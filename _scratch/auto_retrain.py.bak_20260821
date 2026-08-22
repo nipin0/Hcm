@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""auto_retrain.py — LightGBM 信号质量模型自动重训闭环（路径 A+B+C）。
+
+设计目标（用户 2026-08-20 决策：A/B/C 全做，先搭功能架构，数据再积累）：
+  A. 自动重训：PG 标注(hcm_ai.labeled_samples) → labels.csv/features.csv →
+     训练产出新版本模型 → 回测 → 切 ai.lm.model_path（sidecar 30s 内热重载）。
+  B. DeepSeek 裁判：回测指标 + 样本分布摘要发给 DeepSeek，由其判定
+     "采用/回滚 + 理由"；DeepSeek 不可用/超时 → 按本地 AUC 阈值 fail-open 决策。
+  C. DeepSeek 特征增强：quality_features.py 已把 ds_fake_prob/ds_sl_coeff/
+     ds_continuity 近邻匹配注入训练 CSV（与推理侧 build_features 同契约），
+     本脚本只需调用 quality_features 即自动生效，无需改任何已上线代码。
+
+铁律合规：
+  - 纯新增文件，不改动任何已上线功能（路径 C 的契约层已于 2026-08-17 就绪）。
+  - 训练产物落 tools/_artifacts/，模型落 tools/models/（与生产 sidecar 同目录）。
+  - 所有外部调用（PG / DeepSeek / Redis）均有超时+降级兜底，绝不因重训失败卡死主链路。
+  - 模型切换经 config_provider.set 双写 PG+Redis+PUB，与现有配置热重载机制一致。
+
+用法：
+  # 单次跑（验证/调试）
+  python auto_retrain.py --once
+
+  # 常驻守护（每 --interval-hours 小时一轮，默认 24）
+  python auto_retrain.py --daemon --interval-hours 24
+
+  # 强制忽略 DeepSeek 裁判、纯本地 AUC 决策（离线/无 key 环境）
+  python auto_retrain.py --once --no-deepseek
+
+依赖：lightgbm, scikit-learn, pandas, numpy, psycopg2, requests
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+ARTIFACTS = os.path.join(TOOLS_DIR, "_artifacts")
+MODELS_DIR = os.path.join(TOOLS_DIR, "models")
+os.makedirs(ARTIFACTS, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+DB_URL_DEFAULT = "postgresql://hcm:hcm_dev_pwd@localhost:5432/hcm_v2"
+REDIS_HOST = "localhost"
+REDIS_PORT = 6379
+
+# 本地决策阈值（fail-open 护栏）：测试集 AUC 低于此值视为退化，不切模型
+LOCAL_AUC_ADOPT_MIN = 0.55
+# 样本量下限：少于此数训练结果不可靠，仅产模型不切（避免用噪声数据覆盖好模型）
+# 支持环境变量 RETRAIN_MIN_SAMPLES 覆盖（验证时可临时调大，避免误切线上模型）
+MIN_SAMPLES_FOR_SWITCH = int(os.environ.get("RETRAIN_MIN_SAMPLES", "200"))
+
+PY = sys.executable
+DS_API_DEFAULT = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1/chat/completions")
+DS_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DS_MODEL_DEFAULT = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+
+
+def load_ds_config_from_pg() -> dict:
+    """从 PG 配置中心(hcm_config.metadata)读取 DeepSeek 配置——与系统其他模块一致的真源。
+
+    优先级：环境变量 > PG(hcm_config.metadata) > 模块内置默认值。
+    这样守护无需手动填 key：只要 PG 里 deepseek.api_key 已配（实测已配，
+    sk-5... 35字符），裁判即自动链动；PG 缺失则回退模块默认，再由
+    deepseek_judge 的 no_key 兜底走 local_fallback（不卡死）。
+    """
+    cfg = {
+        "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+        "api_base": os.environ.get("DEEPSEEK_API_BASE", ""),
+        "model": os.environ.get("DEEPSEEK_MODEL", ""),
+    }
+    try:
+        import psycopg2
+        conn = psycopg2.connect(DB_URL_DEFAULT, connect_timeout=5)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT config_key, current_value FROM hcm_config.metadata "
+                    "WHERE config_key IN ('deepseek.api_key','deepseek.api_base','deepseek.model')"
+                )
+                for k, v in cur.fetchall():
+                    if k == "deepseek.api_key" and not cfg["api_key"]:
+                        cfg["api_key"] = v or ""
+                    elif k == "deepseek.api_base" and not cfg["api_base"]:
+                        # 归一化：DeepSeek 开放 API 标准端点为 /v1/chat/completions。
+                        # PG 真源常只存根域名 https://api.deepseek.com（别处共享配置），
+                        # 此处补全路径，不擅自改 PG 真源值（铁律：不单边改配置）。
+                        base = (v or "").rstrip("/")
+                        if base and not base.endswith("/chat/completions"):
+                            if base.endswith("/v1"):
+                                base += "/chat/completions"
+                            elif "/v1/" not in base:
+                                base += "/v1/chat/completions"
+                        cfg["api_base"] = base
+                    elif k == "deepseek.model" and not cfg["model"]:
+                        cfg["model"] = v or ""
+        finally:
+            conn.close()
+    except Exception as e:
+        log(f"[ds-config] PG read failed (non-fatal, fall back to env/default): {e}")
+    return cfg
+
+
+def log(msg: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    with open(os.path.join(TOOLS_DIR, "auto_retrain.log"), "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+# ── 版本自增 ──────────────────────────────────────────────────────────────
+def next_model_version() -> int:
+    """扫描 tools/models/lgbm_quality_vN.txt，返回最大 N+1。"""
+    import re
+    max_v = 0
+    for fn in os.listdir(MODELS_DIR):
+        m = re.match(r"lgbm_quality_v(\d+)\.txt$", fn)
+        if m:
+            max_v = max(max_v, int(m.group(1)))
+    return max_v + 1
+
+
+# ── 子进程调用 ────────────────────────────────────────────────────────────
+def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
+    log(f"[run] {' '.join(cmd)}")
+    try:
+        p = subprocess.run(cmd, cwd=TOOLS_DIR, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s"
+    except Exception as e:
+        return 1, "", str(e)
+
+
+# ── 回测指标解析 ──────────────────────────────────────────────────────────
+def parse_auc(stdout: str) -> float | None:
+    """从 train_signal_quality.py 输出抓 [split] 或 [tss-summary] 的 AUC。"""
+    import re
+    best = None
+    for line in stdout.splitlines():
+        m = re.search(r"AUC=(\d+\.\d+)", line)
+        if m:
+            v = float(m.group(1))
+            if best is None or "tss-summary" in line or "test" in line.lower():
+                best = v
+    # 优先 tss-summary 均值（时序交叉验证更可靠）
+    m = re.search(r"tss-summary\] AUC mean=(\d+\.\d+)", stdout)
+    if m:
+        return float(m.group(1))
+    return best
+
+
+def count_samples(stdout: str) -> int:
+    import re
+    m = re.search(r"joined rows=(\d+)", stdout)
+    return int(m.group(1)) if m else 0
+
+
+def ds_nonzero_ratio(stdout: str) -> float | None:
+    import re
+    m = re.search(r"DeepSeek 特征非零占比 (\d+\.\d+)%", stdout)
+    if m:
+        return float(m.group(1)) / 100.0
+    m2 = re.search(r"ds_diag\] WARNING: DeepSeek 特征非零占比仅 (\d+\.\d+)%", stdout)
+    if m2:
+        return float(m2.group(1)) / 100.0
+    return None
+
+
+# ── 路径 B：DeepSeek 裁判 ─────────────────────────────────────────────────
+def deepseek_judge(api_base: str, api_key: str, payload: dict, timeout: int = 60,
+                   model: str = "deepseek-chat") -> dict:
+    """把回测摘要发给 DeepSeek，返回 {decision: 'adopt'|'rollback', reason: str}。
+
+    超时/无 key/异常 → 返回 {decision: 'local_fallback', reason: 'ds_unavailable'}，
+    调用方据此走本地 AUC 决策（fail-open，绝不卡死）。
+    """
+    if not api_key:
+        return {"decision": "local_fallback", "reason": "no_deepseek_key"}
+    try:
+        import requests
+        prompt = (
+            "你是量化模型训练的质量裁判。以下是 LightGBM 信号质量模型的一次重训结果摘要，"
+            "请判断【是否采用新模型替换线上模型】。\n"
+            "采用标准：测试 AUC 较基线有实质提升、样本量充足、DeepSeek 特征吸收充分、"
+            "无退化迹象。若 AUC<0.55 或样本<200 或校准器退化，应回滚。\n"
+            "只返回一个 JSON：{\"decision\": \"adopt\" 或 \"rollback\", \"reason\": \"中文简述\"}\n\n"
+            f"摘要：{json.dumps(payload, ensure_ascii=False)}"
+        )
+        resp = requests.post(
+            api_base,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0.0, "max_tokens": 300},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        # 容错：从返回里抠 JSON
+        import re
+        jm = re.search(r"\{[^{}]*\}", content, re.DOTALL)
+        if jm:
+            return json.loads(jm.group(0))
+        return {"decision": "local_fallback", "reason": f"ds_unparseable: {content[:120]}"}
+    except Exception as e:
+        return {"decision": "local_fallback", "reason": f"ds_error: {e}"}
+
+
+# ── 模型切换（双写 PG+Redis）─────────────────────────────────────────────
+def switch_model(model_path: str, calib_path: str) -> bool:
+    """把新模型路径写 ai.lm.model_path / ai.lm.calib_path（PG+Redis 双写+PUB）。
+
+    优先用 config_provider.set（若存在），否则直接双写 PG+Redis。
+    返回是否成功。
+    """
+    try:
+        import psycopg2
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
+
+        # 1) Redis 直写（hcm:config:v2 哈希字段）
+        r.hset("hcm:config:v2", "ai.lm.model_path", model_path)
+        r.hset("hcm:config:v2", "ai.lm.calib_path", calib_path)
+        r.publish("hcm:config:invalidate", "ai.lm.model_path")
+        r.publish("hcm:config:invalidate", "ai.lm.calib_path")
+        log("[switch] Redis hcm:config:v2 updated + PUB")
+
+        # 2) PG 直写（hcm_config.metadata 真源）
+        conn = psycopg2.connect(DB_URL_DEFAULT, connect_timeout=5)
+        try:
+            with conn.cursor() as cur:
+                for key, val in (("ai.lm.model_path", model_path), ("ai.lm.calib_path", calib_path)):
+                    # default_value 是 NOT NULL 列：INSERT 时与 current_value 同值；
+                    # 已存在则仅更新 current_value（default_value 保持不变）。
+                    cur.execute(
+                        "INSERT INTO hcm_config.metadata "
+                        "(config_key, current_value, default_value, value_type, category) "
+                        "VALUES (%s, %s, %s, 'string', 'ai') "
+                        "ON CONFLICT (config_key) DO UPDATE SET current_value = EXCLUDED.current_value",
+                        (key, val, val),
+                    )
+                conn.commit()
+            log("[switch] PG hcm_config.metadata updated")
+        finally:
+            conn.close()
+        return True
+    except Exception as e:
+        log(f"[switch] FAILED: {e}")
+        return False
+
+
+def record_retrain_run(payload: dict):
+    """记录重训历史到 Redis 键 hcm:ai:retrain:last（JSON）+ 保留最近 50 条列表。
+
+    设计取舍：不写入 hcm_ai.calibration_daily（该表是 reconcile_labels 的产出表，
+    列结构 win_rate/trades 等与本脚本的模型版本语义不同，擅自入侵列=铁律禁止的
+    schema 改动）。改用 Redis 单一真源记录，零 schema 风险，面板/诊断可经
+    hcm:ai:retrain:last 查最新、hcm:ai:retrain:history 查近 50 轮。
+    """
+    try:
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
+        blob = json.dumps(payload, ensure_ascii=False, default=str)
+        r.set("hcm:ai:retrain:last", blob)
+        r.lpush("hcm:ai:retrain:history", blob)
+        r.ltrim("hcm:ai:retrain:history", 0, 49)
+        log("[record] retrain run saved to Redis hcm:ai:retrain:last")
+    except Exception as e:
+        log(f"[record] Redis save FAILED (non-fatal, see auto_retrain.log): {e}")
+
+
+# ── 主流程 ────────────────────────────────────────────────────────────────
+def retrain_once(use_deepseek: bool = True) -> dict:
+    """执行一轮完整重训闭环，返回结果摘要。"""
+    v = next_model_version()
+    model_out = os.path.join(MODELS_DIR, f"lgbm_quality_v{v}.txt")
+    calib_out = os.path.join(MODELS_DIR, f"calib_v{v}.pkl")
+    labels_csv = os.path.join(ARTIFACTS, "labels.csv")
+    features_csv = os.path.join(ARTIFACTS, "features.csv")
+
+    log(f"=== retrain round: target version v{v} ===")
+
+    # 1) 标签
+    rc, out, err = run([PY, "build_labels.py", "--out", labels_csv, "--mode", "HEXP:%"])
+    if rc != 0:
+        log(f"[ABORT] build_labels failed: {err[-500:]}")
+        return {"ok": False, "stage": "build_labels", "error": err[-500:]}
+
+    # 2) 特征（自动带 ds_* DeepSeek 特征 = 路径 C）
+    rc, out, err = run([PY, "quality_features.py", "--out", features_csv, "--mode", "HEXP:%", "--period-align", "m5"])
+    if rc != 0:
+        log(f"[ABORT] quality_features failed: {err[-500:]}")
+        return {"ok": False, "stage": "quality_features", "error": err[-500:]}
+
+    # 3) 训练
+    rc, out, err = run(
+        [PY, "train_signal_quality.py", "--labels", labels_csv, "--features", features_csv,
+         "--model", model_out, "--calib", calib_out, "--outdir", ARTIFACTS],
+        timeout=900,
+    )
+    if rc != 0:
+        log(f"[ABORT] train failed: {err[-800:]}")
+        return {"ok": False, "stage": "train", "error": err[-800:]}
+
+    auc = parse_auc(out)
+    samples = count_samples(out)
+    ds_ratio = ds_nonzero_ratio(out)
+    log(f"[train] done: auc={auc} samples={samples} ds_nonzero_ratio={ds_ratio}")
+
+    payload = {
+        "model_version": f"v{v}",
+        "auc": auc,
+        "samples": samples,
+        "ds_nonzero_ratio": ds_ratio,
+        "baseline_win_rate": None,  # train 输出含，按需扩展解析
+    }
+
+    # 4) 决策：DeepSeek 裁判（路径 B）或本地 AUC 护栏
+    # 从 PG 配置中心读取 DeepSeek 真源 key/api_base/model（与系统其他模块一致），
+    # 覆盖模块默认，使守护无需手动填 key 即可链动裁判。
+    ds_cfg = load_ds_config_from_pg()
+    ds_key = ds_cfg["api_key"] or DS_KEY
+    ds_api = ds_cfg["api_base"] or DS_API_DEFAULT
+    ds_model = ds_cfg["model"] or DS_MODEL_DEFAULT
+    log(f"[ds-config] key_present={bool(ds_key)} api_base={ds_api[:24]}... model={ds_model}")
+
+    decided_adopt = False
+    judge = {"decision": "local_fallback", "reason": "disabled"}
+    if use_deepseek:
+        judge = deepseek_judge(ds_api, ds_key, payload, model=ds_model)
+        if judge.get("decision") == "adopt":
+            decided_adopt = True
+        elif judge.get("decision") == "rollback":
+            decided_adopt = False
+        else:  # local_fallback
+            decided_adopt = (auc is not None and auc >= LOCAL_AUC_ADOPT_MIN
+                             and samples >= MIN_SAMPLES_FOR_SWITCH)
+    else:
+        decided_adopt = (auc is not None and auc >= LOCAL_AUC_ADOPT_MIN
+                         and samples >= MIN_SAMPLES_FOR_SWITCH)
+
+    log(f"[judge] decision={judge.get('decision')} reason={judge.get('reason')} "
+        f"-> adopt={decided_adopt}")
+
+    # 5) 样本不足 → 只产模型不切（避免噪声覆盖）
+    if samples < MIN_SAMPLES_FOR_SWITCH:
+        log(f"[skip-switch] samples={samples} < {MIN_SAMPLES_FOR_SWITCH}，模型已产出但未切换")
+        decided_adopt = False
+
+    # 6) 切换
+    switched = False
+    if decided_adopt:
+        switched = switch_model(model_out, calib_out)
+        log(f"[switch] {'OK' if switched else 'FAILED'} -> {model_out}")
+
+    payload.update({"adopted": decided_adopt, "switched": switched, "judge": judge})
+    record_retrain_run(payload)
+    log(f"=== round done: adopted={decided_adopt} switched={switched} ===")
+    return payload
+
+
+def _heartbeat():
+    """守护存活心跳：写 Redis hcm:ai:retrain:daemon（TTL 续期）。
+
+    前端报表据此判断守护是否在线（死守护/未启动→离线，避免误以为'没训练'）。
+    每轮重训后 + 崩溃兜底都刷新，TTL 取 2 倍间隔(48h)容错。
+    """
+    try:
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
+        import time as _t
+        blob = json.dumps({"pid": os.getpid(), "at": _t.strftime("%Y-%m-%d %H:%M:%S")},
+                          ensure_ascii=False)
+        r.set("hcm:ai:retrain:daemon", blob, ex=48 * 3600)
+    except Exception as e:
+        log(f"[heartbeat] write failed (non-fatal): {e}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true", help="单次运行后退出")
+    ap.add_argument("--daemon", action="store_true", help="常驻循环")
+    ap.add_argument("--interval-hours", type=float, default=24.0)
+    ap.add_argument("--no-deepseek", action="store_true", help="禁用 DeepSeek 裁判，纯本地 AUC 决策")
+    args = ap.parse_args()
+
+    use_ds = not args.no_deepseek
+    if args.once:
+        retrain_once(use_deepseek=use_ds)
+        return
+
+    # daemon 模式
+    log(f"auto_retrain daemon started: interval={args.interval_hours}h deepseek={use_ds}")
+    while True:
+        try:
+            retrain_once(use_deepseek=use_ds)
+        except Exception as e:
+            log(f"[daemon] round crashed (non-fatal): {e}")
+        _heartbeat()  # 不论成功/崩溃都刷新存活标记
+        time.sleep(max(1.0, args.interval_hours * 3600.0))
+
+
+if __name__ == "__main__":
+    main()

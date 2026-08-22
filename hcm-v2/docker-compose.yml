@@ -1,0 +1,349 @@
+# docker-compose.yml — HCM v2 全栈部署编排
+# 版本: v1.0 | 基于 PRD v1.3 附录 B
+name: hcm-v2
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: hcm_v2
+      POSTGRES_USER: hcm
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-hcm_dev_pwd}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./deploy/init_config_metadata.sql:/docker-entrypoint-initdb.d/02-init_config_metadata.sql
+      - ./deploy/init_event_calendar.sql:/docker-entrypoint-initdb.d/03-init_event_calendar.sql
+      - ./deploy/init_symbol_meta.sql:/docker-entrypoint-initdb.d/04-init_symbol_meta.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - hcm-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hcm -d hcm_v2"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    networks:
+      - hcm-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  hcm-gateway:
+    build:
+      context: .
+      dockerfile: hcm-gateway/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_URL=postgresql://hcm:${DB_PASSWORD:-hcm_dev_pwd}@postgres:5432/hcm_v2
+      - MT5_PATH=/app/mt5
+      - GRPC_PORT=8004
+      - WS_PORT=8005
+    ports:
+      - "8004:8004"
+      - "8005:8005"
+    networks:
+      - hcm-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  hcm-collector:
+    build:
+      context: .
+      dockerfile: hcm-collector/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      hcm-gateway:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_URL=postgresql://hcm:${DB_PASSWORD:-hcm_dev_pwd}@postgres:5432/hcm_v2
+      - GATEWAY_WS_URL=ws://hcm-gateway:8005
+      - SERVICE_PORT=8001
+    ports:
+      - "0.0.0.0:8001:8001"
+    networks:
+      - hcm-network
+    volumes:
+      # 2026-08-05 (D4): 源码即权威，跨 recreate 持久（与 signal-tower/web 同模式）
+      - ./hcm-collector/main.py:/app/main.py
+      - ./hcm-collector/collector:/app/collector
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  hcm-signal-tower:
+    build:
+      context: .
+      dockerfile: hcm-signal-tower/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      hcm-collector:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_URL=postgresql://hcm:${DB_PASSWORD:-hcm_dev_pwd}@postgres:5432/hcm_v2
+      # DeepSeek 凭证改由配置中心(PG hcm_config.metadata)经 config_provider 注入，
+      # 不再读取 .env，遵守"配置真源在 PG/Redis、禁用硬编码"纪律。
+      - SERVICE_PORT=8002
+    ports:
+      - "0.0.0.0:8002:8002"
+    networks:
+      - hcm-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    volumes:
+      # 绑定挂载源码（无网环境无法 rebuild 镜像）：使主号周期重解析等修复跨容器 recreate 持久生效
+      - ./hcm-signal-tower/signal_tower/scheduler.py:/app/signal_tower/scheduler.py
+      # [2026-08-04 治本③] 连亏制动时间衰减：consecutive_loss 老旧自动清零，破除永久死锁；绑定挂载跨 recreate 持久
+      - ./hcm-signal-tower/signal_tower/risk_state_sync.py:/app/signal_tower/risk_state_sync.py
+      # [2026-07-30] Bar 质量分纯函数：信号塔处理高质量 K 线数据，默认不影响信号（计算层）
+      - ./hcm-signal-tower/signal_tower/bar_quality.py:/app/signal_tower/bar_quality.py
+      # 手动跟单同步修复：手动镜像动作(action/close_mode/close_ticket/magic)透传到 signal:stream
+      - ./hcm-signal-tower/signal_tower/manual_mode.py:/app/signal_tower/manual_mode.py
+      - ./hcm-signal-tower/signal_tower/signal_publisher.py:/app/signal_tower/signal_publisher.py
+      # 五维模型硬删除(2026-07-24)：main.py 移除 AiInvoker 实例化、__init__.py 移除 ai_invoker 导出，跨 recreate 持久
+      - ./hcm-signal-tower/main.py:/app/main.py
+      - ./hcm-signal-tower/signal_tower/__init__.py:/app/signal_tower/__init__.py
+      # [2026-07-24 审计加固] 冷却键/强趋势门槛安全默认防御（配置丢失不退化）：跨 recreate 持久
+      - ./hcm-signal-tower/signal_tower/scoring_engine.py:/app/signal_tower/scoring_engine.py
+      # [2026-07-31] H1 防火墙方向补全修复：惯性分支保留趋势 regime 时补全 trend_direction，
+      # 否则逆势单漏过；绑定挂载跨 recreate 持久
+      - ./hcm-signal-tower/signal_tower/h1_regime_classifier.py:/app/signal_tower/h1_regime_classifier.py
+      - ./hcm-signal-tower/signal_tower/co_source.py:/app/signal_tower/co_source.py
+      # [2026-08-08] 和乘幂(hexp)独立信号源引擎：跨 recreate 持久（新文件，非镜像烘焙）
+      - ./hcm-signal-tower/signal_tower/hexp_engine.py:/app/signal_tower/hexp_engine.py
+      - ./hcm-signal-tower/signal_tower/micro_state.py:/app/signal_tower/micro_state.py
+      - ./hcm-signal-tower/signal_tower/precision_entry.py:/app/signal_tower/precision_entry.py
+      # [2026-08-14 闭环] quality_gate 融合闸门 + ai_async_client(DeepSeek 校准融合)：LightGBM+DeepSeek 闭环裁决，跨 recreate 持久
+      - ./hcm-signal-tower/signal_tower/quality_gate.py:/app/signal_tower/quality_gate.py
+      - ./hcm-signal-tower/signal_tower/ai_async_client.py:/app/signal_tower/ai_async_client.py
+      # [P1] 轻量 DeepSeek 客户端：供校准诊断生成自然语言报告（shared 包镜像内置，单文件挂载跨 recreate 持久）
+      - ./shared/llm_client.py:/app/shared/llm_client.py
+      # [2026-08-17 B7] RedisClient 封装类补 exists 方法（DeepSeek run_loop 检测触发标志依赖），
+      # 同 llm_client 模式挂载使容器使用新码，跨 recreate 持久
+      - ./shared/redis_client.py:/app/shared/redis_client.py
+      # [2026-08-21] ConfigProviderV3.get_current（只读 current_value、不做 PG default_value
+      # 兜底）：根治「和乘幂配置保存刷新又复原」。shared 包镜像内置，须单文件挂载才进容器，
+      # 否则 hexp_engine/web 的 get_current 调用抛 AttributeError → 回退默认、读不到用户调优值。
+      - ./shared/config_provider.py:/app/shared/config_provider.py
+
+  hcm-market-intel:
+    build:
+      context: .
+      dockerfile: hcm-market-intel/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_URL=postgresql://hcm:${DB_PASSWORD:-hcm_dev_pwd}@postgres:5432/hcm_v2
+      - FRED_API_KEY=${FRED_API_KEY:-}
+      - CME_API_KEY=${CME_API_KEY:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - MARKET_INTEL_STUB_MODE=false
+      - SERVICE_PORT=8006
+    ports:
+      - "8006:8006"
+    networks:
+      - hcm-network
+    volumes:
+      # 绑定挂载源码（无网环境无法 rebuild 镜像）：使「关闭 StubMode + 写状态标记键」
+      # 修复跨容器 recreate 持久生效（否则容器重建回退镜像版丢失修复）
+      - ./hcm-market-intel/main.py:/app/main.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8006/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  hcm-risk-engine:
+    build:
+      context: .
+      dockerfile: hcm-risk-engine/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_URL=postgresql://hcm:${DB_PASSWORD:-hcm_dev_pwd}@postgres:5432/hcm_v2
+      - SERVICE_PORT=8007
+    ports:
+      - "8007:8007"
+    networks:
+      - hcm-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8007/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    volumes:
+      # 绑定挂载源码（无网环境无法 rebuild 镜像）：使手动跟单生命周期动作免规则链放行、透传 action/close_mode/close_ticket 等修复跨容器 recreate 持久生效
+      - ./hcm-risk-engine/risk_engine/stream_consumer.py:/app/risk_engine/stream_consumer.py
+      # 风控配置崩溃降级 + 60s 热重载修复：配置缺失不再 raise、未加载时降级放行、改 PG 配置即生效
+      - ./hcm-risk-engine/risk_engine/rule_chain.py:/app/risk_engine/rule_chain.py
+      - ./hcm-risk-engine/main.py:/app/main.py
+      # 风控决策引擎：同向冷却(risk_cool_minutes)移出软规则改为硬规则 REJECT，绑定挂载跨 recreate 持久
+      - ./hcm-risk-engine/risk_engine/decision.py:/app/risk_engine/decision.py
+
+  hcm-dispatcher:
+    build:
+      context: .
+      dockerfile: hcm-dispatcher/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      hcm-gateway:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_URL=postgresql://hcm:${DB_PASSWORD:-hcm_dev_pwd}@postgres:5432/hcm_v2
+      - GATEWAY_GRPC_URL=hcm-gateway:8004
+      - SERVICE_PORT=8008
+    ports:
+      - "8008:8008"
+    networks:
+      - hcm-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8008/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    volumes:
+      # 绑定挂载源码（无网环境无法 rebuild 镜像）：使「主号+跟单号都通知钉钉」修复跨容器 recreate 持久生效
+      - ./hcm-dispatcher/dispatcher/execution_notifier.py:/app/dispatcher/execution_notifier.py
+      - ./hcm-dispatcher/dispatcher/notifier.py:/app/dispatcher/notifier.py
+
+  hcm-copy-trading:
+    build:
+      context: .
+      dockerfile: hcm-copy-trading/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      hcm-gateway:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_URL=postgresql://hcm:${DB_PASSWORD:-hcm_dev_pwd}@postgres:5432/hcm_v2
+      - GATEWAY_GRPC_URL=hcm-gateway:8004
+      - SERVICE_PORT=8009
+    ports:
+      - "8009:8009"
+    networks:
+      - hcm-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8009/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  hcm-web:
+    build:
+      context: .
+      dockerfile: hcm-web/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DB_URL=postgresql://hcm:${DB_PASSWORD:-hcm_dev_pwd}@postgres:5432/hcm_v2
+      - SERVICE_PORT=8000
+      - JWT_SECRET=${JWT_SECRET:-dev-jwt-secret-change-in-production}
+    ports:
+      - "0.0.0.0:8000:8000"
+    networks:
+      - hcm-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    volumes:
+      # 绑定挂载源码（无网环境无法 rebuild 镜像）：使启用/停用开关即时广播等修复跨容器 recreate 持久生效
+      - ./hcm-web/web/api/system.py:/app/web/api/system.py
+      # 平仓配置 API：时段系数(亚盘/欧盘/美盘)开关在此实现，绑定挂载跨 recreate 持久
+      - ./hcm-web/web/api/close.py:/app/web/api/close.py
+      # 评分阈值(公用) API：live_override 反转救援等参数经此 GET/PUT，绑定挂载跨 recreate 持久
+      - ./hcm-web/web/api/signal_tower.py:/app/web/api/signal_tower.py
+      # 风险参数 API：经 config_provider.set 双写 PG+Redis；显式 hset 双写保险已合并进源码，
+      # 绑定挂载使「风险参数即时双写」跨 recreate 持久（否则容器重建回退镜像版丢失双写保险）
+      - ./hcm-web/web/api/risk.py:/app/web/api/risk.py
+      # 跟单关系 API：含空串→默认值容错(消除创建 422)；绑定挂载使该修复跨 recreate 持久
+      - ./hcm-web/web/api/copy.py:/app/web/api/copy.py
+      # 共源信号配置 API：经 config_provider.set 双写 PG(metadata)+Redis(hcm:config:v2)+PUB；
+      # 绑定挂载使「共源配置 PG/Redis 双写」跨 recreate 持久（否则容器重建回退镜像版丢失双写逻辑）
+      - ./hcm-web/web/api/cosource.py:/app/web/api/cosource.py
+      # [2026-08-08] 和乘幂(hexp)独立信号源配置 API：PG(metadata)+Redis(hcm:config:v2) 双写 + PUB；绑定挂载跨 recreate 持久
+      - ./hcm-web/web/api/hexp.py:/app/web/api/hexp.py
+      # [2026-08-14] AI 信号质量模块配置 API（ai.* 命名空间，新文件非镜像烘焙）：绑定挂载跨 recreate 持久
+      - ./hcm-web/web/api/ai_config.py:/app/web/api/ai_config.py
+      # [2026-08-14] AI 报表聚合 API（只读，新文件非镜像烘焙）：绑定挂载跨 recreate 持久
+      - ./hcm-web/web/api/ai_report.py:/app/web/api/ai_report.py
+      # [2026-08-08] hcm-web 主入口：注册 hexp 等新增路由；绑定挂载使路由注册跨 recreate 持久（否则容器重建回退镜像版丢失 hexp 路由）
+      - ./hcm-web/main.py:/app/main.py
+      # 仪表盘 API：新增 live-score 端点（暴露信号塔实时评分快照：评分 vs 自适应门槛 vs 能否下单）；绑定挂载跨 recreate 持久
+      - ./hcm-web/web/api/dashboard.py:/app/web/api/dashboard.py
+      # [2026-08-21] ConfigProviderV3.get_current：根治「和乘幂配置保存刷新又复原」。
+      # shared 包镜像内置，须单文件挂载才进容器，否则 web/_read_config 的 get_current
+      # 调用抛 AttributeError → 回退默认、读不到用户调优值。
+      - ./shared/config_provider.py:/app/shared/config_provider.py
+      # 前端 dist 绑定挂载：使「token 刷新锁修复(消除闪即退)」跨容器 recreate 持久生效（无网环境无法 rebuild 镜像）
+      - ./hcm-web/frontend/dist:/app/frontend/dist
+
+networks:
+  hcm-network:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:

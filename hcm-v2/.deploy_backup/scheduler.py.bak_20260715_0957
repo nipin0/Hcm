@@ -1,0 +1,1466 @@
+"""Scheduler — bar_close trigger → signal production pipeline.
+
+The scheduler is the orchestration layer of signal-tower:
+1. Monitors K-line data for bar_close events
+2. Triggers the signal production pipeline per symbol
+3. Coordinates: indicator calculation → regime classification →
+   scoring → AI invocation → signal publication
+
+Implements staggered start for multiple symbols to avoid
+resource contention.
+
+Design: per-symbol task with independent timing.
+
+Fix #1-#5 (2025-07-10):
+  #1 Bar confirmation: prevent chasing reversals
+  #2 Bar momentum: single-bar velocity scoring
+  #3 AI Fallback Gate: protect ai_fallback from extreme bars
+  #4 Live bar push: MT5 bridge pushes unclosed bar to Redis
+  #5 Circuit breaker: bar_range > 2×ATR → skip signal
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+import numpy as np
+
+from signal_tower.indicator_calculator import (
+    IndicatorCalculator,
+    IndicatorResults,
+    DEFAULT_RSI_PERIOD,
+    DEFAULT_MACD_FAST,
+    DEFAULT_MACD_SLOW,
+    DEFAULT_MACD_SIGNAL,
+    DEFAULT_ADX_PERIOD,
+    DEFAULT_BOLL_PERIOD,
+    DEFAULT_BOLL_STD,
+    DEFAULT_STOCH_K,
+    DEFAULT_STOCH_D,
+    DEFAULT_STOCH_SMOOTH,
+    DEFAULT_MA_SHORT,
+    DEFAULT_MA_LONG,
+)
+from signal_tower.regime_classifier import Regime, RegimeClassifier, RegimeConfig, RegimeResult
+from signal_tower.scoring_engine import ScoreResult, ScoringEngine
+from signal_tower.range_bonus import RangeBonus
+from signal_tower.ai_invoker import AiInvoker, AiResponse
+from signal_tower.signal_publisher import SignalData, SignalPublisher
+from signal_tower.watchdog import WatchdogManager
+from shared.signal_tower_defaults import (
+    LIVE_BAR_KEY_TEMPLATE,
+)
+
+logger = logging.getLogger(__name__)
+
+# ── Default Config ─────────────────────────────
+
+DEFAULT_SYMBOLS = ["XAUUSD", "BTCUSD"]
+DEFAULT_TIMEFRAMES = {"XAUUSD": "M5", "BTCUSD": "M15"}
+DEFAULT_IDLE_SLEEP = 5.0
+DEFAULT_LOOP_ERROR_SLEEP = 5.0
+DEFAULT_KLINE_STALE_MAX_BARS = 3
+DEFAULT_CONFIG_RELOAD_INTERVAL_SECONDS = 30  # P0: hot-reload cadence for live param tuning
+TIMEFRAME_SECONDS = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800, "H1": 3600, "H4": 14400}
+
+# P0 fix (2026-07-15): kline feed staleness ceiling (seconds). If the latest
+# closed bar's open_time has not advanced for longer than this, the market-data
+# feed is treated as genuinely broken — production is paused (not force-advanced
+# into a self-DoS) and an ALERT is logged. 10 min = 2× M5 bar length.
+KLINE_STALE_THRESHOLD_SEC = 600
+
+
+@dataclass
+class SymbolState:
+    """Per-symbol scheduling state — P2-7: timeframe-agnostic with sub-period."""
+    symbol: str
+    timeframe: str = "M5"
+    sub_period: str = "M1"                      # P2-7: sub-bar period
+    bar_seconds: int = 300
+    sub_bar_seconds: int = 60                    # P2-7
+    last_bar_open_time: Optional[datetime] = None
+    last_sub_bar_open_time: Optional[datetime] = None  # P2-7
+    last_signal_time: float = 0.0
+    last_direction: str = ""
+    consecutive_errors: int = 0
+    kline_not_ready_count: int = 0
+    enabled: bool = True
+    same_dir_bypass_count: int = 0
+    # P2-7: midbar inference state
+    midbar_enabled: bool = False
+    midbar_inference_bars: list = field(default_factory=lambda: [2, 3, 4, 5])
+    midbar_min_confirm: int = 2
+    midbar_confirm_count: int = 0
+    midbar_cached_direction: str = ""
+    midbar_cached_score: float = 0.0
+    midbar_liquidity_max: float = 0.08
+    # P2-7: regime thresholds (per-period, loaded from config)
+    trend_adx_threshold: float = 22.0
+    trend_adx_exit_threshold: float = 18.0
+    dispute_diff_threshold: float = 0.05
+    min_score_threshold: float = 0.15
+    # ADX trading floor (config-driven, default 22.0) — must match
+    # ScoringEngine._min_adx_for_trade so the midbar cache never carries a
+    # low-ADX directional signal that could cross-validate a bad trade.
+    min_adx_for_trade: float = 22.0
+
+    # ── Bar confirmation state ──
+    prev_bar_open: float = 0.0
+    prev_bar_close: float = 0.0
+    prev_bar_direction: str = ""
+
+
+class Scheduler:
+    """Orchestrates the signal production pipeline.
+
+    On bar_close:
+      0. Market circuit check (Fix #5)
+      1. Fetch K-line data from PostgreSQL + Redis live bar (Fix #4)
+      2. Compute technical indicators
+      3. Classify market regime (five-level)
+      4. Bar confirmation (Fix #1)
+      5. Compute pre_score with regime-aware weights + bar_momentum (Fix #2)
+      6. Apply cooldown check
+      7. Invoke AI / AI Fallback Gate (Fix #3)
+      8. Publish signal via dual-write
+
+    Example:
+        scheduler = Scheduler(db_pool, redis_client, config_provider,
+                             ai_invoker, signal_publisher, watchdog)
+        await scheduler.start()
+    """
+
+    def __init__(
+        self,
+        db_pool: Any = None,
+        redis_client: Any = None,
+        config_provider: Any = None,
+        ai_invoker: Optional[AiInvoker] = None,
+        signal_publisher: Optional[SignalPublisher] = None,
+        watchdog: Optional[WatchdogManager] = None,
+    ):
+        """Initialize Scheduler.
+
+        Args:
+            db_pool: DatabasePool instance for K-line queries.
+            redis_client: RedisClient instance for cache reads.
+            config_provider: ConfigProviderV3 for runtime parameters.
+            ai_invoker: AiInvoker for DeepSeek calls.
+            signal_publisher: SignalPublisher for dual-write.
+            watchdog: WatchdogManager for health monitoring.
+        """
+        self._db = db_pool
+        self._redis = redis_client
+        self._config = config_provider
+        self._ai_invoker = ai_invoker
+        self._signal_publisher = signal_publisher
+        self._watchdog = watchdog
+
+        # Core engines
+        self._indicator_calc = IndicatorCalculator()
+        self._regime_classifier = RegimeClassifier()
+        self._scoring_engine = ScoringEngine(config_provider=config_provider)
+        self._range_bonus = RangeBonus()
+
+        # Per-symbol state
+        self._symbols: dict[str, SymbolState] = {}
+        self._tasks: dict[str, asyncio.Task] = {}
+
+        # Global state
+        self._running = False
+        self._start_time: float = 0.0
+        self._account_id: Optional[int] = None  # cached from DB
+
+        # Config hot-reload (P0: live parameter tuning)
+        self._config_reload_task: Optional[asyncio.Task] = None
+        self._config_reload_interval: int = DEFAULT_CONFIG_RELOAD_INTERVAL_SECONDS
+
+        # P0 fix (2026-07-15): kline feed staleness ceiling (seconds). Beyond
+        # this, the feed is treated as broken and production is paused (no
+        # force-advance self-DoS). See KLINE_STALE_THRESHOLD_SEC.
+        self._kline_stale_threshold_sec: int = KLINE_STALE_THRESHOLD_SEC
+
+        # P0 fix (2026-07-15): per-(symbol,timeframe) idempotency guard.
+        # Stores the last bar open_time that was actually produced so a stuck
+        # feed (repeated force-advance on the same bar) cannot re-publish the
+        # same signal. Key = "symbol:timeframe" → open_time.
+        self._last_produced_open_time: dict[str, Any] = {}
+        self._stats: dict[str, int] = {
+            "loops": 0,
+            "signals_produced": 0,
+            "signals_bypassed": 0,
+            "errors": 0,
+            "circuit_trips": 0,
+            "bar_confirm_fails": 0,
+            "ai_gate_rejects": 0,
+        }
+
+        # User prompt template — loaded from Redis, fallback to hardcoded if None
+        self._prompt_template: Optional[str] = None
+
+    # ── Lifecycle ───────────────────────────────
+
+    async def start(
+        self, symbols: Optional[list[str]] = None
+    ) -> None:
+        """Start the scheduler with per-symbol tasks.
+
+        Args:
+            symbols: List of symbols to schedule (default: from config).
+        """
+        if symbols is None:
+            if self._config is not None:
+                active_json = await self._config.get_json(
+                    "active_symbols", DEFAULT_SYMBOLS
+                )
+                symbols = active_json if isinstance(active_json, list) else DEFAULT_SYMBOLS
+            else:
+                symbols = DEFAULT_SYMBOLS
+
+        # Initialize per-symbol state — read timeframe from config, falling
+        # back to DEFAULT_TIMEFRAMES for each symbol.
+        config_timeframe: Optional[str] = None
+        if self._config is not None:
+            try:
+                config_timeframe = await self._config.get("datasource.timeframe")
+            except Exception:
+                pass
+        # Normalize: if config returns empty/M5 (the default), use DEFAULT_TIMEFRAMES fallback
+        if not config_timeframe or config_timeframe.strip() == "" or config_timeframe == "M5":
+            config_timeframe = None
+
+        for i, sym in enumerate(symbols):
+            if config_timeframe is not None:
+                tf = config_timeframe
+            else:
+                tf = DEFAULT_TIMEFRAMES.get(sym, "M5")
+
+            # P2-7: load per-period config from Redis (no hardcoding)
+            sub_period = tf  # fallback
+            midbar_enabled = False
+            midbar_bars = [2, 3, 4, 5]
+            min_confirm = 2
+            trend_adx = 22.0
+            trend_adx_exit = 18.0
+            dispute_diff = 0.05
+            min_score = 0.15
+            liquidity_max = 0.08
+            if self._config is not None:
+                try:
+                    sub_period = await self._config.get(f"midbar.{tf}.sub_period") or tf
+                    midbar_enabled = await self._config.get_bool(f"midbar.{tf}.enabled")
+                    bars_json = await self._config.get_json(f"midbar.{tf}.inference_bars")
+                    if isinstance(bars_json, list):
+                        midbar_bars = bars_json
+                    min_confirm = await self._config.get_int(f"midbar.{tf}.min_confirm_bars", 2)
+                    trend_adx = await self._config.get_float(f"scoring.{tf}.trend_adx_threshold", 22.0)
+                    trend_adx_exit = await self._config.get_float(f"scoring.{tf}.trend_adx_exit_threshold", 18.0)
+                    dispute_diff = await self._config.get_float(f"scoring.{tf}.dispute_diff_threshold", 0.05)
+                    min_score = await self._config.get_float(f"scoring.{tf}.min_score_threshold", 0.15)
+                    liquidity_max = await self._config.get_float(f"midbar.{tf}.liquidity_bidask_max", 0.08)
+                except Exception:
+                    pass
+
+            sub_bar_sec = TIMEFRAME_SECONDS.get(sub_period, 60)
+            bar_sec = TIMEFRAME_SECONDS.get(tf, 300)
+            state = SymbolState(
+                symbol=sym, timeframe=tf,
+                sub_period=sub_period, sub_bar_seconds=sub_bar_sec, bar_seconds=bar_sec,
+                midbar_enabled=midbar_enabled, midbar_inference_bars=midbar_bars,
+                midbar_min_confirm=min_confirm,
+                trend_adx_threshold=trend_adx, trend_adx_exit_threshold=trend_adx_exit,
+                dispute_diff_threshold=dispute_diff, min_score_threshold=min_score,
+                midbar_liquidity_max=liquidity_max,
+            )
+            self._symbols[sym] = state
+
+        self._running = True
+        self._start_time = time.time()
+
+        # Start per-symbol tasks with staggered delay
+        for i, sym in enumerate(symbols):
+            st = self._symbols[sym]
+            # Main loop — wait for bar close, produce signal
+            task = asyncio.create_task(self._symbol_loop(st))
+            self._tasks[sym] = task
+            # P2-7: sub-bar loop for midbar inference (if enabled)
+            if st.midbar_enabled and st.sub_period != st.timeframe:
+                sub_task = asyncio.create_task(self._sub_bar_loop(st))
+                self._tasks[f"{sym}_sub"] = sub_task
+            # Stagger to avoid all symbols triggering simultaneously
+            if i > 0:
+                await asyncio.sleep(1.0)
+
+        # P0: periodic hot-reload of runtime parameters (no restart needed)
+        if self._config is not None:
+            self._config_reload_task = asyncio.create_task(self._config_reload_loop())
+
+        logger.info("Scheduler started: symbols=%s, timeframes=%s", symbols,
+                    {s: self._symbols[s].timeframe for s in symbols})
+
+    async def stop(self) -> None:
+        """Gracefully stop all per-symbol tasks."""
+        self._running = False
+        # Cancel config hot-reload loop
+        if self._config_reload_task is not None:
+            self._config_reload_task.cancel()
+            try:
+                await self._config_reload_task
+            except asyncio.CancelledError:
+                pass
+            self._config_reload_task = None
+        for sym, task in self._tasks.items():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._tasks.clear()
+        logger.info("Scheduler stopped (stats=%s)", self._stats)
+
+    # ── Symbol Loop ─────────────────────────────
+
+    async def _symbol_loop(self, state: SymbolState) -> None:
+        """Per-symbol main loop: detect bar_close → produce signal.
+
+        Args:
+            state: SymbolState for this symbol.
+        """
+        logger.info("Symbol loop started: %s (tf=%s)", state.symbol, state.timeframe)
+        tf_seconds = TIMEFRAME_SECONDS.get(state.timeframe, 300)
+
+        while self._running:
+            # Reset stale last_bar_open_time to force fresh bar detection
+            if state.last_bar_open_time is not None:
+                now = datetime.now(timezone.utc)
+                if state.last_bar_open_time.tzinfo is None:
+                    last = state.last_bar_open_time.replace(tzinfo=timezone.utc)
+                else:
+                    last = state.last_bar_open_time
+                age_hours = (now - last).total_seconds() / 3600
+                if age_hours > 1:
+                    logger.warning(
+                        "Resetting stale last_bar_open_time (%.1fh old) for %s",
+                        age_hours, state.symbol,
+                    )
+                    state.last_bar_open_time = None
+
+            if self._watchdog:
+                self._watchdog.mark_loop_start()
+
+            try:
+                # Wait for bar_close
+                bar_closed = await self._wait_bar_close(state, tf_seconds)
+                if not bar_closed:
+                    continue
+
+                # Produce signal
+                await self._produce_signal(state)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Symbol loop error (%s): %s", state.symbol, exc)
+                state.consecutive_errors += 1
+                self._stats["errors"] += 1
+
+                if self._watchdog:
+                    await self._watchdog.report_step(
+                        "loop_error", 0.0,
+                    )
+
+                await asyncio.sleep(DEFAULT_LOOP_ERROR_SLEEP)
+
+            if self._watchdog:
+                self._watchdog.mark_loop_end()
+                await self._watchdog.beat()
+
+            self._stats["loops"] += 1
+
+    # ── Bar Close Detection ─────────────────────
+
+    async def _wait_bar_close(
+        self, state: SymbolState, tf_seconds: int,
+        timeframe_override: Optional[str] = None,
+        state_attr: str = "last_bar_open_time",
+    ) -> bool:
+        """Wait for the current bar to close.
+
+        Strategy: poll PG for latest kline, detect when open_time changes.
+        Sleep-based polling with adaptive interval.
+
+        Args:
+            state: SymbolState.
+            tf_seconds: Timeframe duration in seconds.
+
+        Returns:
+            True if a new bar closed.
+        """
+        if self._db is None or not self._db.is_initialized:
+            await asyncio.sleep(DEFAULT_IDLE_SLEEP)
+            return False
+
+        try:
+            # Get latest kline
+            tf = timeframe_override or state.timeframe
+            rows = await self._db.fetch(
+                """SELECT open_time, close, high, low
+                   FROM hcm_market.klines
+                   WHERE symbol=$1 AND time_frame=$2
+                   ORDER BY open_time DESC LIMIT 1""",
+                state.symbol, tf,
+            )
+
+            if not rows:
+                state.kline_not_ready_count += 1
+                await asyncio.sleep(DEFAULT_IDLE_SLEEP)
+                return False
+
+            latest_open = rows[0]["open_time"]
+
+            # Check if this is a new bar
+            last_bar = getattr(state, state_attr, None)
+            if last_bar is None:
+                setattr(state, state_attr, latest_open)
+                state.kline_not_ready_count = 0
+                await asyncio.sleep(1.0)
+                return False
+
+            if latest_open == last_bar:
+                # Same bar — wait
+                now = datetime.now(timezone.utc)
+                seconds_in_bar = (now - latest_open.replace(tzinfo=timezone.utc)).total_seconds()
+                if seconds_in_bar < tf_seconds:
+                    wait_time = tf_seconds - seconds_in_bar + 0.5
+                    if wait_time > 0.5:
+                        await asyncio.sleep(min(wait_time, 5.0))
+                else:
+                    if seconds_in_bar > tf_seconds + 30:
+                        # P0 fix (2026-07-15): previously this branch returned
+                        # True with NO sleep. The caller (_symbol_loop) then
+                        # re-entered _wait_bar_close immediately on the SAME
+                        # stuck bar, force-advancing again → tight busy-poll
+                        # that re-published a NO_TRADE every ~50ms (self-DoS,
+                        # ~19 writes/s, drowned real signals and hammered PG).
+                        # Now we distinguish mild vs. severe staleness:
+                        if seconds_in_bar > self._kline_stale_threshold_sec:
+                            # Genuinely broken feed: no real new bar exists.
+                            # Pause production (do NOT force-advance) and alert,
+                            # backing off so we stop querying/hammering PG.
+                            logger.error(
+                                "ALERT kline feed STALE for %s/%s: latest bar "
+                                "open_time unmoved for %.0fs (>= threshold %ds). "
+                                "Pausing signal production until feed recovers.",
+                                state.symbol, tf, seconds_in_bar,
+                                self._kline_stale_threshold_sec,
+                            )
+                            await asyncio.sleep(min(tf_seconds, 30))
+                            return False
+                        # Mild delay (late but plausibly live bar): allow one
+                        # force-advance, but RATE-LIMIT it. The per-bar
+                        # idempotency guard in _produce_signal suppresses any
+                        # duplicate writes for this same stuck bar.
+                        logger.warning(
+                            "Bar close delayed for %s/%s (stuck %.0fs), forcing advance",
+                            state.symbol, tf, seconds_in_bar,
+                        )
+                        setattr(state, state_attr, latest_open)
+                        await asyncio.sleep(min(tf_seconds, 30))
+                        return True
+                    await asyncio.sleep(1.0)
+                return False
+
+            # New bar detected!
+            setattr(state, state_attr, latest_open)
+            state.kline_not_ready_count = 0
+            logger.debug("Bar closed: %s %s → %s", state.symbol, tf, latest_open)
+            return True
+
+        except Exception as exc:
+            logger.warning("Kline query failed for %s: %s", state.symbol, exc)
+            state.kline_not_ready_count += 1
+            await asyncio.sleep(DEFAULT_LOOP_ERROR_SLEEP)
+            return False
+
+    # ── P2-7: Sub-bar Midbar Inference ───────────
+
+    async def _sub_bar_loop(self, state: SymbolState) -> None:
+        """Sub-bar loop: detect sub-period bar close → midbar inference.
+
+        Runs in parallel with main _symbol_loop. When ADX > trend threshold,
+        performs early scoring every sub-bar close. Caches direction+score
+        to Redis. Main loop cross-validates at bar close.
+        """
+        tf_seconds = state.sub_bar_seconds
+        logger.info(
+            "Sub-bar loop started: %s (tf=%s, sub=%s)",
+            state.symbol, state.timeframe, state.sub_period,
+        )
+        while self._running:
+            try:
+                # Honour the midbar enabled flag (hot-reloaded every 30s).
+                # When disabled, sleep briefly and loop — no sub-bar inference runs.
+                if not state.midbar_enabled:
+                    await asyncio.sleep(5)
+                    continue
+
+                # Wait for sub-bar close (same polling strategy as _wait_bar_close)
+                sub_closed = await self._wait_bar_close(
+                    state, tf_seconds,
+                    timeframe_override=state.sub_period,
+                    state_attr="last_sub_bar_open_time",
+                )
+                if not sub_closed:
+                    continue
+
+                # Determine which sub-bar index within the main bar
+                bar_idx = self._get_sub_bar_index(state)
+                if bar_idx is None or bar_idx not in state.midbar_inference_bars:
+                    continue
+
+                await self._midbar_inference(state, bar_idx)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("Sub-bar loop error (%s): %s", state.symbol, exc)
+                await asyncio.sleep(5.0)
+
+    def _get_sub_bar_index(self, state: SymbolState) -> Optional[int]:
+        """Get the current sub-bar index within the main bar (1-based)."""
+        if state.last_sub_bar_open_time is None:
+            return None
+        main_seconds = state.bar_seconds
+        sub_seconds = state.sub_bar_seconds
+        if main_seconds <= 0 or sub_seconds <= 0:
+            return None
+        ratio = main_seconds // sub_seconds
+        if ratio <= 0:
+            return None
+        # Derive index from open_time alignment
+        bar_ts = state.last_sub_bar_open_time
+        if bar_ts.tzinfo is None:
+            bar_ts = bar_ts.replace(tzinfo=timezone.utc)
+        epoch = bar_ts.timestamp()
+        idx = int((epoch % main_seconds) // sub_seconds) + 1
+        return max(1, min(idx, ratio))
+
+    async def _midbar_inference(
+        self, state: SymbolState, bar_index: int,
+    ) -> None:
+        """Run midbar inference: compute indicators + score + direction on sub-bar data.
+
+        Caches result to Redis: hcm:midbar:{symbol}:{period}:direction + pre_score.
+        Main loop uses this to cross-validate at bar close.
+        """
+        # Fetch sub-period K-lines from PG
+        klines = await self._fetch_klines(state.symbol, state.sub_period, limit=50)
+        if len(klines) < 14:
+            return
+
+        # Compute indicators on sub-period data — convert to numpy arrays (compute_all expects ndarray)
+        import numpy as np
+        closes = np.array([float(r["close"]) for r in klines])
+        highs  = np.array([float(r["high"]) for r in klines])
+        lows   = np.array([float(r["low"]) for r in klines])
+        opens  = np.array([float(r["open"]) for r in klines])
+        indicators = self._indicator_calc.compute_all(closes, highs, lows, opens)
+        if indicators is None:
+            return
+
+        # ── ADX trading floor (config-driven, default 22.0) ──
+        # The midbar sub-loop had NO ADX gate before — it could write a
+        # directional signal to Redis even at ADX<15, which then
+        # cross-validated a bad trade at bar close. Mirror the main-loop
+        # floor from ScoringEngine: below min_adx_for_trade, skip entirely.
+        if indicators.adx_14 < state.min_adx_for_trade:
+            logger.debug(
+                "Midbar[%s/%s bar-%d]: ADX=%.1f < floor=%.1f — skipped (no direction)",
+                state.symbol, state.timeframe, bar_index,
+                indicators.adx_14, state.min_adx_for_trade,
+            )
+            return
+
+        # Compute regime — extract from IndicatorResults
+        regime_result = self._regime_classifier.classify(
+            adx=indicators.adx_14,
+            adx_values=list(indicators.recent_closes or [])[-14:],
+            bbw=indicators.bbw if hasattr(indicators, 'bbw') else 1.0,
+            bbw_ma20=indicators.bbw_ma20 if hasattr(indicators, 'bbw_ma20') else 1.0,
+            close=indicators.close,
+            recent_highs=list(indicators.recent_highs or []),
+            recent_lows=list(indicators.recent_lows or []),
+            pct_b=indicators.pct_b if hasattr(indicators, 'pct_b') else 0.5,
+        )
+
+        # Score
+        score_result = self._scoring_engine.compute_pre_score(indicators, regime_result)
+
+        if score_result.pre_score < state.min_score_threshold:
+            # Log even weak signals — operators need to know midbar is alive
+            logger.debug(
+                "Midbar[%s/%s bar-%d]: score=%.3f < min=%.3f — skipped",
+                state.symbol, state.timeframe, bar_index,
+                score_result.pre_score, state.min_score_threshold,
+            )
+            return  # Too weak — skip
+
+        direction = score_result.direction
+        pre_score = score_result.pre_score
+
+        # Check previous cached direction for confirmation
+        if self._redis is not None and self._redis.is_initialized:
+            try:
+                cached_dir = await self._redis.get(
+                    f"hcm:midbar:{state.symbol}:{state.timeframe}:direction"
+                )
+                if cached_dir == direction:
+                    state.midbar_confirm_count += 1
+                else:
+                    state.midbar_confirm_count = 1  # reset on direction change
+                state.midbar_cached_direction = direction
+                state.midbar_cached_score = pre_score
+
+                # Write to Redis
+                pipe = self._redis.pipeline()
+                pipe.set(
+                    f"hcm:midbar:{state.symbol}:{state.timeframe}:direction",
+                    direction, ex=300,
+                )
+                pipe.set(
+                    f"hcm:midbar:{state.symbol}:{state.timeframe}:pre_score",
+                    str(pre_score), ex=300,
+                )
+                pipe.set(
+                    f"hcm:midbar:{state.symbol}:{state.timeframe}:confirm_count",
+                    str(state.midbar_confirm_count), ex=300,
+                )
+                await pipe.execute()
+            except Exception:
+                pass
+
+        logger.info(
+            "Midbar[%s/%s bar-%d]: dir=%s score=%.3f confirm=%d/%d",
+            state.symbol, state.timeframe, bar_index,
+            direction, pre_score,
+            state.midbar_confirm_count, state.midbar_min_confirm,
+        )
+
+    # ── Signal Production Pipeline ──────────────
+
+    async def _produce_signal(self, state: SymbolState) -> None:
+        """Execute the full signal production pipeline.
+
+        Steps:
+          0. Market circuit check (Fix #5)
+          1. Fetch K-lines + Redis live bar merge (Fix #4)
+          2. Compute indicators (with ATR, bar_open)
+          3. Regime classification
+          4. Bar confirmation (Fix #1)
+          5. Scoring (with bar_momentum Fix #2)
+          6. Cooldown check
+          7. AI invocation + AI Fallback Gate (Fix #3)
+          8. Publish
+
+        Args:
+            state: SymbolState for current symbol.
+        """
+        trace_id = uuid.uuid4().hex[:12]
+        logger.info("Signal production: symbol=%s, trace_id=%s", state.symbol, trace_id)
+
+        # ── P0 fix (2026-07-15): per-bar idempotency guard ──
+        # When _wait_bar_close force-advances on a stale feed, _produce_signal
+        # can be re-entered on the SAME bar. Without this guard it re-runs the
+        # full pipeline and re-publishes a NO_TRADE every loop (self-DoS). Once
+        # a bar's open_time has been produced, subsequent force-advances on that
+        # identical bar become no-ops — including skipping the kline fetch.
+        current_bar_open = getattr(state, "last_bar_open_time", None)
+        guard_key = f"{state.symbol}:{state.timeframe}"
+        last_produced = self._last_produced_open_time.get(guard_key)
+        if (
+            last_produced is not None
+            and current_bar_open is not None
+            and last_produced == current_bar_open
+        ):
+            logger.debug(
+                "Skip duplicate production: %s/%s open_time=%s already produced "
+                "(stale-feed guard)",
+                state.symbol, state.timeframe, current_bar_open,
+            )
+            return
+        if current_bar_open is not None:
+            self._last_produced_open_time[guard_key] = current_bar_open
+
+        # ── Signal production heartbeat — pipeline uses this to determine engine health
+        if self._redis is not None and self._redis.is_initialized:
+            try:
+                await self._redis.set(
+                    f"hcm:signal_tower:last_production:{state.symbol}:{state.timeframe}",
+                    datetime.now(timezone.utc).isoformat(),
+                    ex=300,  # TTL 5 min
+                )
+            except Exception:
+                pass
+
+        # ── Step 1: Fetch K-line data ───────────
+        t0 = time.time()
+        klines = await self._fetch_klines(state.symbol, state.timeframe)
+        if len(klines) < 30:
+            logger.warning("Insufficient kline data: %s (%d bars)", state.symbol, len(klines))
+            return
+
+        closes = np.array([k["close"] for k in klines], dtype=np.float64)
+        highs = np.array([k["high"] for k in klines], dtype=np.float64)
+        lows = np.array([k["low"] for k in klines], dtype=np.float64)
+        opens = np.array([k["open"] for k in klines], dtype=np.float64)
+
+        if self._watchdog:
+            await self._watchdog.report_step("kline", time.time() - t0)
+
+        # ── Step 1: Compute Indicators ──────────
+        t0 = time.time()
+        indicators = self._indicator_calc.compute_all(closes, highs, lows, opens)
+
+        if self._watchdog:
+            await self._watchdog.report_step("indicator", time.time() - t0, timeout_seconds=5.0)
+
+        # ── Step 3: Regime Classification ───────
+        t0 = time.time()
+        manual_score = await self._get_manual_regime_score(state.symbol)
+        regime_result = self._regime_classifier.classify(
+            adx=indicators.adx_14,
+            adx_values=indicators.adx_values,
+            bbw=indicators.bbw,
+            bbw_ma20=indicators.bbw_ma20,
+            close=indicators.close,
+            recent_highs=indicators.recent_highs,
+            recent_lows=indicators.recent_lows,
+            pct_b=indicators.pct_b,
+            manual_regime_score=manual_score,
+        )
+
+        # ── Step 4: Scoring ─────────────────────
+        score_result = self._scoring_engine.compute_pre_score(indicators, regime_result)
+
+        if not score_result.threshold_passed:
+            logger.info(
+                "Signal skipped: score=%.3f < threshold=%.3f (%s, %s)",
+                score_result.pre_score, score_result.threshold,
+                state.symbol, regime_result.regime.value,
+            )
+            # Publish filtered signal so PG captures pre_score for diagnostics
+            await self._publish_filtered_signal(
+                state, indicators, regime_result, score_result, trace_id,
+            )
+            return
+
+        # ── Step 6: Cooldown Check ──────────────
+        # vol_ratio = relative band width (bbw / bbw_ma20) drives P1 adaptive cooldown
+        vol_ratio = (indicators.bbw / indicators.bbw_ma20) if indicators.bbw_ma20 > 0 else 1.0
+        bar_seconds = TIMEFRAME_SECONDS.get(state.timeframe, 300)
+        cooldown = self._scoring_engine.compute_cooldown(
+            regime_result.regime,
+            score_result.pre_score,
+            score_result.direction,
+            state.last_direction,
+            vol_ratio,
+            bar_seconds=bar_seconds,
+        )
+        elapsed_since_last = time.time() - state.last_signal_time
+        if elapsed_since_last < cooldown:
+            remaining = int(cooldown - elapsed_since_last)
+            logger.info(
+                "Signal suppressed: cooldown active for %s/%s (remaining %ds, cooldown %ds, regime %s)",
+                state.symbol, state.timeframe, remaining, cooldown, regime_result.regime,
+            )
+            return
+
+        # P1-6: Rate-limit same-direction cooldown bypass (max 3 consecutive)
+        if cooldown == 0:
+            if state.same_dir_bypass_count >= 3:
+                logger.info(
+                    "Signal suppressed: same-dir bypass rate limit reached "
+                    "(%s, trace_id=%s)",
+                    state.symbol, trace_id,
+                )
+                return
+            state.same_dir_bypass_count += 1
+
+        # ── Step 7: AI Invocation ───────────────
+        # P2-7: dispute-only AI — skip when direction is clear
+        t0 = time.time()
+        ai_response: Optional[AiResponse] = None
+        bypass_reason: Optional[str] = None
+
+        # Compute buy/sell dispute score
+        buy_sell_diff = abs(
+            getattr(score_result, 'buy_score', 0.0) -
+            getattr(score_result, 'sell_score', 0.0)
+        )
+
+        # Dispute check: only call AI when direction is ambiguous
+        dispute_ai = (
+            buy_sell_diff <= state.dispute_diff_threshold
+            and score_result.pre_score >= state.min_score_threshold
+            and score_result.direction != "NO_TRADE"
+        )
+
+        bypass_ai = (
+            self._ai_invoker is None
+            or self._ai_invoker.is_bypass
+            or not dispute_ai  # P2-7: skip AI when direction is clear
+        )
+
+        if self._ai_invoker is not None and self._ai_invoker.is_bypass:
+            bypass_reason = "circuit_breaker_open"
+        elif not dispute_ai:
+            bypass_reason = f"direction_clear(diff={buy_sell_diff:.3f})"
+
+        if not bypass_ai:
+            try:
+                prompt = self._build_prompt(
+                    state.symbol, state.timeframe, indicators,
+                    regime_result, score_result,
+                )
+                ai_response = await self._ai_invoker.invoke(
+                    prompt,
+                    pre_score_direction=score_result.direction,
+                    trace_id=trace_id,
+                )
+                if not ai_response.success:
+                    bypass_reason = "ai_fallback"
+                    ai_response = None
+            except Exception as exc:
+                logger.warning("AI invocation failed: %s → using pre_score direction", exc)
+                bypass_reason = "ai_error"
+
+            if self._watchdog:
+                await self._watchdog.report_step(
+                    "deepseek", time.time() - t0, timeout_seconds=15.0
+                )
+
+        # ── Step 8: Midbar Cross-Validation ──────
+        # P2-7: compare main bar direction with midbar cached direction
+        midbar_confirmed = False
+        if state.midbar_enabled and state.midbar_confirm_count >= state.midbar_min_confirm:
+            if state.midbar_cached_direction == score_result.direction:
+                midbar_confirmed = True
+                logger.info(
+                    "Midbar confirmed: dir=%s confirm=%d/%d score=%.3f",
+                    state.midbar_cached_direction,
+                    state.midbar_confirm_count, state.midbar_min_confirm,
+                    state.midbar_cached_score,
+                )
+
+        # ── Step 9: Final Direction ──────────────
+        if ai_response is not None and ai_response.success:
+            ai_dir = ai_response.direction
+            ai_conf = ai_response.confidence
+            # Audit 2026-07-14: don't let AI veto a strong scoring signal.
+            # Only respect AI's NO_TRADE override if its confidence is HIGHER
+            # than the scoring engine's pre_score, OR scoring is weak (< 0.20).
+            if ai_dir == "NO_TRADE" and score_result.pre_score >= 0.20 and ai_conf < score_result.pre_score:
+                final_direction = score_result.direction
+                final_confidence = score_result.pre_score
+                logger.info(
+                    "AI NO_TRADE veto overridden by strong scoring: "
+                    "score=%.2f beats ai_conf=%.2f → %s",
+                    score_result.pre_score, ai_conf, final_direction,
+                )
+            else:
+                final_direction = ai_dir
+                final_confidence = ai_conf
+        else:
+            final_direction = score_result.direction
+            final_confidence = score_result.pre_score
+            self._stats["signals_bypassed"] += 1
+
+        if final_direction == "NO_TRADE":
+            logger.info("Signal NO_TRADE: %s", state.symbol)
+            # Audit 2026-07-14: still publish NO_TRADE so dashboard's
+            # `latestInference` reflects current state (pre_score visible).
+            await self._publish_filtered_signal(
+                state, indicators, regime_result, score_result, trace_id,
+            )
+            self._clear_midbar_cache(state)
+            return
+
+        # P2-7: if midbar not confirmed, skip order — just record signal
+        # With fallback: if sub-bar data unavailable (0 confirm after 3+ main bars),
+        # allow signals through without midbar requirement.
+        if state.midbar_enabled and not midbar_confirmed:
+            # Allow fallback: if midbar loop has been running for > 3 main bars
+            # with 0 confirmations, sub-bar data is likely unavailable → bypass
+            if state.midbar_confirm_count == 0 and self._stats.get("loops", 0) > 3:
+                logger.warning(
+                    "Midbar bypass: 0 confirmations after %d main loops — "
+                    "sub-bar data may be unavailable (M1 not collected?)",
+                    self._stats.get("loops", 0),
+                )
+            else:
+                logger.info(
+                    "Signal skipped: midbar not confirmed (confirm=%d/%d cached=%s final=%s)",
+                    state.midbar_confirm_count, state.midbar_min_confirm,
+                    state.midbar_cached_direction, final_direction,
+                )
+                await self._publish_filtered_signal(
+                    state, indicators, regime_result, score_result, trace_id,
+                    extra_reason="midbar_not_confirmed",
+                )
+                self._clear_midbar_cache(state)
+                return
+
+        # ── Step 10: Publish Signal ──────────────
+        t0 = time.time()
+        signal_id = await self._signal_publisher.generate_signal_id() if self._signal_publisher else int(time.time() * 1000000) % 1000000000
+
+        acc_id = await self._resolve_account_id()
+        if acc_id is None:
+            logger.error("无法解析主交易账户（无 active master / DB 不可用），跳过信号发射")
+            return
+        signal_data = SignalData(
+            signal_id=signal_id,
+            task_id=0,
+            account_id=acc_id,
+            symbol=state.symbol,
+            time_frame=state.timeframe,
+            direction=final_direction,
+            entry_price=indicators.close,
+            sl_price=0.0,
+            tp1=0.0,
+            tp2=0.0,
+            lot=0.0,
+            confidence=final_confidence,
+            signal_mode=(
+                "ai_dynamic" if ai_response is not None
+                else (score_result.weight_scheme or "scoring")[:30]
+            ),
+            indicator_values={
+                "adx_14": round(indicators.adx_14, 2),
+                "rsi_14": round(indicators.rsi_14, 2),
+                "macd": round(indicators.macd, 4),
+                "atr_14": round(indicators.atr_14, 2),
+            },
+            fallback_reason=bypass_reason,
+            regime=regime_result.regime.value,
+            pre_score=round(score_result.pre_score, 4),
+            weight_scheme=score_result.weight_scheme,
+            position_in_range=round(score_result.range_position.pct_b_range, 4) if score_result.range_position else None,
+            trace_id=trace_id,
+        )
+
+        if self._signal_publisher:
+            await self._signal_publisher.publish(signal_data)
+
+        if self._watchdog:
+            await self._watchdog.report_step("publish", time.time() - t0)
+
+        # Update state
+        state.last_signal_time = time.time()
+        state.last_direction = final_direction
+        # P1-6: reset same-dir bypass counter on non-bypass signals
+        if cooldown > 0:
+            state.same_dir_bypass_count = 0
+        self._stats["signals_produced"] += 1
+
+        logger.info(
+            "Signal produced: id=%d, symbol=%s, direction=%s, "
+            "pre_score=%.3f, confidence=%.2f, regime=%s, "
+            "bypass=%s, bar_momentum=%.3f, trace_id=%s",
+            signal_id, state.symbol, final_direction,
+            score_result.pre_score, final_confidence,
+            regime_result.regime.value, bypass_reason or "none",
+            score_result.bar_momentum_applied, trace_id,
+        )
+
+    async def _publish_filtered_signal(
+        self, state: SymbolState, indicators: IndicatorResults,
+        regime_result: RegimeResult, score_result: ScoreResult,
+        trace_id: str,
+        extra_reason: str = "",
+    ) -> None:
+        """Publish a below-threshold signal to PG for diagnostic visibility.
+
+        Score 0.1-0.28 signals that would otherwise be silently dropped are
+        written with direction=NO_TRADE so the real pre_score is captured.
+        """
+        if self._signal_publisher is None:
+            return
+
+        signal_id = await self._signal_publisher.generate_signal_id()
+
+        acc_id = await self._resolve_account_id()
+        if acc_id is None:
+            logger.error("无法解析主交易账户（无 active master / DB 不可用），跳过信号发射")
+            return
+        signal_data = SignalData(
+            signal_id=signal_id,
+            task_id=0,
+            account_id=acc_id,
+            symbol=state.symbol,
+            time_frame=state.timeframe,
+            direction="NO_TRADE",
+            entry_price=indicators.close,
+            sl_price=0.0,
+            tp1=0.0,
+            tp2=0.0,
+            lot=0.0,
+            confidence=score_result.pre_score,
+            signal_mode="filtered",
+            indicator_values={
+                "adx_14": round(indicators.adx_14, 2),
+                "rsi_14": round(indicators.rsi_14, 2),
+                "macd": round(indicators.macd, 4),
+            },
+            fallback_reason=(
+                # Accurate reason: only claim "below_threshold" when the score
+                # actually FAILED the gate. When the threshold PASSED but the
+                # signal was still filtered (NO_TRADE direction or midbar
+                # cross-validation block), report the real cause instead of a
+                # misleading "below_threshold(0.254<0.050)".
+                (
+                    f"below_threshold({score_result.pre_score:.3f}<{score_result.threshold:.3f})"
+                    + (f"|{extra_reason}" if extra_reason else "")
+                )
+                if not score_result.threshold_passed
+                else (extra_reason or f"no_trade(dir={score_result.direction})")
+            ),
+            regime=regime_result.regime.value,
+            pre_score=round(score_result.pre_score, 4),
+            weight_scheme=score_result.weight_scheme,
+            position_in_range=round(score_result.range_position.pct_b_range, 4) if score_result.range_position else None,
+            trace_id=trace_id,
+        )
+
+        await self._signal_publisher.publish(signal_data)
+        logger.debug(
+            "Filtered signal published: id=%d, symbol=%s, pre_score=%.3f (below threshold)",
+            signal_id, state.symbol, score_result.pre_score,
+        )
+
+    def _clear_midbar_cache(self, state: SymbolState) -> None:
+        """Reset in-memory midbar confirmation state after a signal is
+        published or filtered.
+
+        Called synchronously from the production pipeline (lines that handle
+        NO_TRADE and midbar-not-confirmed outcomes). Before this method
+        existed the two call-sites raised AttributeError on every filtered
+        signal — that was the source of the recurring ``errors`` count and
+        aborted the pipeline before ``_clear_midbar_cache`` could run.
+
+        We only reset the in-process counters here. The Redis midbar keys
+        (``hcm:midbar:{symbol}:{tf}:*``) carry a 300s TTL and expire on their
+        own, so a stale cached direction cannot survive to cross-validate a
+        future trade.
+        """
+        state.midbar_confirm_count = 0
+        state.midbar_cached_direction = ""
+        state.midbar_cached_score = 0.0
+
+    # ═══════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════
+    #  Fix #1: Bar Direction Confirmation
+
+    # ═══════════════════════════════════════════════════════════════
+    #  Fix #3: AI Fallback Gate
+
+    # ═══════════════════════════════════════════════════════════════
+    #  Fix #4: Redis Live Bar Read
+    # ── K-line Fetching ─────────────────────────
+
+    async def _fetch_klines(
+        self, symbol: str, timeframe: str, limit: int = 100
+    ) -> list[dict]:
+        """Fetch recent klines from PostgreSQL, merged with Redis live bar.
+
+        PostgreSQL query first. Then, if Redis has a live bar with open_time
+        newer than the last PG bar, it is appended to the list.
+
+        Args:
+            symbol: Trading symbol.
+            timeframe: Timeframe string.
+            limit: Max bars to fetch.
+
+        Returns:
+            List of kline dicts sorted by open_time ascending.
+        """
+        if self._db is None or not self._db.is_initialized:
+            return []
+
+        try:
+            rows = await self._db.fetch(
+                """SELECT open_time, open, high, low, close, tick_volume
+                   FROM hcm_market.klines
+                   WHERE symbol=$1 AND time_frame=$2
+                   ORDER BY open_time DESC LIMIT $3""",
+                symbol, timeframe, limit,
+            )
+            # Reverse to ascending order for indicator calculation
+            klines = [
+                {
+                    "open_time": r["open_time"],
+                    "open": float(r["open"]),
+                    "high": float(r["high"]),
+                    "low": float(r["low"]),
+                    "close": float(r["close"]),
+                    "tick_volume": int(r["tick_volume"]),
+                }
+                for r in reversed(rows)
+            ]
+            return klines
+        except Exception as exc:
+            logger.warning("Kline fetch failed for %s/%s: %s", symbol, timeframe, exc)
+            return []
+
+    # ── Prompt Builder ──────────────────────────
+
+    def _build_prompt(
+        self,
+        symbol: str,
+        timeframe: str,
+        indicators: IndicatorResults,
+        regime: RegimeResult,
+        score: ScoreResult,
+    ) -> str:
+        """Build a compact, data-dense DeepSeek prompt.
+
+        Priority: user-configured Redis template → hardcoded fallback.
+        Template variables: {symbol} {timeframe} {regime} {regime_strength}
+        {rsi} {macd} {adx} {bbw} {pct_b} {stoch_k} {atr} {bar_open} {close}
+        {bar_momentum} {ma_alignment} {pre_dir} {pre_score} {trend_note} {momentum_note}
+        """
+        regime_label = regime.regime.value
+        trend_note = ""
+        if regime_label == "TREND":
+            trend_note = "TREND: align signal with MACD/MA. Reject counter-trend."
+        elif regime_label == "RANGE":
+            trend_note = "RANGE: only reverse at extreme %b."
+        elif regime_label == "PRE_TREND":
+            trend_note = "PRE_TREND: prefer breakout with momentum>1.5."
+
+        momentum_note = ""
+        bar_mom = float(getattr(indicators, 'bar_momentum', 0) or 0)
+        if bar_mom > 2.0:
+            momentum_note = "STRONG momentum — follow direction."
+        elif bar_mom < 0.5:
+            momentum_note = "WEAK momentum — noise, prefer NO_TRADE."
+
+        vars_dict = {
+            "symbol": symbol, "timeframe": timeframe,
+            "regime": regime_label, "regime_strength": f"{regime.strength:.2f}",
+            "rsi": f"{indicators.rsi_14:.0f}", "macd": f"{indicators.macd:.2f}",
+            "adx": f"{indicators.adx_14:.0f}", "bbw": f"{indicators.bbw:.3f}",
+            "pct_b": f"{indicators.pct_b:.3f}", "stoch_k": f"{indicators.stoch_k:.0f}",
+            "atr": f"{indicators.atr_14:.1f}", "bar_open": f"{indicators.bar_open:.2f}",
+            "close": f"{indicators.close:.2f}", "bar_momentum": f"{bar_mom:.2f}",
+            "ma_alignment": str(indicators.ma_alignment),
+            "pre_dir": score.direction, "pre_score": f"{score.pre_score:.3f}",
+            "trend_note": trend_note, "momentum_note": momentum_note,
+        }
+
+        # 1. Try user-configured Redis template
+        user_template = getattr(self, "_prompt_template", None)
+        if user_template:
+            try:
+                return user_template.format(**vars_dict)
+            except (KeyError, ValueError) as exc:
+                logger.warning("User prompt template error: %s — falling back to default", exc)
+
+        # 2. Hardcoded fallback (compact, token-efficient, always safe)
+        return (
+            f"XAUUSD {timeframe} | {regime_label} r={regime.strength:.2f}\n"
+            f"RSI={indicators.rsi_14:.0f} MACD={indicators.macd:.2f} ADX={indicators.adx_14:.0f} "
+            f"%%b={indicators.pct_b:.3f} StochK={indicators.stoch_k:.0f}\n"
+            f"ATR14={indicators.atr_14:.1f} bar_open={indicators.bar_open:.2f} close={indicators.close:.2f} "
+            f"bar_momentum={bar_mom:.2f} (range/ATR)\n"
+            f"MA={indicators.ma_alignment} pre_dir={score.direction} pre_score={score.pre_score:.3f}\n"
+            f"{trend_note} {momentum_note}\n"
+            f"Output JSON: "
+            f'{{"direction":"BUY|SELL|NO_TRADE","confidence":0-1,'
+            f'"sl_atr_mult":1.5-2.5,"tp_atr_mult":2.0-4.0,'
+            f'"reason":"<50chars","risk":"<30chars"}}'
+        )
+
+    # ── Config ──────────────────────────────────
+
+    async def _resolve_account_id(self) -> Optional[int]:
+        """Resolve the active master account_id from broker accounts.
+
+        Queries hcm_broker.accounts for the first active master account.
+        Result is cached after the first successful query.
+
+        Returns:
+            account_id (int) on success, None if no active master found
+            and DB is unavailable.
+        """
+        if self._account_id is not None:
+            return self._account_id
+
+        if self._db is not None and self._db.is_initialized:
+            try:
+                row = await self._db.fetchrow(
+                    """SELECT account_id FROM hcm_broker.accounts
+                       WHERE is_active = true AND account_type = 'master'
+                       ORDER BY account_id LIMIT 1"""
+                )
+                if row is not None:
+                    self._account_id = int(row["account_id"])
+                    logger.info("Resolved account_id=%d from broker accounts", self._account_id)
+                    return self._account_id
+            except Exception as exc:
+                logger.warning("Failed to query broker accounts: %s", exc)
+
+        # 账户解析失败（DB 不可用 / 无 active master）：fail-closed，
+        # 返回 None 让上游停止发射账户不明的信号，而非静默转发到停用种子账户。
+        logger.error("No active master account resolved — refusing to emit signal with unknown account_id")
+        return None
+
+    async def _get_manual_regime_score(self, symbol: str) -> Optional[int]:
+        """Get manual regime score from config if set.
+
+        Args:
+            symbol: Trading symbol.
+
+        Returns:
+            Manual score or None.
+        """
+        if self._config is None:
+            return None
+
+        try:
+            raw = await self._config.get_with_resolution(
+                "manual_regime_score", symbol=symbol
+            )
+            if raw and raw.strip():
+                return int(raw)
+        except Exception:
+            pass
+
+        return None
+
+    async def load_config(self) -> None:
+        """Load scheduler parameters from config_provider.
+
+        P0: indicator periods + regime detection thresholds + market guard
+        configs are now wired through config_provider so they can be tuned
+        live (no restart). All runtime parameters follow the same
+        config-center governance as O2.
+        """
+        if self._config is None:
+            return
+
+        try:
+            # Hot-reload cadence (self-referential, tunable)
+            self._config_reload_interval = max(
+                5,
+                await self._config.get_int(
+                    "signal_tower.config_reload_interval",
+                    DEFAULT_CONFIG_RELOAD_INTERVAL_SECONDS,
+                ),
+            )
+            # P0-critical loads first — independent of other loaders
+            await self._load_indicator_config()
+            await self._load_regime_config()
+            # Existing loaders (each has internal error handling)
+            await self._scoring_engine.load_config()
+            if self._watchdog:
+                await self._watchdog.load_config()
+            # Load user prompt template (Redis → optional, fallback to hardcoded if missing)
+            await self._load_prompt_template()
+            # P2-7: hot-reload midbar per-period config (enable/disable, thresholds)
+            await self._load_midbar_config()
+            logger.info(
+                "Scheduler config loaded (reload interval=%ds)",
+                self._config_reload_interval,
+            )
+        except Exception as exc:
+            logger.warning("Scheduler config load failed: %s", exc)
+
+    # ── Config Loaders (P0) ─────────────────────
+
+    async def _load_indicator_config(self) -> None:
+        """Rebuild IndicatorCalculator with periods read from config_provider.
+
+        IndicatorCalculator is stateless across bars, so recreating it on each
+        config load is safe and keeps it in sync with live-tuned periods.
+        """
+        if self._config is None:
+            return
+        try:
+            periods = {
+                "rsi_period": await self._config.get_int("indicator_rsi_period", DEFAULT_RSI_PERIOD),
+                "macd_fast": await self._config.get_int("indicator_macd_fast", DEFAULT_MACD_FAST),
+                "macd_slow": await self._config.get_int("indicator_macd_slow", DEFAULT_MACD_SLOW),
+                "macd_signal": await self._config.get_int("indicator_macd_signal", DEFAULT_MACD_SIGNAL),
+                "adx_period": await self._config.get_int("indicator_adx_period", DEFAULT_ADX_PERIOD),
+                "boll_period": await self._config.get_int("indicator_boll_period", DEFAULT_BOLL_PERIOD),
+                "boll_std": await self._config.get_float("indicator_boll_std", DEFAULT_BOLL_STD),
+                "stoch_k": await self._config.get_int("indicator_stoch_k", DEFAULT_STOCH_K),
+                "stoch_d": await self._config.get_int("indicator_stoch_d", DEFAULT_STOCH_D),
+                "stoch_smooth": await self._config.get_int("indicator_stoch_smooth", DEFAULT_STOCH_SMOOTH),
+                "ma_short": await self._config.get_int("indicator_ma_short", DEFAULT_MA_SHORT),
+                "ma_long": await self._config.get_int("indicator_ma_long", DEFAULT_MA_LONG),
+            }
+            self._indicator_calc = IndicatorCalculator(**periods)
+            logger.info(
+                "IndicatorCalculator rebuilt from config_provider: rsi_period=%s adx_period=%s boll_period=%s",
+                periods["rsi_period"], periods["adx_period"], periods["boll_period"],
+            )
+        except Exception as exc:
+            logger.warning("Indicator config load failed: %s (keeping previous calculator)", exc)
+
+    async def _load_regime_config(self) -> None:
+        """Build RegimeConfig from config_provider and push into the classifier.
+
+        Uses RegimeClassifier.update_config() which swaps self._cfg in place,
+        preserving in-flight confirmation/lock state.
+        """
+        if self._config is None:
+            return
+        try:
+            cfg = RegimeConfig(
+                pretrend_adx_rising_bars=await self._config.get_int("pretrend_adx_rising_bars", 3),
+                pretrend_breakout_factor=await self._config.get_float("pretrend_breakout_factor", 1.005),
+                pretrend_breakout_lookback=await self._config.get_int("pretrend_breakout_lookback", 20),
+                pretrend_threshold_floor=await self._config.get_float("pretrend_threshold_floor", 0.42),
+                regime_adx_trend=await self._config.get_float("regime_adx_trend", 24.0),
+                trend_strong_adx_threshold=await self._config.get_float("trend_strong_adx_threshold", 28.0),
+                fade_adx_falling_bars=await self._config.get_int("fade_adx_falling_bars", 3),
+                fade_bbw_ratio_max=await self._config.get_float("fade_bbw_ratio_max", 1.0),
+                regime_adx_range=await self._config.get_float("regime_adx_range", 22.0),
+                range_bbw_max=await self._config.get_float("range_bbw_max", 1.0),
+                switch_pretrend_confirm_bars=await self._config.get_int("switch_pretrend_confirm_bars", 0),
+                switch_pretrend_lock_bars=await self._config.get_int("switch_pretrend_lock_bars", 0),
+                switch_trend_confirm_bars=await self._config.get_int("switch_trend_confirm_bars", 2),
+                switch_trend_lock_bars=await self._config.get_int("switch_trend_lock_bars", 1),
+                switch_fade_confirm_bars=await self._config.get_int("switch_fade_confirm_bars", 2),
+                switch_fade_lock_bars=await self._config.get_int("switch_fade_lock_bars", 0),
+                switch_range_confirm_bars=await self._config.get_int("switch_range_confirm_bars", 2),
+                switch_range_lock_bars=await self._config.get_int("switch_range_lock_bars", 1),
+                # P1 — volatility-adaptive
+                vol_adapt_enable=await self._config.get_bool("regime_vol_adapt_enable", False),
+                vol_adapt_scale=await self._config.get_float("regime_vol_adapt_scale", 0.15),
+                vol_adapt_band_ref=await self._config.get_float("regime_vol_adapt_band_ref", 1.0),
+            )
+            self._regime_classifier.update_config(cfg)
+            logger.info(
+                "RegimeClassifier config updated from config_provider: regime_adx_trend=%.1f range_bbw_max=%.2f vol_adapt=%s",
+                cfg.regime_adx_trend, cfg.range_bbw_max, cfg.vol_adapt_enable,
+            )
+        except Exception as exc:
+            logger.warning("Regime config load failed: %s (keeping previous config)", exc)
+
+    async def _load_midbar_config(self) -> None:
+        """Hot-reload midbar per-period config into SymbolState for each symbol.
+
+        Called every config_reload_interval so the panel's 开/关 and
+        parameter changes take effect without restarting the signal tower.
+        """
+        if self._config is None:
+            return
+        for sym, state in self._symbols.items():
+            tf = state.timeframe
+            try:
+                state.midbar_enabled = await self._config.get_bool(f"midbar.{tf}.enabled", False)
+                state.sub_period = await self._config.get(f"midbar.{tf}.sub_period") or tf
+                state.sub_bar_seconds = TIMEFRAME_SECONDS.get(state.sub_period, 60)
+                state.midbar_min_confirm = await self._config.get_int(
+                    f"midbar.{tf}.min_confirm_bars", 2,
+                )
+                state.midbar_liquidity_max = await self._config.get_float(
+                    f"midbar.{tf}.liquidity_bidask_max", 0.08,
+                )
+                logger.info(
+                    "Midbar config for %s/%s reloaded: enabled=%s sub=%s confirm=%d",
+                    sym, tf, state.midbar_enabled, state.sub_period, state.midbar_min_confirm,
+                )
+                bars_json = await self._config.get_json(f"midbar.{tf}.inference_bars")
+                if isinstance(bars_json, list):
+                    state.midbar_inference_bars = bars_json
+                state.trend_adx_threshold = await self._config.get_float(
+                    f"scoring.{tf}.trend_adx_threshold", 22.0,
+                )
+                state.trend_adx_exit_threshold = await self._config.get_float(
+                    f"scoring.{tf}.trend_adx_exit_threshold", 18.0,
+                )
+                state.dispute_diff_threshold = await self._config.get_float(
+                    f"scoring.{tf}.dispute_diff_threshold", 0.05,
+                )
+                state.min_score_threshold = await self._config.get_float(
+                    f"scoring.{tf}.min_score_threshold", 0.15,
+                )
+                state.min_adx_for_trade = await self._config.get_float(
+                    f"scoring.{tf}.min_adx_for_trade", 22.0,
+                )
+            except Exception as exc:
+                logger.warning("Midbar config for %s/%s load failed: %s", sym, tf, exc)
+
+    async def _load_prompt_template(self) -> None:
+        """Load user-defined prompt template from Redis config.
+
+        If the key `signal_tower.prompt.user_prompt_template` exists and is
+        non-empty in Redis hcm:config:v2, use it as the DeepSeek prompt with
+        {variable} interpolation. Falls back to hardcoded default if missing
+        or broken.
+        """
+        if self._config is None:
+            self._prompt_template = None
+            return
+        try:
+            raw = await self._config.get("signal_tower.prompt.user_prompt_template", "")
+            if raw and raw.strip():
+                self._prompt_template = raw.strip()
+                logger.info("User prompt template loaded (%d chars)", len(raw))
+            else:
+                self._prompt_template = None
+        except Exception:
+            self._prompt_template = None
+
+    async def _config_reload_loop(self) -> None:
+        """Periodically re-load runtime parameters so config edits take effect
+        without a service restart (P0 agility requirement).
+
+        Safe to run alongside signal production: IndicatorCalculator rebuild
+        is an atomic reference swap and RegimeClassifier.update_config preserves
+        confirmation/lock state.
+        """
+        logger.info("Config hot-reload loop started (interval=%ds)", self._config_reload_interval)
+        while self._running:
+            await asyncio.sleep(self._config_reload_interval)
+            try:
+                await self.load_config()
+            except Exception as exc:  # never let the loop die
+                logger.warning("Periodic config reload failed: %s", exc)
+
+    # ── Stats ───────────────────────────────────
+
+    def get_stats(self) -> dict:
+        """Get scheduler statistics.
+
+        Returns:
+            Dict with runtime stats.
+        """
+        return {
+            **self._stats,
+            "uptime_seconds": round(time.time() - self._start_time, 1),
+            "active_symbols": list(self._symbols.keys()),
+            "running": self._running,
+        }
+
+    async def health_check(self) -> dict:
+        """Check scheduler health.
+
+        Returns:
+            Dict with status and stats.
+        """
+        return {
+            "status": "healthy" if self._running else "stopped",
+            "stats": self.get_stats(),
+        }

@@ -1,0 +1,1302 @@
+#!/usr/bin/env python3
+"""MT5 Bridge — 连接真实 MT5，替换模拟 K 线和 stub 下单。
+
+功能:
+  1. 从 MT5 拉取实时 XAUUSD M5 K 线 → PG + Redis
+  2. 实时推送价格 → Redis
+  3. 监听 Redis signal:risk_passed → MT5 下单
+  4. 下单后更新信号状态 + 写入持仓
+
+配置:
+  从 Redis hcm:config:v2 读取 mt5.server_address / mt5.account_number / mt5.password
+  在 MT5 接入页面 (localhost:3000/system/mt5) 修改后即时生效
+
+用法:
+  python mt5_bridge.py
+  python mt5_bridge.py --dry-run
+  python mt5_bridge.py --max-retries=10
+"""
+
+import os
+import sys
+import json
+import time
+import asyncio
+import logging
+from datetime import datetime, timezone
+
+import MetaTrader5 as _mt5_global  # top-level import for reliable order_send
+
+# Lazy import — resolved when position_sync.py exists (T02+)
+# Re-imported in T04 when actually called from main()
+from position_sync import sync_positions  # noqa: F401
+
+# Live bar Redis key — inline to avoid cross-module import (bridge runs on Windows host)
+LIVE_BAR_KEY_TEMPLATE = "market:bar:{symbol}:{timeframe}:live"
+LIVE_BAR_TTL_SECONDS = 600
+
+# 单条信号过期阈值（秒）—— 超过即拒绝下单。可由 Redis bridge.max_signal_age_seconds 热改。
+DEFAULT_MAX_SIGNAL_AGE_SECONDS = 10
+
+PG_DSN = "postgresql://hcm:hcm_dev_pwd@localhost:5432/hcm_v2"
+REDIS_URL = "redis://localhost:6379"
+SYMBOL = "XAUUSD"
+DEFAULT_TIMEFRAME = "M5"
+DEFAULT_TIMEFRAMES = ["M5", "M1"]   # P2-7: multi-timeframe collection
+TIMEFRAME_MAP = {
+    "M1": 1, "M5": 5, "M15": 15, "M30": 30,
+    "H1": 60, "H4": 240, "D1": 1440,
+}
+MT5_TIMEFRAME_MAP = {
+    "M1": None, "M5": None, "M15": None, "M30": None,
+    "H1": None, "H4": None, "D1": None,
+}  # populated after mt5 import
+MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("mt5_bridge")
+_fh = logging.FileHandler(r"D:\HCM_ASST\hcm-v2\tools\bridge.log", encoding="utf-8")
+_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log.addHandler(_fh)
+
+
+def _load_mt5_config(redis_conn):
+    cfg = redis_conn.hgetall("hcm:config:v2") or {}
+    login_raw = cfg.get("mt5.account_number", "0")
+    try:
+        login = int(login_raw) if login_raw and login_raw != "0" else 0
+    except (ValueError, TypeError):
+        login = 0
+    # Read timeframe from datasource config, with M5 as default
+    tf_str = cfg.get("datasource.timeframe", DEFAULT_TIMEFRAME)
+    if not tf_str or tf_str.strip() == "":
+        tf_str = DEFAULT_TIMEFRAME
+    # P2-7: read additional timeframes (comma-separated, e.g. "M1,M15")
+    tfs_str = cfg.get("datasource.timeframes", "")
+    extra_tfs = []
+    if tfs_str and tfs_str.strip():
+        extra_tfs = [t.strip() for t in tfs_str.split(",") if t.strip() and t.strip() != tf_str]
+    # Dedup + merge: primary timeframe first, then extras
+    all_tfs = [tf_str]
+    for t in extra_tfs:
+        if t not in all_tfs:
+            all_tfs.append(t)
+    # Read max_bars from config
+    max_bars_str = cfg.get("datasource.max_bars", "500")
+    try:
+        max_bars = int(max_bars_str)
+    except (ValueError, TypeError):
+        max_bars = 500
+    # Read symbols from config (default to XAUUSD)
+    symbols_str = cfg.get("datasource.active_symbols", "XAUUSD")
+    symbols = [s.strip() for s in symbols_str.split(",") if s.strip()]
+    if not symbols:
+        symbols = ["XAUUSD"]
+    return {
+        "login": login,
+        "server": cfg.get("mt5.server_address", ""),
+        "password": (cfg.get("mt5.password", "") or "").strip(),
+        "timeframe": tf_str,
+        "timeframes": all_tfs,          # P2-7: all collected timeframes
+        "max_bars": max_bars,
+        "symbols": symbols,
+    }
+
+
+def connect_mt5(login, server, password):
+    try:
+        import MetaTrader5 as mt5
+    except ImportError:
+        log.critical("MetaTrader5 not installed. Run: pip install MetaTrader5")
+        sys.exit(1)
+
+    # Populate MT5_TIMEFRAME_MAP after import
+    MT5_TIMEFRAME_MAP.update({
+        "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5,
+        "M15": mt5.TIMEFRAME_M15, "M30": mt5.TIMEFRAME_M30,
+        "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4, "D1": mt5.TIMEFRAME_D1,
+    })
+
+    log.info(f"Connecting MT5: login={login}, server={server}")
+    if not mt5.initialize(path=MT5_PATH, login=login, server=server, password=password):
+        log.error(f"MT5 auth failed: {mt5.last_error()}")
+        log.error("请在 localhost:3000/system/mt5 修改账户信息后重试")
+        return None
+    log.info("MT5 connected")
+    # Diagnostic: check trade permissions
+    info = mt5.account_info()
+    if info:
+        log.info(f"Account: balance={info.balance}, equity={info.equity}, "
+                 f"trade_allowed={info.trade_allowed}, trade_expert={info.trade_expert}")
+        if not info.trade_allowed:
+            log.error("⚠️  MT5 account trade_allowed=False — check terminal settings!")
+        if not info.trade_expert:
+            log.error("⚠️  MT5 account trade_expert=False — algorithmic trading may be disabled!")
+    else:
+        log.error("Cannot retrieve MT5 account_info — check login status")
+    ti = mt5.terminal_info()
+    if ti:
+        log.info(f"Terminal: community_account={ti.community_account}, "
+                 f"connected={ti.connected}, trade_allowed={ti.trade_allowed}")
+    # Detect broker timezone offset
+    broker_utc_offset_hours = 0
+    try:
+        tick = mt5.symbol_info_tick("XAUUSD")
+        if tick and tick.time:
+            import time as _time_lib
+            broker_utc_offset_hours = round(
+                (tick.time - int(_time_lib.time())) / 3600.0
+            )
+            log.info(f"Broker timezone offset: UTC{broker_utc_offset_hours:+d}h (detected from tick.time)")
+    except Exception:
+        log.warning("Cannot detect broker timezone, assuming UTC+0")
+    mt5._broker_utc_offset_s = broker_utc_offset_hours * 3600  # attach to mt5 object
+    return mt5
+
+
+def fetch_klines(mt5, symbol, timeframe_str, count=500):
+    """Fetch klines for a symbol with dynamic timeframe.
+
+    Args:
+        mt5: MT5 connection object.
+        symbol: Trading symbol (e.g. XAUUSD).
+        timeframe_str: Timeframe string (M1/M5/M15/H1/H4/D1).
+        count: Number of bars to fetch.
+
+    Returns:
+        List of rate dicts or empty list.
+    """
+    mt5_tf = MT5_TIMEFRAME_MAP.get(timeframe_str, mt5.TIMEFRAME_M5)
+    rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, count)
+    if rates is None:
+        return []
+    try:
+        l = len(rates)
+        if l > 0:
+            return list(rates)
+    except:
+        pass
+    return []
+
+
+async def write_klines_to_pg(pool, rates, symbol, timeframe_str, broker_utc_offset_s: int = 0):
+    """Write kline bars to PostgreSQL.
+
+    Args:
+        pool: asyncpg connection pool.
+        rates: List of rate dicts from MT5.
+        symbol: Trading symbol.
+        timeframe_str: Timeframe string (M1/M5/...).
+        broker_utc_offset_s: Broker timezone offset in seconds (detected at connect).
+    """
+    count = 0
+    for r in rates:
+        ts = datetime.fromtimestamp(r['time'] - broker_utc_offset_s, tz=timezone.utc)
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO hcm_market.klines (symbol, time_frame, open_time, open, high, low, close, tick_volume)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                ON CONFLICT (symbol, time_frame, open_time) DO UPDATE SET
+                    high = GREATEST(hcm_market.klines.high, EXCLUDED.high),
+                    low = LEAST(hcm_market.klines.low, EXCLUDED.low),
+                    close = EXCLUDED.close,
+                    tick_volume = hcm_market.klines.tick_volume + EXCLUDED.tick_volume
+            """, symbol, timeframe_str, ts, float(r['open']), float(r['high']),
+                 float(r['low']), float(r['close']), int(r['tick_volume'] or 0))
+        count += 1
+    if count:
+        log.info(f"K-lines written to PG: {count} ({symbol} {timeframe_str})")
+
+
+async def write_price_to_redis(redis_conn, mt5, symbol, timeframe_str, broker_utc_offset_s: int = 0):
+    """Push real-time price and latest kline to Redis with timeout protection.
+
+    Args:
+        redis_conn: Redis connection.
+        mt5: MT5 connection object.
+        symbol: Trading symbol.
+        timeframe_str: Timeframe string.
+        broker_utc_offset_s: Broker timezone offset in seconds (detected at connect).
+    """
+    try:
+        tick = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, mt5.symbol_info_tick, symbol),
+            timeout=3.0
+        )
+    except (asyncio.TimeoutError, Exception) as exc:
+        log.warning(f"write_price_to_redis: symbol_info_tick timeout/error: {exc}")
+        return
+    if tick is None:
+        return
+    redis_conn.hset("hcm:config:v2", f"market:latest:{symbol}", json.dumps({
+        "bid": tick.bid, "ask": tick.ask,
+        "time": tick.time - broker_utc_offset_s,  # convert broker local → UTC
+        "last": tick.last,
+        "updated_at": tick.time - broker_utc_offset_s,  # explicit UTC timestamp
+    }))
+    mt5_tf = MT5_TIMEFRAME_MAP.get(timeframe_str, mt5.TIMEFRAME_M5)
+    try:
+        rates = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, mt5.copy_rates_from_pos, symbol, mt5_tf, 0, 1),
+            timeout=3.0
+        )
+    except (asyncio.TimeoutError, Exception) as exc:
+        log.warning(f"write_price_to_redis: copy_rates_from_pos timeout/error: {exc}")
+        return
+    if rates is not None and len(rates) > 0:
+        r = rates[-1]
+        redis_conn.hset("hcm:config:v2", f"latest_kline:{symbol}:{timeframe_str}", json.dumps({
+            "open_time": int(r['time']) - broker_utc_offset_s,
+            "open": float(r['open']), "high": float(r['high']),
+            "low": float(r['low']), "close": float(r['close']),
+            "volume": int(r['tick_volume'] or 0),
+        }))
+        # Compute and cache ATR (14-period) for SL/TP calculation
+        try:
+            atr_rates = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, mt5.copy_rates_from_pos, symbol, mt5.TIMEFRAME_M5, 0, 15),
+                timeout=3.0
+            )
+        except (asyncio.TimeoutError, Exception) as exc:
+            log.warning(f"write_price_to_redis: ATR copy_rates_from_pos timeout/error: {exc}")
+            return
+        if atr_rates is not None and len(atr_rates) >= 15:
+            trs: list[float] = []
+            for i in range(1, len(atr_rates)):
+                hl = float(atr_rates[i]['high']) - float(atr_rates[i]['low'])
+                hc = abs(float(atr_rates[i]['high']) - float(atr_rates[i-1]['close']))
+                lc = abs(float(atr_rates[i]['low']) - float(atr_rates[i-1]['close']))
+                trs.append(max(hl, hc, lc))
+            atr_val = sum(trs[-14:]) / 14.0
+            redis_conn.set(f"hcm:atr:{symbol}", str(atr_val), ex=300)
+
+
+def push_live_bar_to_redis(redis_conn, mt5, symbol: str, timeframe_str: str, broker_utc_offset_s: int = 0) -> None:
+    """Push the current (unclosed) live bar to Redis.
+
+    Called from the 2s tick loop — pushes the latest unclosed bar as JSON
+    to market:bar:{symbol}:{timeframe}:live with TTL=600s.
+
+    This enables the scheduler to see the latest bar data before it closes
+    in PostgreSQL (Fix #4).
+
+    Args:
+        redis_conn: Redis connection (sync).
+        mt5: MT5 connection object.
+        symbol: Trading symbol.
+        timeframe_str: Timeframe string (M1/M5/...).
+        broker_utc_offset_s: Broker timezone offset in seconds.
+    """
+    try:
+        mt5_tf = MT5_TIMEFRAME_MAP.get(timeframe_str, mt5.TIMEFRAME_M5)
+        rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, 1)
+        if rates is None or len(rates) == 0:
+            return
+        r = rates[-1]
+        key = LIVE_BAR_KEY_TEMPLATE.format(symbol=symbol, timeframe=timeframe_str)
+        payload = json.dumps({
+            "open_time": int(r['time']) - broker_utc_offset_s,
+            "open": float(r['open']),
+            "high": float(r['high']),
+            "low": float(r['low']),
+            "close": float(r['close']),
+            "tick_volume": int(r['tick_volume'] or 0),
+            "is_closed": False,
+        })
+        redis_conn.set(key, payload, ex=LIVE_BAR_TTL_SECONDS)
+    except Exception as exc:
+        log.debug("push_live_bar_to_redis error for %s/%s: %s", symbol, timeframe_str, exc)
+
+
+def _get_atr_from_redis(redis_conn, symbol: str) -> float:
+    """Get latest ATR value from Redis or compute fallback.
+
+    Args:
+        redis_conn: Redis connection.
+        symbol: Trading symbol.
+
+    Returns:
+        ATR value (0.0 if unavailable — caller should handle).
+    """
+    try:
+        # Try cached ATR first
+        atr = redis_conn.get(f"hcm:atr:{symbol}")
+        if atr:
+            return float(atr)
+        # Fallback: read from latest kline cache
+        cached = redis_conn.get(f"hcm:market:latest_kline:{symbol}")
+        if cached:
+            import json
+            data = json.loads(cached)
+            atr = data.get('atr', 0.0)
+            if atr > 0:
+                return atr
+        return 0.0  # not available — caller should handle
+    except Exception:
+        return 0.0
+
+
+def _get_max_entry_slippage(redis_conn, symbol: str) -> float:
+    """计算"入场价偏移闸门"允许的最大滑点（point）。
+
+    优先用 ATR 倍数（波动率感知），ATR 不可用时回退固定点数。
+    配置（均可 Redis 热改，hcm:config:v2）：
+      - bridge.max_entry_slippage_atr_mult  (默认 0.3)  → max_slip = ATR * mult
+      - bridge.max_entry_slippage_pts       (默认 50)   → ATR 缺失时回退固定点数
+    """
+    try:
+        atr_mult_raw = redis_conn.hget("hcm:config:v2", "bridge.max_entry_slippage_atr_mult")
+        atr_mult = float(atr_mult_raw) if atr_mult_raw else 0.3
+    except (ValueError, TypeError):
+        atr_mult = 0.3
+    atr = _get_atr_from_redis(redis_conn, symbol)
+    if atr > 0:
+        return atr * atr_mult
+    # ATR 不可用时回退固定点数
+    try:
+        pts_raw = redis_conn.hget("hcm:config:v2", "bridge.max_entry_slippage_pts")
+        return float(pts_raw) if pts_raw else 50.0
+    except (ValueError, TypeError):
+        return 50.0
+
+
+def _stream_id_prefix(msg_id: str) -> int:
+    """Redis stream ID 的可比较排序键（毫秒时间戳*100000 + 序列号），越大越新。
+
+    用于 latest-wins：同一批次/跨批次只认最新一条信号，丢弃其余。
+    用完整 ID（含序列号）而非仅毫秒，避免同毫秒多条信号排序歧义。
+    解析失败返回 0（不会被误判为最新）。
+    """
+    try:
+        parts = str(msg_id).split("-")
+        if len(parts) == 2:
+            return int(parts[0]) * 100000 + int(parts[1])
+        return int(parts[0])
+    except (ValueError, AttributeError, IndexError):
+        return 0
+
+
+# ═══════════════════════════════════════════════════════════════
+#  模块级配置读取（供 _update_trailing_stops / _sync_positions 共用）
+# ═══════════════════════════════════════════════════════════════
+
+_warned_keys: set[str] = set()
+
+# close.* 配置默认值 — 集中管理，禁用散落硬编码。
+# 正式环境必须通过 PG(hcm_config.config) + Redis(hcm:config:v2) 显式配置；
+# 此处仅作配置缺失时的安全回退（缺失会打 ERROR 告警，提示运维显式配置）。
+CLOSE_CONFIG_DEFAULTS: dict[str, float] = {
+    "close.breakeven_atr_mult": 0.5,
+    "close.breakeven_buffer_atr_mult": 0.15,
+    "close.trail_wide_atr_mult": 0.7,
+}
+
+
+def _get_close_config(redis_conn, key: str, default: float) -> float:
+    """从 Redis hcm:config:v2 读取 float 配置值，缺值打 WARNING 并使用默认。
+
+    模块级函数，供 _update_trailing_stops() 和 position_sync 共用。
+    使用模块级 _warned_keys 避免同一 key 重复 WARNING。
+
+    Args:
+        redis_conn: Redis connection (sync client, decode_responses=True)。
+        key: 配置 key（如 "close.breakeven_atr_mult"）。
+        default: 缺省默认值。
+
+    Returns:
+        float 配置值。
+    """
+    val = redis_conn.hget("hcm:config:v2", key)
+    if val is None or val == "":
+        if key not in _warned_keys:
+            log.error(
+                "REQUIRED close config '%s' missing in Redis/PG — using fallback %.2f. "
+                "请通过 PG(hcm_config.config) + Redis(hcm:config:v2) 显式配置，禁用硬编码。",
+                key, default,
+            )
+            _warned_keys.add(key)
+        return float(default)
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        if key not in _warned_keys:
+            log.warning(
+                "close config key '%s' invalid value '%s' — using default %.2f",
+                key, val, default,
+            )
+            _warned_keys.add(key)
+        return float(default)
+
+
+def _get_close_config_bool(redis_conn, key: str, default: bool = False) -> bool:
+    """从 Redis hcm:config:v2 读取 bool 配置值。
+
+    接受 "true"/"1"/"yes"（大小写不敏感）为 True。
+
+    Args:
+        redis_conn: Redis connection。
+        key: 配置 key。
+        default: 缺省默认值。
+
+    Returns:
+        bool 配置值。
+    """
+    val = redis_conn.hget("hcm:config:v2", key)
+    if val is None or val == "":
+        if key not in _warned_keys:
+            log.warning(
+                "close config key '%s' not set — using default %s", key, default
+            )
+            _warned_keys.add(key)
+        return default
+    return val.lower() in ("true", "1", "yes")
+
+
+def _is_signal_fresh(msg_data: dict, max_age: int) -> bool:
+    """判断信号是否足够新鲜、允许下单（禁止过期/缺时间戳信号下单）。
+
+    规则（防御纵深，任一不满足即拒绝）：
+      - timestamp 缺失            → 拒绝（绝不 'let through'）
+      - timestamp 解析失败        → 拒绝
+      - age > max_age 秒          → 拒绝（过期信号，行情已变）
+      - age < -5 秒（未来时间）    → 拒绝（时钟异常，避免追错行情）
+
+    Args:
+        msg_data: Redis stream 消息体（含 timestamp / signal_id）。
+        max_age: 允许的最大年龄（秒），来自 bridge.max_signal_age_seconds。
+
+    Returns:
+        True 表示可下单；False 表示必须拒绝。
+    """
+    sid = msg_data.get("signal_id", "?")
+    # 优先用信号塔在 T0 打的原始时间戳；缺失才退回发射时刻 T1
+    ts_raw = msg_data.get("signal_generated_at") or msg_data.get("timestamp", "")
+    if not ts_raw:
+        log.warning("REJECT signal %s: missing 'timestamp' field", sid)
+        return False
+    try:
+        ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+    except Exception as exc:
+        log.warning("REJECT signal %s: bad timestamp '%s': %s", sid, ts_raw, exc)
+        return False
+    if age > max_age:
+        log.warning("REJECT stale signal %s: age=%.0fs > %ds", sid, age, max_age)
+        return False
+    if age < -5:
+        log.warning("REJECT signal %s: timestamp %.0fs in the future", sid, age)
+        return False
+    return True
+
+
+def _detect_tp_lock_conflict(redis_conn, atr: float, lock_trigger: float) -> None:
+    """检测 TP 距离与锁利触发距离的冲突。
+
+    若 tp_distance < lock_trigger，Tier2/Tier3 在 TP 触发前无法生效。
+    纯告警，不改配置值。
+
+    Args:
+        redis_conn: Redis connection。
+        atr: 当前 ATR 值。
+        lock_trigger: 已计算的 Tier2 锁利触发距离 (= ATR * close.lock_trigger_atr_mult)。
+    """
+    tp_mult_str = redis_conn.hget("hcm:config:v2", "close.tp_atr_multiplier")
+    if not tp_mult_str:
+        return  # TP not configured, no conflict
+    try:
+        tp_mult = float(tp_mult_str)
+    except ValueError:
+        return
+    if tp_mult <= 0:
+        return
+    tp_distance = atr * tp_mult
+    if tp_distance < lock_trigger:
+        log.warning(
+            "TP/锁利冲突: tp_distance=%.1f < lock_trigger=%.1f "
+            "(Tier2/Tier3 在 TP 触发前无法生效). "
+            "建议: 增大 close.tp_atr_multiplier 或减小 close.lock_trigger_atr_mult",
+            tp_distance, lock_trigger,
+        )
+
+
+def place_mt5_order(mt5, signal_data, symbol, timeframe_str, redis_conn=None):
+    """Place an order on MT5 based on signal data.
+
+    Args:
+        mt5: MT5 connection object.
+        signal_data: Signal dict from Redis stream.
+        symbol: Trading symbol.
+        timeframe_str: Timeframe string (for logging context).
+        redis_conn: Redis connection for reading close config.
+
+    Returns:
+        Dict with code, message, mt5_ticket, filled_price, volume.
+    """
+    sig_id = signal_data.get('signal_id', 0)
+    direction = signal_data.get('direction', 'BUY')
+    lot = float(signal_data.get('lot', 0.01))
+    if lot <= 0:
+        lot = 0.01
+    sl = float(signal_data.get('sl_price', 0))
+    tp = float(signal_data.get('tp1', 0))
+
+    # Get tick first (needed for SL/TP)
+    tick = _mt5_global.symbol_info_tick(symbol)
+    if tick is None:
+        log.error(f"No tick data for {symbol} — MT5 may be disconnected")
+        return {"code": -1, "message": f"No tick data for {symbol}"}
+
+    # ── 入场价偏移闸门（核心修复）：信号基于 T0 的 entry_price，若行情已漂离则拒绝 ──
+    # 这是"错过入场点=直接止损"的真正防线，替代原来不靠谱的墙钟秒数闸门。
+    entry_price = float(signal_data.get("entry_price", 0.0) or 0.0)
+    if entry_price > 0:
+        exec_price = tick.ask if direction == "BUY" else tick.bid
+        slip_pts = abs(exec_price - entry_price)
+        max_slip = _get_max_entry_slippage(redis_conn, symbol) if redis_conn else 50.0
+        if slip_pts > max_slip:
+            log.warning(
+                "REJECT ENTRY_MISSED signal %s: price slipped %.2f (exec=%.2f entry=%.2f) "
+                "> max_slip=%.2f — 行情已远离入场点，跳过",
+                sig_id, slip_pts, exec_price, entry_price, max_slip,
+            )
+            return {"code": -2, "message": f"ENTRY_MISSED: slippage {slip_pts:.1f}pts > {max_slip:.1f}pts"}
+
+    # ── P1c (collaboration): consume AI risk multipliers + ④ zone co-decides SL ──
+    # GATED by signal_tower.ai_risk_enabled (default OFF → no behavior change
+    # until explicitly enabled). When ON:
+    #   • AI-provided sl/tp ATR multipliers override the global close.* multipliers
+    #   • a present zone tightens SL to just outside the structure boundary
+    #     (② AI and ④ Zone co-decide risk).
+    if redis_conn:
+        try:
+            ai_flag = redis_conn.hget("hcm:config:v2", "signal_tower.ai_risk_enabled")
+            ai_risk_on = bool(ai_flag and str(ai_flag).lower() in ("1", "true"))
+        except Exception:
+            ai_risk_on = False
+        if ai_risk_on:
+            ai_sl = float(signal_data.get("ai_sl_mult", 0) or 0)
+            ai_tp = float(signal_data.get("ai_tp_mult", 0) or 0)
+            zone_lv = float(signal_data.get("zone_level", 0) or 0)
+            zone_tp = signal_data.get("zone_type", "") or ""
+            try:
+                atr = _get_atr_from_redis(redis_conn, symbol) if redis_conn else 0.0
+            except Exception:
+                atr = 0.0
+            if (ai_sl > 0 or ai_tp > 0) and atr > 0:
+                if ai_sl > 0 and sl == 0:
+                    sl_dist = atr * ai_sl
+                    sl = (tick.ask - sl_dist) if direction == "BUY" else (tick.bid + sl_dist)
+                if ai_tp > 0 and tp == 0:
+                    tp_dist = atr * ai_tp
+                    tp = (tick.ask + tp_dist) if direction == "BUY" else (tick.bid - tp_dist)
+                log.info("P1c AI risk applied: ai_sl_mult=%.2f ai_tp_mult=%.2f → sl=%.2f tp=%.2f",
+                         ai_sl, ai_tp, sl, tp)
+            # ④ co-decides risk: tighten SL to just outside the zone boundary
+            if zone_lv > 0 and zone_tp in ("SUPPORT", "RESISTANCE", "PIVOT") and atr > 0:
+                band = max(2.0, atr * 0.15)
+                if direction == "BUY":
+                    sl_via_zone = zone_lv - band
+                    if sl == 0 or sl_via_zone > sl:
+                        sl = sl_via_zone
+                else:
+                    sl_via_zone = zone_lv + band
+                    if sl == 0 or sl_via_zone < sl:
+                        sl = sl_via_zone
+                log.info("P1c ④ zone co-decides SL: zone=%.2f band=%.2f → sl=%.2f", zone_lv, band, sl)
+
+    # Read close config for SL/TP calculation (ATR multiplier mode)
+    if redis_conn and sl == 0:
+        try:
+            trailing_enabled = redis_conn.hget("hcm:config:v2", "close.trailing_stop_enabled")
+            if trailing_enabled and trailing_enabled.lower() in ('true', '1'):
+                sl_mult_str = redis_conn.hget("hcm:config:v2", "close.trailing_stop_distance")
+                if not sl_mult_str:
+                    log.warning("SL not applied: close.trailing_stop_distance not configured")
+                else:
+                    sl_mult = float(sl_mult_str)
+                    atr = _get_atr_from_redis(redis_conn, symbol)
+                    if atr <= 0:
+                        log.warning("SL not applied: ATR unavailable (0.0)")
+                    else:
+                        sl_distance = atr * sl_mult
+                        if direction == "BUY":
+                            sl = tick.ask - sl_distance
+                        else:
+                            sl = tick.bid + sl_distance
+        except Exception as exc:
+            log.error(f"SL calc failed: {exc}")
+    # TP calculation — enabled when close.tp_atr_multiplier > 0
+    # (修复: 不再读取 close.breakeven_enabled，TP 开关语义由 tp_atr_multiplier 值决定)
+    if redis_conn and tp == 0:
+        try:
+            tp_mult_str = redis_conn.hget("hcm:config:v2", "close.tp_atr_multiplier")
+            if not tp_mult_str:
+                log.warning("TP not applied: close.tp_atr_multiplier not configured")
+            else:
+                tp_mult = float(tp_mult_str)
+                if tp_mult <= 0:
+                    log.info("TP disabled: close.tp_atr_multiplier <= 0")
+                else:
+                    atr = _get_atr_from_redis(redis_conn, symbol)
+                    if atr <= 0:
+                        log.warning("TP not applied: ATR unavailable (0.0)")
+                    else:
+                        tp_distance = atr * tp_mult
+                        if direction == "BUY":
+                            tp = tick.ask + tp_distance
+                        else:
+                            tp = tick.bid - tp_distance
+        except Exception as exc:
+            log.error(f"TP calc failed: {exc}")
+
+    # ── Defense in depth: never place an order for a non-tradable direction ──
+    if direction not in ("BUY", "SELL"):
+        log.error(
+            f"Refusing to place order for non-tradable direction: {direction!r} (signal {sig_id})"
+        )
+        return {"code": -1, "message": f"non-tradable direction: {direction}"}
+    order_type = _mt5_global.ORDER_TYPE_BUY if direction == "BUY" else _mt5_global.ORDER_TYPE_SELL
+    price = tick.ask if direction == "BUY" else tick.bid
+    # 滑点可观测性（建议4）：每次下单打印 entry_price / exec_price / slip_pts
+    slip_pts = abs(price - entry_price) if entry_price > 0 else 0.0
+    log.info(
+        f"Placing {direction} {lot} lot {symbol} @ {price} (bid={tick.bid} ask={tick.ask}) "
+        f"entry={entry_price} slip={slip_pts:.2f} signal={sig_id}"
+    )
+
+    request = {
+        "action": _mt5_global.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot,
+        "type": order_type,
+        "price": price,
+        "deviation": 50,
+        "magic": 123456,
+        "comment": f"HCM_v2_signal_{sig_id}",
+        "type_time": _mt5_global.ORDER_TIME_GTC,
+        "type_filling": _mt5_global.ORDER_FILLING_IOC,
+    }
+    # Only add sl/tp if non-zero (MT5 rejects sl=0 / tp=0)
+    if sl > 0:
+        request["sl"] = sl
+    if tp > 0:
+        request["tp"] = tp
+
+    result = _mt5_global.order_send(request)
+    if result is None:
+        err = _mt5_global.last_error()
+        return {"code": -1, "message": f"order_send returned None (last_error={err})"}
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        return {"code": result.retcode, "message": result.comment or f"retcode={result.retcode}"}
+    return {
+        "code": 0, "message": "ok", "mt5_ticket": result.order,
+        "filled_price": result.price, "volume": result.volume,
+        "sl": sl, "tp": tp,
+    }
+
+
+# ── P1a Zone-Trigger Helpers (gated OFF by signal_tower.zone_trigger_enabled) ──
+
+def _price_in_zone_band(tick, direction: str, zone_level: float,
+                         band_pts: float = 3.0) -> bool:
+    """P1a: is current price within the trigger tolerance band of zone_level?"""
+    price = tick.ask if direction == "BUY" else tick.bid
+    return abs(price - zone_level) <= band_pts
+
+
+def _defer_zone_signal(redis_conn, sid: int, msg_data: dict, ttl: int) -> None:
+    """P1a: store a deferred signal to Redis with TTL (= timeout, no dead order)."""
+    try:
+        redis_conn.set(f"bridge:zone_pending:{sid}", json.dumps(msg_data, default=str), ex=ttl)
+        log.info("ZONE DEFER signal %s: price not at zone — deferred %ds", sid, ttl)
+    except Exception as exc:
+        log.error("zone defer store failed for %s: %s", sid, exc)
+
+
+async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
+                           msg_symbol: str, timeframe_str: str,
+                           dry_run: bool) -> bool:
+    """P1a refactor: place order + persist PG + mark processed.
+
+    Extracted from the main loop so both the immediate path AND the
+    zone-trigger recheck can reuse the same order + persistence logic.
+    Returns True when the order was placed (or dry-run logged).
+    """
+    sid = int(msg_data.get("signal_id", 0))
+    if not dry_run:
+        result = place_mt5_order(mt5, msg_data, msg_symbol, timeframe_str, redis_conn)
+        if result['code'] == 0:
+            log.info("✅ MT5 ticket=%s lot=%s", result.get('mt5_ticket'), result.get('volume'))
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE hcm_signal.signals SET signal_status=3, updated_at=now() "
+                    "WHERE signal_id=$1", sid)
+                await conn.execute("""
+                    INSERT INTO hcm_trading.positions
+                    (account_id, symbol, direction, open_price, current_price, lot, sl, tp, open_time)
+                    VALUES ($1,$2,$3,$4,$4,$5,$6,$7,now())
+                """, int(msg_data.get("account_id", 0)) or 6, msg_symbol,
+                     msg_data.get("direction", "BUY"),
+                     float(msg_data.get("entry_price", result.get("filled_price", 0))),
+                     result.get("volume", 0.01),
+                     result.get("sl", 0.0),
+                     result.get("tp", 0.0))
+            return True
+        else:
+            log.error("❌ MT5 order failed: %s", result.get('message', '?'))
+            return False
+    else:
+        log.info("[DRY] %s %s lot", msg_data.get('direction'), msg_data.get('lot', 0.01))
+        return True
+
+
+async def _recheck_zone_pending(pool, mt5, redis_conn, dry_run: bool) -> None:
+    """P1a: scan deferred zone signals; fill when price touches the zone.
+
+    Redis TTL handles the timeout — keys auto-delete, no dead orders.
+    """
+    try:
+        keys = redis_conn.keys("bridge:zone_pending:*")
+    except Exception:
+        return
+    for key in keys:
+        try:
+            raw = redis_conn.get(key)
+            if not raw:
+                continue
+            msg_data = json.loads(raw)
+        except Exception:
+            continue
+        sid = int(msg_data.get("signal_id", 0))
+        direction = msg_data.get("direction", "")
+        if direction not in ("BUY", "SELL"):
+            redis_conn.delete(key)
+            continue
+        symbol = msg_data.get("symbol", "")
+        zl = float(msg_data.get("zone_level", 0) or 0)
+        if zl <= 0:
+            redis_conn.delete(key)
+            continue
+        tick = _mt5_global.symbol_info_tick(symbol)
+        if tick is None:
+            continue
+        if _price_in_zone_band(tick, direction, zl):
+            log.info("ZONE TOUCH signal %s: price at zone %.2f — filling",
+                     sid, zl)
+            await _execute_signal(pool, mt5, redis_conn, msg_data,
+                                   symbol, "zone", dry_run)
+            redis_conn.delete(key)
+            redis_conn.set(f"bridge:processed:{sid}", "done")
+        # Not in band → keep waiting; Redis TTL will drop expired keys.
+
+
+async def main(dry_run=False):
+    import asyncpg
+    import redis as redis_py
+
+    pool = await asyncpg.create_pool(PG_DSN)
+    redis_conn = redis_py.Redis.from_url(REDIS_URL, decode_responses=True)
+    redis_conn.ping()
+    log.info("PG + Redis connected")
+
+    # ── 消费者组初始化：启动时确定性丢弃全部积压（实时优先） ──
+    # 逻辑缺陷修复：原逻辑仅在「首次创建」时用 start_id="$"，重启不重置 →
+    # 重启后 XREADGROUP ">" 从旧 last-delivered-id 重放整段积压，FIFO 把新鲜信号
+    # 堵在队尾（曾 7192 条≈24min 才排到队尾）。现改为：确保组存在 → 删除历史消费者
+    # （修复 PEL/消费者泄漏）→ 重置到最新($)，只处理启动后到达的信号。
+    try:
+        redis_conn.xgroup_create("signal:risk_passed", "bridge-order-group",
+                                 mkstream=True, start_id="$")
+    except Exception:
+        pass  # group already exists
+
+    cur_consumer = f"bridge-consumer-{os.getpid()}"
+    try:
+        consumers = redis_conn.xinfo_consumers("signal:risk_passed", "bridge-order-group")
+        for c in consumers:
+            if c.get("name") != cur_consumer:
+                try:
+                    redis_conn.xgroup_delconsumer(
+                        "signal:risk_passed", "bridge-order-group", c["name"]
+                    )
+                    log.info(f"Removed stale consumer: {c['name']}")
+                except Exception as e:
+                    log.warning(f"Failed to remove consumer {c.get('name')}: {e}")
+    except Exception as e:
+        log.warning(f"xinfo_consumers failed: {e}")
+
+    # 重置到最新：只处理启动后到达的信号，确定性丢弃全部历史积压
+    try:
+        backlog = redis_conn.xlen("signal:risk_passed")
+        redis_conn.xgroup_setid("signal:risk_passed", "bridge-order-group", "$")
+        log.info(
+            f"Startup: discarded {backlog} backlogged signal(s); "
+            f"only real-time signals arriving after now will be ordered"
+        )
+    except Exception as e:
+        log.warning(f"xgroup_setid failed: {e}")
+
+    mt5_cfg = _load_mt5_config(redis_conn)
+
+    if mt5_cfg['login'] == 0:
+        log.error("MT5 account_number not configured (got 0), refusing to connect. "
+                   "Please configure MT5 credentials in system/mt5 page.")
+        await pool.close()
+        return
+
+    log.info(
+        "MT5 config: login=%s, server=%s, timeframe=%s, symbols=%s, max_bars=%s",
+        mt5_cfg['login'], mt5_cfg['server'],
+        mt5_cfg['timeframe'], mt5_cfg['symbols'], mt5_cfg['max_bars'],
+    )
+
+    timeframe_str = mt5_cfg['timeframe']       # primary
+    all_timeframes = mt5_cfg.get('timeframes', [timeframe_str])  # P2-7
+    symbols = mt5_cfg['symbols']
+    primary_symbol = symbols[0]
+    max_bars = mt5_cfg['max_bars']
+
+    mt5 = connect_mt5(mt5_cfg['login'], mt5_cfg['server'], mt5_cfg['password'])
+    if mt5 is None:
+        log.error("MT5 未连接，请在 system/mt5 页面修改账户信息后重试")
+        await pool.close()
+        return
+
+    # Load initial klines for primary symbol — all timeframes (P2-7)
+    for tf in all_timeframes:
+        rates = []
+        for sym in symbols:
+            try:
+                r = fetch_klines(mt5, sym, tf, max_bars)
+                if len(r) > 0:
+                    rates = r
+                    log.info(f"Found klines for {sym}: {len(r)} bars ({tf})")
+                    break
+            except Exception as e:
+                log.warning(f"Cannot fetch {sym} ({tf}): {e}")
+        if len(rates) > 0:
+            await write_klines_to_pg(pool, rates, primary_symbol, tf, mt5._broker_utc_offset_s)
+            log.info(f"Initial K-lines loaded: {len(rates)} ({primary_symbol} {tf})")
+        else:
+            log.warning(f"No K-line data for {tf} — will retry on next cycle")
+
+    last_kline = 0
+    last_tick = 0
+    last_risk = time.time()
+    last_trail = time.time()
+    # P1a zone-trigger deferred recheck
+    zone_trigger_on = False
+    last_zone_cfg_check = 0
+    last_zone_recheck = 0
+    mode = "[DRY RUN]" if dry_run else ""
+
+    log.info(f"Bridge running {mode} — Ctrl+C to stop")
+    while True:
+        try:
+            now = time.time()
+
+            # Real-time tick push every 2s (primary symbol)
+            if now - last_tick > 2:
+                try:
+                    await asyncio.wait_for(
+                        write_price_to_redis(redis_conn, mt5, primary_symbol, timeframe_str, mt5._broker_utc_offset_s),
+                        timeout=5.0
+                    )
+                    # ── Push live bar to Redis (Fix #4) ──
+                    await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, push_live_bar_to_redis, redis_conn, mt5,
+                            primary_symbol, timeframe_str, mt5._broker_utc_offset_s,
+                        ),
+                        timeout=3.0,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning("write_price_to_redis timed out after 5s — skipping this tick")
+                last_tick = now
+
+            # MT5 connection health check every 30s
+            if not hasattr(main, '_last_health_check'):
+                main._last_health_check = 0  # type: ignore[attr-defined]
+            if now - main._last_health_check > 30:  # type: ignore[attr-defined]
+                try:
+                    info = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(None, mt5.terminal_info),
+                        timeout=3.0
+                    )
+                    if not info:
+                        log.error("MT5 terminal disconnected — triggering full reconnect")
+                        raise ConnectionError("MT5 terminal_info() returned None")
+                except asyncio.TimeoutError:
+                    log.warning("MT5 terminal_info() timeout — skipping health check")
+                main._last_health_check = now  # type: ignore[attr-defined]
+
+            # New K-line detection every 5s (all symbols × all timeframes) — P2-7
+            if now - last_kline > 5:
+                for tf in all_timeframes:
+                    for sym in symbols:
+                        rates = fetch_klines(mt5, sym, tf, 2)
+                        if rates is not None and len(rates) > 0:
+                            latest = rates[-1]
+                            bar_time = latest['time']
+                            bar_key = f"_last_bar_time:{sym}:{tf}"
+                            if bar_time != getattr(main, bar_key, 0):
+                                await write_klines_to_pg(pool, rates[-1:], sym, tf, mt5._broker_utc_offset_s)
+                                setattr(main, bar_key, bar_time)
+                                log.info(
+                                    f"Bar closed: {sym} {tf} @ "
+                                    f"{datetime.fromtimestamp(bar_time, tz=timezone.utc)}"
+                                )
+                last_kline = now
+
+            # Check for risk-passed signals to execute orders (consumer group — new only)
+            if now - last_risk > 2:
+                try:
+                    msgs = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: redis_conn.xreadgroup(
+                                groupname="bridge-order-group",
+                                consumername=f"bridge-consumer-{os.getpid()}",
+                                streams={"signal:risk_passed": ">"},
+                                count=10,
+                                block=1000,
+                            )
+                        ),
+                        timeout=3.0
+                    )
+                except asyncio.TimeoutError:
+                    log.debug("xreadgroup timeout (no new messages)")
+                    msgs = None
+                except Exception as exc:
+                    log.warning(f"xreadgroup error: {exc}")
+                    msgs = None
+                # 过期阈值（可热改）：bridge.max_signal_age_seconds，缺省 10s
+                _ma = redis_conn.hget("hcm:config:v2", "bridge.max_signal_age_seconds")
+                try:
+                    max_signal_age = int(_ma) if _ma else DEFAULT_MAX_SIGNAL_AGE_SECONDS
+                except (ValueError, TypeError):
+                    max_signal_age = DEFAULT_MAX_SIGNAL_AGE_SECONDS
+                if msgs:
+                    total_msgs = sum(len(entries) for _stream_name, entries in msgs)
+                    log.info(f"XREADGROUP returned {total_msgs} messages")
+                    for _stream_name, entries in msgs:
+                        if not entries:
+                            continue
+                        # ── latest-wins：只认本批次最新一条，其余直接丢弃（不执行） ──
+                        entries_sorted = sorted(
+                            entries, key=lambda m: _stream_id_prefix(m[0]), reverse=True
+                        )
+                        latest_id, latest_data = entries_sorted[0]
+                        for dmid, dmsg in entries_sorted[1:]:
+                            dsid = int(dmsg.get("signal_id", 0))
+                            log.info(
+                                f"DROP non-latest signal {dsid} (batch latest="
+                                f"{int(latest_data.get('signal_id', 0))}) — latest-wins"
+                            )
+                            redis_conn.set(f"bridge:processed:{dsid}", "done")
+                            redis_conn.xack("signal:risk_passed", "bridge-order-group", dmid)
+                        # 跨批次乱序/重复守卫：比已执行最新信号更旧 → 跳过（防补刀）
+                        latest_prefix = _stream_id_prefix(latest_id)
+                        last_prefix = getattr(main, "_last_exec_prefix", 0)
+                        if latest_prefix <= last_prefix:
+                            lsid = int(latest_data.get("signal_id", 0))
+                            log.info(
+                                f"SKIP older/duplicate signal {lsid} (prefix {latest_prefix} "
+                                f"<= last {last_prefix}) — latest-wins guard"
+                            )
+                            redis_conn.set(f"bridge:processed:{lsid}", "done")
+                            redis_conn.xack("signal:risk_passed", "bridge-order-group", latest_id)
+                            continue
+                        main._last_exec_prefix = latest_prefix  # type: ignore
+                        # 把最新信号当作当前处理条目，复用原 inner-loop 处理链（仅迭代单条=latest）
+                        for msg_id, msg_data in [(latest_id, latest_data)]:
+                            sid = int(msg_data.get("signal_id", 0))
+                            # ── Safety Rail 1 (MOVED UP + STRICT): 禁止过期/缺时间戳信号下单 ──
+                            # 现优先用 signal_generated_at(T0) 算 age；前置为第一道闸门。
+                            if not _is_signal_fresh(msg_data, max_signal_age):
+                                redis_conn.set(f"bridge:processed:{sid}", "done")
+                                redis_conn.xack("signal:risk_passed", "bridge-order-group", msg_id)
+                                continue
+                            # Dedup — Redis fast path
+                            if redis_conn.get(f"bridge:processed:{sid}"):
+                                redis_conn.xack("signal:risk_passed", "bridge-order-group", msg_id)
+                                continue
+                            # Dedup — PG durable fallback (Redis key may have expired)
+                            async with pool.acquire() as conn:
+                                row = await conn.fetchrow(
+                                    "SELECT 1 FROM hcm_trading.orders WHERE signal_id=$1", sid
+                                )
+                                if row:
+                                    redis_conn.set(f"bridge:processed:{sid}", "done")  # restore marker
+                                    redis_conn.xack("signal:risk_passed", "bridge-order-group", msg_id)
+                                    continue
+                            msg_symbol = msg_data.get("symbol", primary_symbol)
+                            # ── Safety Rail 2: Order rate limit (max 50/min) ──
+                            if not hasattr(main, '_order_count_window'):
+                                main._order_count_window = []  # type: ignore
+                            now_ts = time.time()
+                            main._order_count_window = [t for t in main._order_count_window if now_ts - t < 60]  # type: ignore
+                            if len(main._order_count_window) >= 50:
+                                log.critical(
+                                    f"BRIDGE RATE LIMIT: {len(main._order_count_window)} orders/min — "
+                                    f"REJECT signal {sid} to prevent flood"
+                                )
+                                redis_conn.xack("signal:risk_passed", "bridge-order-group", msg_id)
+                                continue
+                            main._order_count_window.append(now_ts)  # type: ignore
+                            log.info(f"Order: signal_id={sid}, symbol={msg_symbol}, {msg_data.get('direction')}")
+                            # ── Safety Rail 3: reject non-tradable directions ──
+                            # Root-cause fix 2026-07-14: the signal tower emits NO_TRADE /
+                            # HOLD when ADX is below floor or midbar is unconfirmed. The
+                            # bridge MUST NOT open a position for these. Previously
+                            # place_mt5_order() fell through to ORDER_TYPE_SELL for any
+                            # non-BUY direction, opening spurious SELL positions
+                            # (see tickets 353488252, 353606173, etc.).
+                            direction = msg_data.get('direction')
+                            if direction not in ('BUY', 'SELL'):
+                                log.warning(
+                                    f"SKIP non-tradable signal {sid}: direction={direction} "
+                                    f"— not opening position (NO_TRADE/HOLD rejected)"
+                                )
+                                redis_conn.set(f"bridge:processed:{sid}", "done")
+                                redis_conn.xack("signal:risk_passed", "bridge-order-group", msg_id)
+                                continue
+                            # ── P1a Zone-Trigger Gate (gated OFF by signal_tower.zone_trigger_enabled) ──
+                            # When ON and the signal carries entry_trigger_wait > 0 with a zone,
+                            # check whether price is already within the trigger tolerance band.
+                            # - In band → fill immediately (zone-touched, market order).
+                            # - Not in band → store a deferred key in Redis with TTL = wait
+                            #   seconds. A periodic recheck below fills when price reaches the
+                            #   zone; expired keys are auto-deleted by Redis (no dead orders).
+                            deferred = False
+                            if zone_trigger_on:
+                                zt_wait = int(msg_data.get("entry_trigger_wait", 0) or 0)
+                                zl = float(msg_data.get("zone_level", 0) or 0)
+                                if zt_wait > 0 and zl > 0:
+                                    tick = _mt5_global.symbol_info_tick(msg_symbol)
+                                    if tick and not _price_in_zone_band(tick, direction, zl):
+                                        _defer_zone_signal(redis_conn, sid, msg_data, zt_wait)
+                                        redis_conn.set(f"bridge:processed:{sid}", "done")
+                                        redis_conn.xack("signal:risk_passed", "bridge-order-group", msg_id)
+                                        deferred = True
+                                    elif tick:
+                                        log.info("ZONE TOUCH signal %s: price at zone %.2f — filling immediately",
+                                                 sid, zl)
+                            if not deferred:
+                                await _execute_signal(pool, mt5, redis_conn, msg_data,
+                                                       msg_symbol, timeframe_str, dry_run)
+                                redis_conn.set(f"bridge:processed:{sid}", "done")
+                                redis_conn.xack("signal:risk_passed", "bridge-order-group", msg_id)
+                last_risk = now
+            # ── P1a: read zone-trigger config + recheck pending (every 5s) ──
+            if now - last_zone_cfg_check > 5:
+                try:
+                    ztc = redis_conn.hget("hcm:config:v2", "signal_tower.zone_trigger_enabled")
+                    zone_trigger_on = bool(ztc and str(ztc).lower() in ("1", "true"))
+                except Exception:
+                    zone_trigger_on = False
+                if zone_trigger_on and now - last_zone_recheck > 2:
+                    await _recheck_zone_pending(pool, mt5, redis_conn, dry_run)
+                    last_zone_recheck = now
+                last_zone_cfg_check = now
+
+            # Trailing stop: check open positions every 5s and move SL
+            if now - last_trail > 5:
+                _update_trailing_stops(mt5, redis_conn)
+                last_trail = now
+
+                # Sync positions to PG + Redis after trailing stop (every 5s)
+                try:
+                    await asyncio.wait_for(
+                        sync_positions(mt5, pool, redis_conn),
+                        timeout=5.0,
+                    )
+                except asyncio.TimeoutError:
+                    log.warning("sync_positions timed out after 5s")
+                except Exception as e:
+                    log.error(f"sync_positions failed: {e}")
+
+            await asyncio.sleep(0.5)
+        except KeyboardInterrupt:
+            break
+        except ConnectionError:
+            raise  # propagate to outer wrapper for full reconnect
+        except Exception as e:
+            log.error(f"Loop: {e}")
+            await asyncio.sleep(5)
+
+    mt5.shutdown()
+    await pool.close()
+
+
+async def run_bridge_forever(dry_run: bool = False, max_retries: int = 0) -> None:
+    """外层自愈循环——任何致命错误都自动重启整个桥。
+
+    Args:
+        dry_run: 不执行真实下单。
+        max_retries: 最大重试次数（0=无限）。达到上限后 raise 终止。
+    """
+    retry = 0
+    while True:
+        try:
+            await main(dry_run=dry_run)
+            # main() 正常退出（如 MT5 未配置）
+            log.warning("main() exited normally, retrying in 10s")
+            await asyncio.sleep(10)
+            retry = 0  # reset on clean exit
+        except KeyboardInterrupt:
+            log.info("Bridge stopped by user (Ctrl+C)")
+            break
+        except Exception as exc:
+            retry += 1
+            if max_retries > 0 and retry > max_retries:
+                log.critical(f"Max retries ({max_retries}) exhausted — giving up")
+                raise
+            wait = min(retry * 5, 60)  # 5s, 10s, 15s, ... max 60s 指数退避
+            log.error(
+                f"Bridge FATAL: {exc.__class__.__name__}: {exc}. "
+                f"Reconnecting in {wait}s (attempt {retry}"
+                f"{'/' + str(max_retries) if max_retries else ''})"
+            )
+            await asyncio.sleep(wait)
+
+
+def _update_trailing_stops(mt5, redis_conn):
+    """保本 + 单线移动止盈（方案乙，2026-07-14）。
+
+    修复原三档(max 棘轮)的缺陷：固定「锁利档」(entry+lock_amount) 会把 SL 钉死，
+    导致价格从 +0.5ATR 涨到 +2ATR 这段最肥行情里 SL 完全不跟价格。
+
+    新逻辑（单一移动止盈线，BUY 只上 / SELL 只下）：
+      1) 保本门槛：盈利 > ATR × close.breakeven_atr_mult
+         → SL 抬到 开仓价 ± ATR × close.breakeven_buffer_atr_mult（覆盖点差/滑点，P&L≥0）
+      2) 单线移动止盈：SL 跟随价格，保持 ATR × close.trail_wide_atr_mult 的距离
+         → 取 max(保本地板, 价格-距离)[BUY] / min(保本地板, 价格+距离)[SELL]
+         → 早期由保本地板封底，价格跑远后自动由移动线接管，SL 平滑跟随价格
+      3) 棘轮：SL 只朝有利方向移动，绝不后退；初始宽保护(close.trailing_stop_distance)保留。
+    所有阈值从 Redis close.* 读取（禁用硬编码；缺失键回退到与配置一致的默认值）。
+    """
+    try:
+        enabled = redis_conn.hget("hcm:config:v2", "close.trailing_stop_enabled")
+        if not enabled or enabled.lower() not in ('true', '1'):
+            return
+    except Exception:
+        return
+    try:
+        positions = mt5.positions_get()
+        if not positions:
+            return
+
+        atr = _get_atr_from_redis(redis_conn, "XAUUSD")
+        if atr <= 0:
+            log.warning("Trailing stop skipped: ATR unavailable (0.0)")
+            return
+
+        # Read trailing stop distance (required)
+        # 注意: close.trailing_stop_distance 的语义是「初始保护距离」(ATR 倍数)，
+        # 名称中 "distance" 有误导（暗示绝对 pips），但保留兼容现有 Redis key 命名。
+        sl_mult_str = redis_conn.hget("hcm:config:v2", "close.trailing_stop_distance")
+        if not sl_mult_str:
+            log.warning("Trailing stop skipped: close.trailing_stop_distance not configured")
+            return
+        sl_mult = float(sl_mult_str)
+
+        # 所有阈值均从 Redis/PG 读取（禁用散落硬编码；缺失键回退到 CLOSE_CONFIG_DEFAULTS 集中默认值）
+        be_trigger = atr * _get_close_config(
+            redis_conn, "close.breakeven_atr_mult",
+            CLOSE_CONFIG_DEFAULTS["close.breakeven_atr_mult"],
+        )
+        be_buffer = atr * _get_close_config(
+            redis_conn, "close.breakeven_buffer_atr_mult",
+            CLOSE_CONFIG_DEFAULTS["close.breakeven_buffer_atr_mult"],
+        )
+        trail_wide = atr * _get_close_config(
+            redis_conn, "close.trail_wide_atr_mult",
+            CLOSE_CONFIG_DEFAULTS["close.trail_wide_atr_mult"],
+        )
+        initial_distance = atr * sl_mult
+
+        for pos in positions:
+            if pos.sl == 0 and pos.price_open is None:
+                continue  # need price_open to calculate
+
+            tick = mt5.symbol_info_tick(pos.symbol)
+            if not tick:
+                continue
+
+            entry = pos.price_open  # entry price
+            new_sl = pos.sl or 0.0
+            pos_type = "BUY" if pos.type == 0 else "SELL" if pos.type == 1 else ""
+
+            if pos.type == 0:  # BUY
+                profit = tick.bid - entry  # current profit (price distance)
+                if profit <= be_trigger:
+                    # 未过保本门槛：仅对完全无 SL 的仓位设初始宽保护；亏损单/已有SL单保持不动
+                    if pos.sl == 0:
+                        new_sl = round(tick.bid - initial_distance, 2)
+                        log.info(f"#{pos.ticket} init SL→{new_sl}")
+                    continue
+                # 过保本门槛：保本地板 与 移动止盈线 取高者（棘轮只上移）
+                breakeven_floor = round(entry + be_buffer, 2)
+                trailing_sl = round(tick.bid - trail_wide, 2)
+                candidate = max(breakeven_floor, trailing_sl)
+                if candidate > pos.sl:
+                    new_sl = candidate
+                    reason = "breakeven" if candidate == breakeven_floor else "trailing"
+                    log.info(f"#{pos.ticket} {reason}: profit={profit:.1f}, SL {pos.sl}→{new_sl}")
+
+            elif pos.type == 1:  # SELL
+                profit = entry - tick.ask  # current profit (positive when price falls)
+                if profit <= be_trigger:
+                    # 未过保本门槛：仅对完全无 SL 的仓位设初始宽保护；亏损单/已有SL单保持不动
+                    if pos.sl == 0:
+                        new_sl = round(tick.ask + initial_distance, 2)
+                        log.info(f"#{pos.ticket} init SL→{new_sl}")
+                    continue
+                breakeven_floor = round(entry - be_buffer, 2)
+                trailing_sl = round(tick.ask + trail_wide, 2)
+                candidate = min(breakeven_floor, trailing_sl)
+                if candidate < pos.sl:
+                    new_sl = candidate
+                    reason = "breakeven" if candidate == breakeven_floor else "trailing"
+                    log.info(f"#{pos.ticket} {reason}: profit={profit:.1f}, SL {pos.sl}→{new_sl}")
+
+            if new_sl > 0 and new_sl != pos.sl:
+                request = {
+                    "action": _mt5_global.TRADE_ACTION_SLTP,
+                    "position": pos.ticket,
+                    "symbol": pos.symbol,
+                    "sl": new_sl,
+                    "tp": pos.tp,
+                }
+                r = _mt5_global.order_send(request)
+                if r and r.retcode == 10009:
+                    log.info(f"Trail #{pos.ticket} {pos_type}: SL {pos.sl}→{new_sl}")
+                else:
+                    retcode = r.retcode if r else "N/A"
+                    err_info = ""
+                    try:
+                        if r:
+                            err_info = r.comment or ""
+                        if not err_info:
+                            err_info = str(mt5.last_error())
+                    except Exception:
+                        err_info = "unknown"
+                    log.error(
+                        f"Trail FAIL #{pos.ticket} {pos_type}: "
+                        f"SL {pos.sl}→{new_sl}, retcode={retcode}, {err_info}"
+                    )
+    except Exception as e:
+        log.error(f"_update_trailing_stops error: {e}")
+
+
+if __name__ == "__main__":
+    dry_run = "--dry-run" in sys.argv
+    max_retries = 0  # 默认无限重试
+    # 支持 --max-retries=N 参数
+    for arg in sys.argv:
+        if arg.startswith("--max-retries="):
+            max_retries = int(arg.split("=")[1])
+    asyncio.run(run_bridge_forever(dry_run=dry_run, max_retries=max_retries))

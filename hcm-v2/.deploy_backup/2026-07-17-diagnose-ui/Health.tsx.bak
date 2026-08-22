@@ -1,0 +1,441 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { Box, Typography, Chip, LinearProgress, Button } from '@mui/material';
+import { RefreshCw, CheckCircle, Error, Warning, HourglassEmpty } from "../../components/Icons";
+import client from '../../api/client';
+import PipelineBar from '../../components/PipelineBar';
+import KpiCard from '../../components/KpiCard';
+
+interface ServiceHealth {
+  name: string;
+  status: 'healthy' | 'degraded' | 'down' | 'starting';
+  latency_ms: number;
+  uptime_percent: number;
+  last_error: string | null;
+  version: string;
+  details: Record<string, string>;
+}
+
+interface HealthSummary {
+  klines_loaded: number;
+  klines_by_symbol?: Record<string, number>;
+  engine_rules: number;
+  mt5_accounts: number;
+  price_feed: string;
+  ai_status: string;
+  ai_signals_last_hour?: number;
+  latest_pre_score?: number | null;
+  score_threshold?: number;
+  signal_tower_heartbeat?: string | null;
+  klines_last_time: string | null;
+  klines_stale_minutes: number | null;
+}
+
+const Health: React.FC = () => {
+  const [services, setServices] = useState<ServiceHealth[]>([]);
+  const [summary, setSummary] = useState<HealthSummary>({
+    klines_loaded: 0,
+    klines_by_symbol: {},
+    engine_rules: 0,
+    mt5_accounts: 0,
+    price_feed: '--',
+    ai_status: '无信号',
+    ai_signals_last_hour: 0,
+    latest_pre_score: null,
+    score_threshold: 0.50,
+    signal_tower_heartbeat: null,
+    klines_last_time: null,
+    klines_stale_minutes: null,
+  });
+  const [loading, setLoading] = useState<boolean>(false);
+  const [lastUpdated, setLastUpdated] = useState<string>('');
+  const [diagnosing, setDiagnosing] = useState<boolean>(false);
+  const [diagnoseResult, setDiagnoseResult] = useState<{
+    all_pass: boolean; nodes: { id: string; name: string; ok: boolean; msg: string; fix: string }[];
+    suggestion: string; heal_applied: string[];
+  } | null>(null);
+
+  const fetchHealth = useCallback(async (): Promise<void> => {
+    setLoading(true);
+    try {
+      const { data } = await client.get('/api/system/health/detailed');
+      const payload = data.data || data;
+      setServices(payload.services || []);
+      setSummary({
+        klines_loaded: payload.klines_loaded ?? 0,
+        klines_by_symbol: payload.klines_by_symbol ?? {},
+        engine_rules: payload.engine_rules ?? 0,
+        mt5_accounts: payload.mt5_accounts ?? 0,
+        price_feed: payload.price_feed ?? '--',
+        ai_status: payload.ai_status ?? '无信号',
+        ai_signals_last_hour: payload.ai_signals_last_hour ?? 0,
+        latest_pre_score: payload.latest_pre_score ?? null,
+        score_threshold: payload.score_threshold ?? 0.50,
+        signal_tower_heartbeat: payload.signal_tower_heartbeat ?? null,
+        klines_last_time: payload.klines_last_time ?? null,
+        klines_stale_minutes: payload.klines_stale_minutes ?? null,
+      });
+      setLastUpdated(new Date().toLocaleTimeString('zh-CN'));
+    } catch {
+      setServices([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const runDiagnose = useCallback(async (autoHeal: boolean = false) => {
+    setDiagnosing(true);
+    setDiagnoseResult(null);
+    try {
+      const { data } = await client.post(`/api/v1/system/diagnose?auto_heal=${autoHeal}`);
+      if (data.code === 0) setDiagnoseResult(data.data);
+    } catch {
+      // ignore
+    } finally {
+      setDiagnosing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchHealth();
+    const interval = setInterval(fetchHealth, 15000);
+    return () => clearInterval(interval);
+  }, [fetchHealth]);
+
+  const statusIcon = (status: string): React.ReactNode => {
+    switch (status) {
+      case 'healthy': return <CheckCircle sx={{ color: '#22c55e', fontSize: 18 }} />;
+      case 'degraded': return <Warning sx={{ color: '#eab308', fontSize: 18 }} />;
+      case 'down': return <Error sx={{ color: '#ef4444', fontSize: 18 }} />;
+      case 'starting': return <HourglassEmpty sx={{ color: '#3b82f6', fontSize: 18 }} />;
+      default: return null;
+    }
+  };
+
+  const statusLabel = (status: string): string => {
+    switch (status) {
+      case 'healthy': return '正常';
+      case 'degraded': return '降级';
+      case 'down': return '宕机';
+      case 'starting': return '启动中';
+      default: return status;
+    }
+  };
+
+  const statusColor = (status: string): 'success' | 'warning' | 'error' | 'info' => {
+    switch (status) {
+      case 'healthy': return 'success';
+      case 'degraded': return 'warning';
+      case 'down': return 'error';
+      default: return 'info';
+    }
+  };
+
+  const overallHealth = (): string => {
+    if (services.length === 0) return 'unknown';
+    const allHealthy = services.every((s) => s.status === 'healthy');
+    const anyDown = services.some((s) => s.status === 'down');
+    if (allHealthy) return 'healthy';
+    if (anyDown) return 'unhealthy';
+    return 'degraded';
+  };
+
+  const overallColor = (): string => {
+    switch (overallHealth()) {
+      case 'healthy': return '#22c55e';
+      case 'degraded': return '#eab308';
+      case 'unhealthy': return '#ef4444';
+      default: return '#64748b';
+    }
+  };
+
+  const overallLabel = (): string => {
+    switch (overallHealth()) {
+      case 'healthy': return '系统正常';
+      case 'degraded': return '部分降级';
+      case 'unhealthy': return '系统异常';
+      default: return '未知';
+    }
+  };
+
+  // K-line staleness helper
+  const klinesStaleness = (): { emoji: string; label: string; color: string } | null => {
+    if (summary.klines_stale_minutes === null) return null;
+    const m = summary.klines_stale_minutes;
+    if (m < 5) return { emoji: '🟢', label: '实时', color: '#22c55e' };
+    if (m < 30) return { emoji: '🟡', label: `延迟 ${m}分钟`, color: '#eab308' };
+    return { emoji: '🔴', label: `停滞 ${m}分钟`, color: '#ef4444' };
+  };
+
+  // AI mode helpers
+  const aiStatusColor = (status: string): string => {
+    if (status.includes('AI')) return '#22c55e';
+    if (status.includes('混合')) return '#a855f7';
+    if (status.includes('指标')) return '#3b82f6';
+    if (status.includes('无信号')) return '#64748b';
+    return '#eab308';  // bypass / fallback
+  };
+
+  const aiStatusLabel = (status: string): string => {
+    if (status === 'bypass') return '未启用';
+    if (status === '无信号') return '等待信号';
+    return status;
+  };
+
+  // Summary card definitions (K-line card rendered standalone below)
+  const summaryCards: { label: string; value: string | number; color: string }[] = [
+    { label: '推理规则', value: `${summary.engine_rules} 条`, color: '#8b5cf6' },
+    { label: 'MT5 账户', value: `${summary.mt5_accounts} 个`, color: '#22c55e' },
+  ];
+
+  // Engine heartbeat staleness helper
+  const heartbeat = summary.signal_tower_heartbeat;
+  const engineStatus = (): { label: string; color: string } => {
+    if (!heartbeat) return { label: '无心跳', color: '#ef4444' };
+    const delta = (Date.now() - new Date(heartbeat).getTime()) / 60000;
+    if (delta < 10) return { label: '正常', color: '#22c55e' };
+    if (delta < 30) return { label: '延迟', color: '#eab308' };
+    return { label: '宕机', color: '#ef4444' };
+  };
+
+  return (
+    <Box>
+      <Box className="flex items-center justify-between mb-6">
+        <Box>
+          <Typography variant="h6" className="text-gray-100 font-semibold">系统健康</Typography>
+          <Typography variant="caption" className="text-gray-500">
+            最后更新: {lastUpdated || '--'}
+          </Typography>
+        </Box>
+        <Box className="flex items-center gap-3">
+          <Chip
+            icon={<span className="w-2 h-2 rounded-full ml-1" style={{ backgroundColor: overallColor() }} />}
+            label={overallLabel()}
+            sx={{
+              backgroundColor: `${overallColor()}22`,
+              color: overallColor(),
+              fontWeight: 600,
+              border: `1px solid ${overallColor()}44`,
+            }}
+          />
+          <Button variant="outlined" startIcon={<RefreshCw />} onClick={fetchHealth} disabled={loading}
+            sx={{ borderColor: '#4b5563', color: '#94a3b8' }}>
+            刷新
+          </Button>
+          <Button
+            variant="contained"
+            onClick={() => runDiagnose(false)}
+            disabled={diagnosing}
+            sx={{
+              backgroundColor: diagnosing ? '#4b5563' : '#3b82f6',
+              '&:hover': { backgroundColor: diagnosing ? '#4b5563' : '#2563eb' },
+              fontWeight: 600,
+            }}
+          >
+            {diagnosing ? '诊断中…' : '🔍 一键诊断'}
+          </Button>
+          <Button
+            variant="contained"
+            onClick={() => runDiagnose(true)}
+            disabled={diagnosing}
+            sx={{
+              backgroundColor: diagnosing ? '#4b5563' : '#059669',
+              '&:hover': { backgroundColor: diagnosing ? '#4b5563' : '#047857' },
+              fontWeight: 600,
+            }}
+          >
+            ⚡ 自愈
+          </Button>
+        </Box>
+      </Box>
+
+      {/* ── Pipeline Axis Bar ── */}
+      <PipelineBar />
+
+      {/* ── Diagnose Result Panel ── */}
+      {diagnoseResult && (
+        <Box className="mb-6 p-4 rounded-lg border" sx={{
+          borderColor: diagnoseResult.all_pass ? '#22c55e44' : '#ef444444',
+          backgroundColor: diagnoseResult.all_pass ? '#22c55e08' : '#ef444408',
+        }}>
+          <Box className="flex items-center justify-between mb-3">
+            <Typography variant="subtitle1" sx={{ color: diagnoseResult.all_pass ? '#22c55e' : '#ef4444', fontWeight: 600 }}>
+              {diagnoseResult.all_pass ? '✅ 全链路畅通' : `⚠️ ${diagnoseResult.suggestion}`}
+            </Typography>
+            {diagnoseResult.heal_applied.length > 0 && (
+              <Chip size="small" label={`已自愈 ${diagnoseResult.heal_applied.length} 项`} sx={{ backgroundColor: '#05966944', color: '#34d399' }} />
+            )}
+          </Box>
+          <Box className="grid gap-2">
+            {diagnoseResult.nodes.map((n) => (
+              <Box key={n.id} className="flex items-center gap-3 px-3 py-2 rounded" sx={{
+                backgroundColor: n.ok ? '#22c55e0a' : '#ef44440a',
+                borderLeft: `3px solid ${n.ok ? '#22c55e' : '#ef4444'}`,
+              }}>
+                <Typography variant="caption" sx={{ color: n.ok ? '#22c55e' : '#ef4444', fontSize: 14 }}>
+                  {n.ok ? '✅' : '❌'}
+                </Typography>
+                <Typography variant="body2" sx={{ color: '#cbd5e1', minWidth: 80, fontWeight: 600 }}>
+                  {n.name}
+                </Typography>
+                <Typography variant="caption" sx={{ color: '#94a3b8', flex: 1 }}>
+                  {n.msg}
+                </Typography>
+                {!n.ok && n.fix && (
+                  <Chip size="small" label={n.fix.replace(/_/g, ' ')} sx={{
+                    backgroundColor: '#ef444422', color: '#f87171', fontSize: 10,
+                  }} />
+                )}
+              </Box>
+            ))}
+          </Box>
+        </Box>
+      )}
+
+      {/* ── Summary Cards ── */}
+      <Box className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        {/* K-line card — standalone with staleness indicator */}
+        <Box
+          className="card"
+          sx={{
+            borderLeft: `3px solid ${klinesStaleness()?.color ?? '#3b82f6'}`,
+            backgroundColor: `${klinesStaleness()?.color ?? '#3b82f6'}0a`,
+          }}
+        >
+          <Typography variant="caption" className="text-gray-500">K线数据</Typography>
+          <Typography className="text-gray-200 font-semibold mt-1">
+            已加载 {summary.klines_loaded.toLocaleString()} 根
+          </Typography>
+          {summary.klines_last_time && (
+            <Typography variant="caption" className="text-gray-500" sx={{ display: 'block', mt: 0.5 }}>
+              最近: {new Date(summary.klines_last_time).toLocaleString('zh-CN', {
+                year: 'numeric', month: '2-digit', day: '2-digit',
+                hour: '2-digit', minute: '2-digit',
+              })}
+            </Typography>
+          )}
+          {klinesStaleness() && (
+            <Typography variant="caption" sx={{ display: 'block', mt: 0.25, color: klinesStaleness()!.color }}>
+              {klinesStaleness()!.emoji} {klinesStaleness()!.label}
+            </Typography>
+          )}
+        </Box>
+
+        {summaryCards.map((card) => (
+          <Box
+            key={card.label}
+            className="card"
+            sx={{
+              borderLeft: `3px solid ${card.color}`,
+              backgroundColor: `${card.color}0a`,
+            }}
+          >
+            <Typography variant="caption" className="text-gray-500">{card.label}</Typography>
+            <Typography className="text-gray-200 font-semibold mt-1">
+              {typeof card.value === 'number' ? card.value.toLocaleString() : card.value}
+            </Typography>
+          </Box>
+        ))}
+
+        {/* ── 推理评分卡 ── */}
+        <KpiCard
+          title="推理评分"
+          color="#3b82f6"
+          items={[
+            { label: '指标评分', value: summary.ai_status === '指标评分' && summary.latest_pre_score != null ? summary.latest_pre_score.toFixed(3) : '—', color: summary.ai_status === '指标评分' ? '#3b82f6' : '#64748b' },
+            { label: 'AI 评分', value: summary.ai_status === 'AI 评分' && summary.latest_pre_score != null ? summary.latest_pre_score.toFixed(3) : '—', color: summary.ai_status === 'AI 评分' ? '#22c55e' : '#64748b' },
+            { label: '混合评分', value: summary.ai_status === '混合评分' && summary.latest_pre_score != null ? summary.latest_pre_score.toFixed(3) : '—', color: summary.ai_status === '混合评分' ? '#a855f7' : '#64748b' },
+            { label: '引擎状态', value: engineStatus().label, color: engineStatus().color },
+          ]}
+        />
+      </Box>
+
+      {/* ── K-line Staleness Diagnostic Panel ── */}
+      {summary.klines_stale_minutes !== null && summary.klines_stale_minutes >= 30 && (
+        <Box sx={{
+          mt: 3, mb: 3, p: 2,
+          border: '1px solid #eab30844',
+          borderRadius: 2,
+          backgroundColor: '#eab3080a',
+        }}>
+          <Typography variant="subtitle2" sx={{ color: '#eab308', fontWeight: 600, mb: 1 }}>
+            K 线数据已 {summary.klines_stale_minutes} 分钟未更新 — 排查步骤
+          </Typography>
+          <Box component="ol" sx={{ pl: 2, m: 0, color: '#94a3b8', fontSize: '0.8rem', lineHeight: 1.8 }}>
+            <li>确认 MT5 Bridge 是否在运行：检查宿主机 <code style={{backgroundColor:'#1a1a24',padding:'1px 6px',borderRadius:4}}>bridge.log</code></li>
+            <li>确认 MT5 已登录且连接到模拟账户</li>
+            <li>确认当前是否在交易时段（休市期间无新 K 线属正常）</li>
+            <li>检查 hcm-collector 容器：<code style={{backgroundColor:'#1a1a24',padding:'1px 6px',borderRadius:4}}>docker logs hcm-v2-hcm-collector-1 --tail 50</code></li>
+            <li>尝试重启采集器：<code style={{backgroundColor:'#1a1a24',padding:'1px 6px',borderRadius:4}}>docker restart hcm-v2-hcm-collector-1</code></li>
+          </Box>
+        </Box>
+      )}
+
+      {loading && services.length === 0 ? (
+        <LinearProgress sx={{ backgroundColor: '#1a1a24', '& .MuiLinearProgress-bar': { backgroundColor: '#3b82f6' } }} />
+      ) : services.length === 0 ? (
+        <Typography className="text-gray-500 text-center py-12">无法获取健康状态</Typography>
+      ) : (
+        <Box className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {services.map((svc) => (
+            <Box
+              key={svc.name}
+              className="card hover:border-gray-600 transition-colors"
+              sx={{
+                borderLeft: `3px solid ${
+                  svc.status === 'healthy' ? '#22c55e' :
+                  svc.status === 'degraded' ? '#eab308' :
+                  svc.status === 'down' ? '#ef4444' : '#3b82f6'
+                }`,
+              }}
+            >
+              <Box className="flex items-center justify-between mb-3">
+                <Box className="flex items-center gap-2">
+                  {statusIcon(svc.status)}
+                  <Typography className="font-semibold text-gray-200">{svc.name}</Typography>
+                </Box>
+                <Chip
+                  label={statusLabel(svc.status)}
+                  size="small"
+                  color={statusColor(svc.status)}
+                  sx={{ fontSize: 10, height: 20 }}
+                />
+              </Box>
+
+              <Box className="space-y-2">
+                <Box className="flex justify-between">
+                  <Typography variant="caption" className="text-gray-500">延迟</Typography>
+                  <Typography variant="caption" className="text-gray-300">{svc.latency_ms}ms</Typography>
+                </Box>
+                <Box className="flex justify-between">
+                  <Typography variant="caption" className="text-gray-500">运行时间</Typography>
+                  <Typography variant="caption" className="text-gray-300">{svc.uptime_percent.toFixed(2)}%</Typography>
+                </Box>
+                <Box className="flex justify-between">
+                  <Typography variant="caption" className="text-gray-500">版本</Typography>
+                  <Typography variant="caption" className="text-blue-400 font-mono">{svc.version}</Typography>
+                </Box>
+                {svc.last_error && (
+                  <Box className="bg-red-900/20 border border-red-800/30 rounded-lg p-2 mt-2">
+                    <Typography variant="caption" className="text-red-400">{svc.last_error}</Typography>
+                  </Box>
+                )}
+                {Object.entries(svc.details).length > 0 && (
+                  <Box className="mt-2 pt-2 border-t border-gray-700">
+                    {Object.entries(svc.details).map(([key, val]) => (
+                      <Box key={key} className="flex justify-between text-xs">
+                        <span className="text-gray-500">{key}</span>
+                        <span className="text-gray-400">{val}</span>
+                      </Box>
+                    ))}
+                  </Box>
+                )}
+              </Box>
+            </Box>
+          ))}
+        </Box>
+      )}
+    </Box>
+  );
+};
+
+export default Health;

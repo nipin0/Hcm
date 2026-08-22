@@ -1,0 +1,26 @@
+# ===== secrets & agent data (NEVER commit) =====
+.workbuddy/
+.env
+*.env
+*.env.*
+
+# ===== build / cache artifacts =====
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ===== production dumps & scratch/backups (may contain LIVE secrets) =====
+# backup/ holds production Redis/DB dumps that include a live DeepSeek API key
+# (appendonly.aof) -> must NOT be pushed. Sanitize before versioning if ever needed.
+backup/
+hcm-v2/tools/_scratch/
+hcm-v2/tools/_baseline/
+hcm-v2/tools/archive/
+hcm-v2/hcm-web/frontend/dist_bak*/
+hcm-v2/hcm-web/frontend/dist_old/
+hcm-v2/hcm-web/frontend/_scratch/
+
+# ===== logs =====
+*.log

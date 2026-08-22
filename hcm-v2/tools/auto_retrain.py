@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+"""auto_retrain.py — LightGBM 信号质量模型自动重训闭环（路径 A+B+C）。
+
+设计目标（用户 2026-08-20 决策：A/B/C 全做，先搭功能架构，数据再积累）：
+  A. 自动重训：PG 标注(hcm_ai.labeled_samples) → labels.csv/features.csv →
+     训练产出新版本模型 → 回测 → 切 ai.lm.model_path（sidecar 30s 内热重载）。
+  B. DeepSeek 裁判：回测指标 + 样本分布摘要发给 DeepSeek，由其判定
+     "采用/回滚 + 理由"；DeepSeek 不可用/超时 → 按本地 AUC 阈值 fail-open 决策。
+  C. DeepSeek 特征增强：quality_features.py 已把 ds_fake_prob/ds_sl_coeff/
+     ds_continuity 近邻匹配注入训练 CSV（与推理侧 build_features 同契约），
+     本脚本只需调用 quality_features 即自动生效，无需改任何已上线代码。
+
+铁律合规：
+  - 纯新增文件，不改动任何已上线功能（路径 C 的契约层已于 2026-08-17 就绪）。
+  - 训练产物落 tools/_artifacts/，模型落 tools/models/（与生产 sidecar 同目录）。
+  - 所有外部调用（PG / DeepSeek / Redis）均有超时+降级兜底，绝不因重训失败卡死主链路。
+  - 模型切换经 config_provider.set 双写 PG+Redis+PUB，与现有配置热重载机制一致。
+
+用法：
+  # 单次跑（验证/调试）
+  python auto_retrain.py --once
+
+  # 常驻守护（每 --interval-hours 小时一轮，默认 24）
+  python auto_retrain.py --daemon --interval-hours 24
+
+  # 强制忽略 DeepSeek 裁判、纯本地 AUC 决策（离线/无 key 环境）
+  python auto_retrain.py --once --no-deepseek
+
+依赖：lightgbm, scikit-learn, pandas, numpy, psycopg2, requests
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import psycopg2
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+try:
+    import lightgbm as lgb
+except Exception:
+    lgb = None
+try:
+    from sklearn.metrics import roc_auc_score as _roc_auc
+except Exception:
+    _roc_auc = None
+
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, TOOLS_DIR)
+from _monitor_common import (load_baseline, compute_psi_batch,
+                             build_live_baseline_from_features,
+                             load_live_baseline, save_live_baseline, LIVE_BASELINE_PATH)
+ARTIFACTS = os.path.join(TOOLS_DIR, "_artifacts")
+MODELS_DIR = os.path.join(TOOLS_DIR, "models")
+os.makedirs(ARTIFACTS, exist_ok=True)
+os.makedirs(MODELS_DIR, exist_ok=True)
+
+DB_URL_DEFAULT = "postgresql://hcm:hcm_dev_pwd@localhost:5432/hcm_v2"
+REDIS_HOST = "localhost"
+REDIS_PORT = 6379
+
+# 本地决策阈值（fail-open 护栏）：测试集 AUC 低于此值视为退化，不切模型
+LOCAL_AUC_ADOPT_MIN = 0.55
+# 样本量下限：少于此数训练结果不可靠，仅产模型不切（避免用噪声数据覆盖好模型）
+# 支持环境变量 RETRAIN_MIN_SAMPLES 覆盖（验证时可临时调大，避免误切线上模型）
+MIN_SAMPLES_FOR_SWITCH = int(os.environ.get("RETRAIN_MIN_SAMPLES", "200"))
+# 【P0-O3 2026-08-22】DeepSeek 三特征非零占比硬门槛：低于此值说明训练集大部分
+# ds_* 列是 0.0 占位（历史缺 DS 票）→ 模型实质未吸收 ds 语义，切上线只会带来
+# "看似重训了、实则没吸收新信号"的假精准。低于阈值 → 只产模型不切换（与样本量
+# 不足同级别的护栏）。支持环境变量 DS_MIN_NONZERO_RATIO 覆盖。
+DS_MIN_NONZERO_RATIO = float(os.environ.get("DS_MIN_NONZERO_RATIO", "0.30"))
+
+# ── P3-B/C 触发阈值（环境变量可覆盖）────────────────────────────────────
+PSI_TRIGGER = float(os.environ.get("PSI_TRIGGER", "0.25"))          # 特征分布漂移阈值
+CALIB_COLLAPSE_PCT = float(os.environ.get("CALIB_COLLAPSE_PCT", "0.90"))  # 置信坍缩占比阈值
+DRY_RUN = False  # 置 True 时 switch_model 只记录不切换（验证/灰度用）
+
+PY = sys.executable
+DS_API_DEFAULT = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1/chat/completions")
+DS_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DS_MODEL_DEFAULT = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+
+
+def load_ds_config_from_pg() -> dict:
+    """从 PG 配置中心(hcm_config.metadata)读取 DeepSeek 配置——与系统其他模块一致的真源。
+
+    优先级：环境变量 > PG(hcm_config.metadata) > 模块内置默认值。
+    这样守护无需手动填 key：只要 PG 里 deepseek.api_key 已配（实测已配，
+    sk-5... 35字符），裁判即自动链动；PG 缺失则回退模块默认，再由
+    deepseek_judge 的 no_key 兜底走 local_fallback（不卡死）。
+    """
+    cfg = {
+        "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+        "api_base": os.environ.get("DEEPSEEK_API_BASE", ""),
+        "model": os.environ.get("DEEPSEEK_MODEL", ""),
+    }
+    try:
+        import psycopg2
+        conn = psycopg2.connect(DB_URL_DEFAULT, connect_timeout=5)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT config_key, current_value FROM hcm_config.metadata "
+                    "WHERE config_key IN ('deepseek.api_key','deepseek.api_base','deepseek.model')"
+                )
+                for k, v in cur.fetchall():
+                    if k == "deepseek.api_key" and not cfg["api_key"]:
+                        cfg["api_key"] = v or ""
+                    elif k == "deepseek.api_base" and not cfg["api_base"]:
+                        # 归一化：DeepSeek 开放 API 标准端点为 /v1/chat/completions。
+                        # PG 真源常只存根域名 https://api.deepseek.com（别处共享配置），
+                        # 此处补全路径，不擅自改 PG 真源值（铁律：不单边改配置）。
+                        base = (v or "").rstrip("/")
+                        if base and not base.endswith("/chat/completions"):
+                            if base.endswith("/v1"):
+                                base += "/chat/completions"
+                            elif "/v1/" not in base:
+                                base += "/v1/chat/completions"
+                        cfg["api_base"] = base
+                    elif k == "deepseek.model" and not cfg["model"]:
+                        cfg["model"] = v or ""
+        finally:
+            conn.close()
+    except Exception as e:
+        log(f"[ds-config] PG read failed (non-fatal, fall back to env/default): {e}")
+    return cfg
+
+
+def log(msg: str):
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    with open(os.path.join(TOOLS_DIR, "auto_retrain.log"), "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+# ── 版本自增 ──────────────────────────────────────────────────────────────
+def next_model_version() -> int:
+    """扫描 tools/models/lgbm_quality_vN.txt，返回最大 N+1。"""
+    import re
+    max_v = 0
+    for fn in os.listdir(MODELS_DIR):
+        m = re.match(r"lgbm_quality_v(\d+)\.txt$", fn)
+        if m:
+            max_v = max(max_v, int(m.group(1)))
+    return max_v + 1
+
+
+# ── 子进程调用 ────────────────────────────────────────────────────────────
+def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
+    log(f"[run] {' '.join(cmd)}")
+    try:
+        p = subprocess.run(cmd, cwd=TOOLS_DIR, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s"
+    except Exception as e:
+        return 1, "", str(e)
+
+
+# ── 回测指标解析 ──────────────────────────────────────────────────────────
+def parse_auc(stdout: str) -> float | None:
+    """从 train_signal_quality.py 输出抓 [split] 或 [tss-summary] 的 AUC。"""
+    import re
+    best = None
+    for line in stdout.splitlines():
+        m = re.search(r"AUC=(\d+\.\d+)", line)
+        if m:
+            v = float(m.group(1))
+            if best is None or "tss-summary" in line or "test" in line.lower():
+                best = v
+    # 优先 tss-summary 均值（时序交叉验证更可靠）
+    m = re.search(r"tss-summary\] AUC mean=(\d+\.\d+)", stdout)
+    if m:
+        return float(m.group(1))
+    return best
+
+
+def count_samples(stdout: str) -> int:
+    import re
+    m = re.search(r"joined rows=(\d+)", stdout)
+    return int(m.group(1)) if m else 0
+
+
+def ds_nonzero_ratio(stdout: str) -> float | None:
+    import re
+    m = re.search(r"DeepSeek 特征非零占比 (\d+\.\d+)%", stdout)
+    if m:
+        return float(m.group(1)) / 100.0
+    m2 = re.search(r"ds_diag\] WARNING: DeepSeek 特征非零占比仅 (\d+\.\d+)%", stdout)
+    if m2:
+        return float(m2.group(1)) / 100.0
+    return None
+
+
+# ── 路径 B：DeepSeek 裁判 ─────────────────────────────────────────────────
+def deepseek_judge(api_base: str, api_key: str, payload: dict, timeout: int = 60,
+                   model: str = "deepseek-chat") -> dict:
+    """把回测摘要发给 DeepSeek，返回 {decision: 'adopt'|'rollback', reason: str}。
+
+    超时/无 key/异常 → 返回 {decision: 'local_fallback', reason: 'ds_unavailable'}，
+    调用方据此走本地 AUC 决策（fail-open，绝不卡死）。
+    """
+    if not api_key:
+        return {"decision": "local_fallback", "reason": "no_deepseek_key"}
+    try:
+        import requests
+        prompt = (
+            "你是量化模型训练的质量裁判。以下是 LightGBM 信号质量模型的一次重训结果摘要，"
+            "请判断【是否采用新模型替换线上模型】。\n"
+            "采用标准：测试 AUC 较基线有实质提升、样本量充足、DeepSeek 特征吸收充分、"
+            "无退化迹象。若 AUC<0.55 或样本<200 或校准器退化，应回滚。\n"
+            "只返回一个 JSON：{\"decision\": \"adopt\" 或 \"rollback\", \"reason\": \"中文简述\"}\n\n"
+            f"摘要：{json.dumps(payload, ensure_ascii=False)}"
+        )
+        resp = requests.post(
+            api_base,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": [{"role": "user", "content": prompt}],
+                  "temperature": 0.0, "max_tokens": 300},
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        # 容错：从返回里抠 JSON
+        import re
+        jm = re.search(r"\{[^{}]*\}", content, re.DOTALL)
+        if jm:
+            return json.loads(jm.group(0))
+        return {"decision": "local_fallback", "reason": f"ds_unparseable: {content[:120]}"}
+    except Exception as e:
+        return {"decision": "local_fallback", "reason": f"ds_error: {e}"}
+
+
+# ── 模型切换（双写 PG+Redis）─────────────────────────────────────────────
+def switch_model(model_path: str, calib_path: str) -> bool:
+    """把新模型路径写 ai.lm.model_path / ai.lm.calib_path（PG+Redis 双写+PUB）。
+
+    优先用 config_provider.set（若存在），否则直接双写 PG+Redis。
+    返回是否成功。DRY_RUN=True 时只记录不切换（验证/灰度用）。
+    """
+    if DRY_RUN:
+        log(f"[switch] DRY_RUN=True, skip actual switch (would set {model_path})")
+        return True
+    try:
+        import psycopg2
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
+
+        # 1) Redis 直写（hcm:config:v2 哈希字段）
+        r.hset("hcm:config:v2", "ai.lm.model_path", model_path)
+        r.hset("hcm:config:v2", "ai.lm.calib_path", calib_path)
+        r.publish("hcm:config:invalidate", "ai.lm.model_path")
+        r.publish("hcm:config:invalidate", "ai.lm.calib_path")
+        log("[switch] Redis hcm:config:v2 updated + PUB")
+
+        # 2) PG 直写（hcm_config.metadata 真源）
+        conn = psycopg2.connect(DB_URL_DEFAULT, connect_timeout=5)
+        try:
+            with conn.cursor() as cur:
+                for key, val in (("ai.lm.model_path", model_path), ("ai.lm.calib_path", calib_path)):
+                    # default_value 是 NOT NULL 列：INSERT 时与 current_value 同值；
+                    # 已存在则仅更新 current_value（default_value 保持不变）。
+                    cur.execute(
+                        "INSERT INTO hcm_config.metadata "
+                        "(config_key, current_value, default_value, value_type, category) "
+                        "VALUES (%s, %s, %s, 'string', 'ai') "
+                        "ON CONFLICT (config_key) DO UPDATE SET current_value = EXCLUDED.current_value",
+                        (key, val, val),
+                    )
+                conn.commit()
+            log("[switch] PG hcm_config.metadata updated")
+        finally:
+            conn.close()
+        return True
+    except Exception as e:
+        log(f"[switch] FAILED: {e}")
+        return False
+
+
+def record_retrain_run(payload: dict):
+    """记录重训历史到 Redis 键 hcm:ai:retrain:last（JSON）+ 保留最近 50 条列表。
+
+    设计取舍：不写入 hcm_ai.calibration_daily（该表是 reconcile_labels 的产出表，
+    列结构 win_rate/trades 等与本脚本的模型版本语义不同，擅自入侵列=铁律禁止的
+    schema 改动）。改用 Redis 单一真源记录，零 schema 风险，面板/诊断可经
+    hcm:ai:retrain:last 查最新、hcm:ai:retrain:history 查近 50 轮。
+    """
+    try:
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
+        blob = json.dumps(payload, ensure_ascii=False, default=str)
+        r.set("hcm:ai:retrain:last", blob)
+        r.lpush("hcm:ai:retrain:history", blob)
+        r.ltrim("hcm:ai:retrain:history", 0, 49)
+        log("[record] retrain run saved to Redis hcm:ai:retrain:last")
+    except Exception as e:
+        log(f"[record] Redis save FAILED (non-fatal, see auto_retrain.log): {e}")
+
+
+def record_shadow_eval(payload: dict):
+    """持久化 champion vs challenger 影子对比结果（P1-O5 2026-08-22）。
+
+    每轮重训的 shadow_eval 不再只打日志（事后无法回看在线表现），
+    落 Redis hcm:ai:shadow:last + 保留近 50 条 hcm:ai:shadow:history，
+    形成「候选 vs 现役」随时间轴的可回看记录，支持模型版本归因。
+    零 schema 风险（复用 Redis，不碰 PG 表结构）。失败仅记日志。
+    """
+    try:
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
+        blob = json.dumps(payload, ensure_ascii=False, default=str)
+        r.set("hcm:ai:shadow:last", blob)
+        r.lpush("hcm:ai:shadow:history", blob)
+        r.ltrim("hcm:ai:shadow:history", 0, 49)
+        log("[shadow-record] shadow eval saved to Redis hcm:ai:shadow:history")
+    except Exception as e:
+        log(f"[shadow-record] Redis save FAILED (non-fatal): {e}")
+
+
+# ── P3 共享工具 ──────────────────────────────────────────────────────────
+def _safe_json(x):
+    """inference_log 的 JSON 列 psycopg2 已解析为 dict；str 才需 loads。"""
+    if x is None:
+        return {}
+    if isinstance(x, dict):
+        return x
+    try:
+        return json.loads(x)
+    except Exception:
+        return {}
+
+
+def safe_auc(y, p):
+    """LightGBM predict 返回 raw 或概率，统一做 AUC；形状异常或单类→None。"""
+    if _roc_auc is None or y is None or p is None:
+        return None
+    y = np.asarray(y, dtype=float)
+    p = np.asarray(p, dtype=float).ravel()
+    if y.size < 30 or len(set(y.tolist())) < 2 or p.size != y.size:
+        return None
+    try:
+        return float(_roc_auc(y, p))
+    except Exception:
+        return None
+
+
+def fetch_recent(window_hours: float = 24.0):
+    """读近窗口 inference_log，返回 (ai_scores, features_list, passed_list)。"""
+    since = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    conn = psycopg2.connect(DB_URL_DEFAULT, connect_timeout=10)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT ai_score, features, snapshot "
+                "FROM hcm_ai.inference_log WHERE created_at >= %s",
+                (since,),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+    ai, feats, passed = [], [], []
+    for a, fj, sj in rows:
+        ai.append(a)
+        feats.append(_safe_json(fj))
+        s = _safe_json(sj)
+        passed.append(1.0 if s.get("passed") else 0.0)
+    return ai, feats, passed
+
+
+def build_live_baseline(window_days: float = 1.0) -> dict | None:
+    """从 inference_log 近窗口特征构建 live 群体基线(deciles)→ models/live_baseline.json。
+
+    P3-B 根治：PSI 基线改取真实生产推理群体，而非训练集(训练子集≠live 群体
+    导致永久误触发+每小时 churn)。重训切换后调用本函数 re-pin，使 PSI 归零、
+    仅未来真漂移才再触发。2026-08-22。
+    窗口默认 24h：捕捉当前(post-shift)regime，与 _compute_trigger 的 24h 比较窗口
+    对齐→PSI≈0、停 churn；更长窗口会混入 pre-shift 旧 regime 致误触发。
+    """
+    ai, feats, passed = fetch_recent(window_days * 24.0)
+    if len(feats) < 50:
+        log(f"[live-baseline] insufficient samples ({len(feats)}), skip")
+        return None
+    try:
+        from _model_feature_cols import MODEL_FEATURE_COLS
+        present = set()
+        for _f in feats[:200]:
+            present |= set(_f.keys())
+        cols = [c for c in MODEL_FEATURE_COLS if c in present] or list(present)
+    except Exception:
+        present = set()
+        for _f in feats[:200]:
+            present |= set(_f.keys())
+        cols = list(present)
+    fdf = pd.DataFrame([{c: f.get(c, float("nan")) for c in cols} for f in feats])
+    bl = build_live_baseline_from_features(fdf, cols)
+    save_live_baseline(bl)
+    log(f"[live-baseline] built from {len(feats)} samples, "
+        f"{len(bl['features'])} features -> {LIVE_BASELINE_PATH}")
+    return bl
+
+
+def _current_model_path() -> str | None:
+    """读现役 champion 模型路径（Redis hcm:config:v2 > PG hcm_config.metadata）。"""
+    try:
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
+        v = r.hget("hcm:config:v2", "ai.lm.model_path")
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        import psycopg2
+        conn = psycopg2.connect(DB_URL_DEFAULT, connect_timeout=5)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT current_value FROM hcm_config.metadata WHERE config_key='ai.lm.model_path'")
+                row = cur.fetchone()
+                if row and row[0]:
+                    return row[0]
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return None
+
+
+def _compute_trigger(baseline, feat_cols, ai, feats, passed):
+    """返回 (psi_dict, collapse_bool, triggered_bool)。"""
+    fdf = pd.DataFrame([{c: f.get(c, float("nan")) for c in feat_cols} for f in feats])
+    psi = compute_psi_batch(fdf, baseline, feat_cols)
+    arr = np.asarray([a for a in ai if a is not None], dtype=float)
+    edges = list(range(0, 101, 5))
+    edges.append(100)
+    counts, _ = np.histogram(arr, bins=edges)
+    collapse = (counts.max() / max(1, int(counts.sum()))) > CALIB_COLLAPSE_PCT
+    triggered = (psi["max"] > PSI_TRIGGER and psi["mean"] > PSI_TRIGGER) or collapse
+    return psi, collapse, triggered
+
+
+# ── P3-A 监控报表联动（每轮守护落库四视图报表到 Redis）────────────────────
+def run_monitor_report(window_hours: float = 24.0) -> bool:
+    """P3-A 联动：每轮守护调用 monitoring_report.py 落库四视图监控报表到 Redis。
+
+    只读聚合 inference_log + 写 Redis 监控键（不写 PG / 不改配置 / 不切模型），
+    与 daemon 其他步骤同属非致命（失败仅记日志，不卡死主链路）。
+    落库后前端 /signal-tower/model-monitor 经 /api/v1/ai/report/monitor 展示。
+    2026-08-22 接入守护循环。
+    """
+    rc, out, err = run([PY, "monitoring_report.py", "--window-hours", str(window_hours)], timeout=120)
+    if rc != 0:
+        log(f"[monitor-report] FAILED rc={rc}: {err[-500:]}")
+        return False
+    return True
+
+
+# ── P3-D 链动：HEXP 参数变更 → re-pin PSI 基线（O7 2026-08-22）────────────────
+# 背景：调 HEXP 极值参数(k_extreme/mm_retreat_min 等)会改变 hexp 快照 → 改变
+#   ai 特征分布 → feature_baseline.json 失配 → 守护每轮误触发重训(churn)。
+# 方案：扫描 Redis hcm:config:version 里 hexp.* 前缀时间戳的最大值，与上次记录
+#   比较；变更即 re-pin live_baseline（build_live_baseline），使 PSI 归零、停 churn，
+#   并把重训交由 PSI 触发机制决定（不因参数变更强制重训，避免过度）。
+_HEXP_CFG_TS_REDIS_KEY = "hcm:ai:retrain:hexp_cfg_ts"
+
+
+def _read_hexp_config_max_ts() -> float | None:
+    """扫描 Redis hcm:config:version 中所有 hexp.* 键的最大时间戳。"""
+    try:
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
+        raw = r.hgetall("hcm:config:version")
+        max_ts = None
+        for k, v in raw.items():
+            if isinstance(k, bytes):
+                k = k.decode("utf-8", "ignore")
+            if str(k).startswith("hexp."):
+                try:
+                    f = float(v)
+                    max_ts = f if max_ts is None or f > max_ts else max_ts
+                except (TypeError, ValueError):
+                    continue
+        return max_ts
+    except Exception:
+        return None
+
+
+def _persist_hexp_cfg_ts(ts: float):
+    try:
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
+        r.set(_HEXP_CFG_TS_REDIS_KEY, str(ts))
+    except Exception:
+        pass
+
+
+def _load_hexp_cfg_ts() -> float | None:
+    try:
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
+        v = r.get(_HEXP_CFG_TS_REDIS_KEY)
+        return float(v) if v else None
+    except Exception:
+        return None
+
+
+def hexp_config_link(force_repin: bool = False) -> bool:
+    """HEXP 参数变更 → re-pin live PSI 基线（O7 链动）。
+
+    返回是否触发了 re-pin。首次运行（无历史记录）→ 直接 pin，不视为变更。
+    force_repin=True（--build-live-baseline）→ 无条件重 pin（供调参后手动调用）。
+    失败/无 Redis 时不抛错（非致命），返回 False。
+    """
+    try:
+        cur_ts = _read_hexp_config_max_ts()
+        if cur_ts is None:
+            log("[hexp-link] cannot read hexp config ts (redis?)")
+            return False
+        prev_ts = _load_hexp_cfg_ts()
+        _persist_hexp_cfg_ts(cur_ts)
+        if force_repin:
+            log(f"[hexp-link] force re-pin live baseline (current hexp cfg ts={cur_ts:.0f})")
+            return build_live_baseline() is not None
+        if prev_ts is None:
+            log(f"[hexp-link] first run, pin hexp cfg ts={cur_ts:.0f} (no repin)")
+            return False
+        if abs(cur_ts - prev_ts) > 1e-6:
+            log(f"[hexp-link] HEXP 参数变更检测到：ts {prev_ts:.0f}→{cur_ts:.0f} "
+                f"→ re-pin live baseline（PSI 归零，避免 churn）")
+            return build_live_baseline() is not None
+        return False
+    except Exception as e:
+        log(f"[hexp-link] error (non-fatal): {e}")
+        return False
+
+
+# ── P3-B 数据驱动重训触发 ─────────────────────────────────────────────────
+def monitor_and_trigger(use_deepseek: bool = True) -> bool:
+    """每轮 daemon 先算 PSI/校准坍缩/regime，触发则调 retrain_once()（路径A护栏+切换）。
+
+    触发条件（任一项）：
+      - PSI>PSI_TRIGGER 且均值>PSI_TRIGGER（特征分布持续漂移）
+      - 置信分布坍缩（单 ai_score 箱占比>CALIB_COLLAPSE_PCT）
+    独立于 24h 定时；零新增生产写路径（仍走 switch_model 双写+PUB）。
+    """
+    baseline = load_live_baseline() or load_baseline()
+    feat_cols = baseline.get("features", [])
+    ai, feats, passed = fetch_recent(24.0)
+    if len(feats) < 50:
+        log("[trigger] insufficient recent samples, skip")
+        return False
+    psi, collapse, triggered = _compute_trigger(baseline, feat_cols, ai, feats, passed)
+    log(f"[trigger] psi_max={psi['max']:.3f} psi_mean={psi['mean']:.3f} "
+        f"collapsed={collapse} drifted={psi['drifted']} -> triggered={triggered}")
+    if triggered:
+        log("[trigger] condition met -> launching retrain_once()")
+        retrain_once(use_deepseek=use_deepseek)
+    return triggered
+
+
+# ── P3-C 灰度对比（champion/challenger）──────────────────────────────────
+def shadow_eval(champion_path: str, candidate_path: str, feats, passed) -> dict:
+    """候选 vs 现役 champion 影子对比：在近期特征上比较 AUC(对 passed 标签)。
+
+    返回 {available, auc_champ, auc_cand, adopt}。adopt=候选 AUC 不劣于 champion
+    （允许 -0.02 容差）。库缺失/样本不足→available=False 且 adopt=True（放行，
+    交由既有 DS/本地护栏兜底）。
+    """
+    if lgb is None or _roc_auc is None:
+        return {"available": False, "adopt": True, "reason": "libs_unavailable"}
+    try:
+        champ = lgb.Booster(model_file=champion_path)
+        cand = lgb.Booster(model_file=candidate_path)
+    except Exception as e:
+        return {"available": False, "adopt": True, "reason": f"load_err:{e}"}
+    cfeats = champ.feature_name()
+    nfeats = cand.feature_name()
+    Xc = pd.DataFrame(feats).reindex(columns=cfeats, fill_value=0.0)
+    Xn = pd.DataFrame(feats).reindex(columns=nfeats, fill_value=0.0)
+    y = np.asarray(passed, dtype=float)
+    if len(y) < 30 or len(set(y.tolist())) < 2:
+        return {"available": True, "adopt": True, "reason": "insufficient_labels"}
+    p_champ = np.asarray(champ.predict(Xc), dtype=float).ravel()
+    p_cand = np.asarray(cand.predict(Xn), dtype=float).ravel()
+    auc_champ = safe_auc(y, p_champ)
+    auc_cand = safe_auc(y, p_cand)
+    adopt = (auc_cand is not None and auc_champ is not None and auc_cand >= auc_champ - 0.02)
+    return {"available": True, "auc_champ": auc_champ, "auc_cand": auc_cand, "adopt": adopt}
+
+
+def _check_trigger_only():
+    """--check-trigger：仅计算并打印触发条件，不重训（安全验证 P3-B）。"""
+    baseline = load_live_baseline() or load_baseline()
+    feat_cols = baseline.get("features", [])
+    ai, feats, passed = fetch_recent(24.0)
+    log(f"[check] recent samples={len(feats)}")
+    if len(feats) < 50:
+        log("[check] insufficient samples"); return
+    psi, collapse, triggered = _compute_trigger(baseline, feat_cols, ai, feats, passed)
+    print(json.dumps({
+        "psi_max": round(psi["max"], 4), "psi_mean": round(psi["mean"], 4),
+        "n_drifted": len(psi["drifted"]), "calib_collapse": bool(collapse),
+        "triggered": bool(triggered),
+    }, ensure_ascii=False, indent=2))
+
+
+def _run_shadow_eval():
+    """--shadow-eval：最新候选 vN vs 现役 champion 影子对比，不切换（安全验证 P3-C）。"""
+    champ = _current_model_path()
+    v = next_model_version() - 1
+    cand = os.path.join(MODELS_DIR, f"lgbm_quality_v{v}.txt")
+    if not champ or not os.path.exists(cand):
+        log(f"[shadow-eval] champion={champ} candidate(v{v})={cand} missing"); return
+    ai, feats, passed = fetch_recent(24.0)
+    if not feats:
+        log("[shadow-eval] no recent features"); return
+    se = shadow_eval(champ, cand, feats, passed)
+    print(json.dumps({"champion": champ, "candidate": cand, "shadow": se},
+                     ensure_ascii=False, indent=2))
+
+
+# ── 主流程 ────────────────────────────────────────────────────────────────
+def retrain_once(use_deepseek: bool = True) -> dict:
+    """执行一轮完整重训闭环，返回结果摘要。"""
+    v = next_model_version()
+    model_out = os.path.join(MODELS_DIR, f"lgbm_quality_v{v}.txt")
+    calib_out = os.path.join(MODELS_DIR, f"calib_v{v}.pkl")
+    labels_csv = os.path.join(ARTIFACTS, "labels.csv")
+    features_csv = os.path.join(ARTIFACTS, "features.csv")
+
+    log(f"=== retrain round: target version v{v} ===")
+
+    # 1) 标签
+    # 2026-08-21: 加 --ds-calibrate，使 build_labels 计算 ds_calib_weight
+    # (DeepSeek 票近邻匹配加权 1.5/0.5)，供 train_signal_quality 作 sample_weight。
+    # 修复前未传此参数 → ds_calib_weight 恒 1.0 → DeepSeek 完全未参与训练加权(断链)。
+    rc, out, err = run([PY, "build_labels.py", "--out", labels_csv, "--mode", "HEXP:%",
+                        "--ds-calibrate"])
+    if rc != 0:
+        log(f"[ABORT] build_labels failed: {err[-500:]}")
+        return {"ok": False, "stage": "build_labels", "error": err[-500:]}
+
+    # 2) 特征（自动带 ds_* DeepSeek 特征 = 路径 C）
+    rc, out, err = run([PY, "quality_features.py", "--out", features_csv, "--mode", "HEXP:%", "--period-align", "m5"])
+    if rc != 0:
+        log(f"[ABORT] quality_features failed: {err[-500:]}")
+        return {"ok": False, "stage": "quality_features", "error": err[-500:]}
+
+    # 3) 训练
+    rc, out, err = run(
+        [PY, "train_signal_quality.py", "--labels", labels_csv, "--features", features_csv,
+         "--model", model_out, "--calib", calib_out, "--outdir", ARTIFACTS],
+        timeout=900,
+    )
+    if rc != 0:
+        log(f"[ABORT] train failed: {err[-800:]}")
+        return {"ok": False, "stage": "train", "error": err[-800:]}
+
+    auc = parse_auc(out)
+    samples = count_samples(out)
+    ds_ratio = ds_nonzero_ratio(out)
+    log(f"[train] done: auc={auc} samples={samples} ds_nonzero_ratio={ds_ratio}")
+
+    payload = {
+        "model_version": f"v{v}",
+        "auc": auc,
+        "samples": samples,
+        "ds_nonzero_ratio": ds_ratio,
+        "baseline_win_rate": None,  # train 输出含，按需扩展解析
+    }
+
+    # 4) 决策：DeepSeek 裁判（路径 B）或本地 AUC 护栏
+    # 从 PG 配置中心读取 DeepSeek 真源 key/api_base/model（与系统其他模块一致），
+    # 覆盖模块默认，使守护无需手动填 key 即可链动裁判。
+    ds_cfg = load_ds_config_from_pg()
+    ds_key = ds_cfg["api_key"] or DS_KEY
+    ds_api = ds_cfg["api_base"] or DS_API_DEFAULT
+    ds_model = ds_cfg["model"] or DS_MODEL_DEFAULT
+    log(f"[ds-config] key_present={bool(ds_key)} api_base={ds_api[:24]}... model={ds_model}")
+
+    decided_adopt = False
+    judge = {"decision": "local_fallback", "reason": "disabled"}
+    if use_deepseek:
+        judge = deepseek_judge(ds_api, ds_key, payload, model=ds_model)
+        if judge.get("decision") == "adopt":
+            decided_adopt = True
+        elif judge.get("decision") == "rollback":
+            decided_adopt = False
+        else:  # local_fallback
+            decided_adopt = (auc is not None and auc >= LOCAL_AUC_ADOPT_MIN
+                             and samples >= MIN_SAMPLES_FOR_SWITCH)
+    else:
+        decided_adopt = (auc is not None and auc >= LOCAL_AUC_ADOPT_MIN
+                         and samples >= MIN_SAMPLES_FOR_SWITCH)
+
+    log(f"[judge] decision={judge.get('decision')} reason={judge.get('reason')} "
+        f"-> adopt={decided_adopt}")
+
+    # 5) 样本不足 → 只产模型不切（避免噪声覆盖）
+    if samples < MIN_SAMPLES_FOR_SWITCH:
+        log(f"[skip-switch] samples={samples} < {MIN_SAMPLES_FOR_SWITCH}，模型已产出但未切换")
+        decided_adopt = False
+    # 【P0-O3 2026-08-22】DeepSeek 特征非零占比硬门槛：占比过低说明模型未真正吸收
+    # ds 语义，切换上线会造成"假精准"。只产模型不切（与样本不足同级别护栏）。
+    if ds_ratio is not None and ds_ratio < DS_MIN_NONZERO_RATIO:
+        log(f"[skip-switch] ds_nonzero_ratio={ds_ratio:.3f} < {DS_MIN_NONZERO_RATIO}，"
+            f"模型实质未吸收 DeepSeek 语义，只产不切（避免假精准）")
+        payload["ds_gate_blocked"] = True
+        decided_adopt = False
+
+    # 6) 切换（P3-C 灰度闸门：候选需不劣于现役 champion 才切）
+    switched = False
+    if decided_adopt:
+        champ_path = _current_model_path()
+        if champ_path and os.path.exists(champ_path) and \
+                os.path.abspath(champ_path) != os.path.abspath(model_out):
+            _ai_l, _f_l, _p_l = fetch_recent(24.0)
+            if _f_l:
+                se = shadow_eval(champ_path, model_out, _f_l, _p_l)
+                log(f"[shadow] {se}")
+                # 【P1-O5 2026-08-22】影子对比持久化：候选 vs 现役 AUC 差异 + 决定落库，
+                # 形成在线表现时间线，供按版本归因/回看（不再仅打日志）。
+                record_shadow_eval({
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "champion": os.path.basename(champ_path),
+                    "candidate": os.path.basename(model_out),
+                    "shadow": se,
+                    "blocked": bool(se.get("available") and not se.get("adopt")),
+                })
+                payload["shadow"] = se
+                if se.get("available") and not se.get("adopt"):
+                    log("[shadow] challenger 未优于 champion -> 不切换")
+                    decided_adopt = False
+        if decided_adopt:
+            switched = switch_model(model_out, calib_out)
+            log(f"[switch] {'OK' if switched else 'FAILED'} -> {model_out}")
+        else:
+            log("[switch] skipped (shadow gate blocked)")
+
+    if switched:
+        try:
+            build_live_baseline()
+            log("[live-baseline] re-pinned after switch")
+        except Exception as e:
+            log(f"[live-baseline] re-pin failed (non-fatal): {e}")
+
+    payload.update({"adopted": decided_adopt, "switched": switched, "judge": judge})
+    record_retrain_run(payload)
+    log(f"=== round done: adopted={decided_adopt} switched={switched} ===")
+    return payload
+
+
+def _heartbeat():
+    """守护存活心跳：写 Redis hcm:ai:retrain:daemon（TTL 续期）。
+
+    前端报表据此判断守护是否在线（死守护/未启动→离线，避免误以为'没训练'）。
+    每轮重训后 + 崩溃兜底都刷新，TTL 取 2 倍间隔(48h)容错。
+    """
+    try:
+        import redis
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
+        import time as _t
+        blob = json.dumps({"pid": os.getpid(), "at": _t.strftime("%Y-%m-%d %H:%M:%S")},
+                          ensure_ascii=False)
+        r.set("hcm:ai:retrain:daemon", blob, ex=48 * 3600)
+    except Exception as e:
+        log(f"[heartbeat] write failed (non-fatal): {e}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true", help="单次运行后退出")
+    ap.add_argument("--daemon", action="store_true", help="常驻循环")
+    ap.add_argument("--interval-hours", type=float, default=24.0)
+    ap.add_argument("--no-deepseek", action="store_true", help="禁用 DeepSeek 裁判，纯本地 AUC 决策")
+    ap.add_argument("--check-trigger", action="store_true",
+                    help="仅计算 PSI/校准触发条件并打印，不重训（安全验证 P3-B）")
+    ap.add_argument("--shadow-eval", action="store_true",
+                    help="最新候选 vN vs 现役 champion 影子对比，不切换（安全验证 P3-C）")
+    ap.add_argument("--build-live-baseline", action="store_true",
+                    help="从 inference_log 重建 live 群体 PSI 基线(写 models/live_baseline.json)，不重训")
+    ap.add_argument("--link-hexp", action="store_true",
+                    help="单次执行 HEXP 参数变更链动检测（变更→re-pin live baseline，O7）")
+    ap.add_argument("--force-repin", action="store_true",
+                    help="强制 re-pin live baseline（调 HEXP 参数后手动调用，配合 --link-hexp）")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="switch_model 只记录不切换（验证/灰度用）")
+    args = ap.parse_args()
+
+    if args.dry_run:
+        global DRY_RUN
+        DRY_RUN = True
+
+    use_ds = not args.no_deepseek
+
+    if args.check_trigger:
+        _check_trigger_only()
+        return
+    if args.shadow_eval:
+        _run_shadow_eval()
+        return
+    if args.build_live_baseline:
+        build_live_baseline()
+        return
+    if args.link_hexp:
+        # O7：单次链动检测（变更→re-pin baseline）；--force-repin 强制重 pin
+        hexp_config_link(force_repin=args.force_repin)
+        return
+    if args.once:
+        retrain_once(use_deepseek=use_ds)
+        return
+
+    # daemon 模式：monitor_and_trigger 高频(≤1h)查数据驱动触发，retrain_once 按 interval 定时全量
+    log(f"auto_retrain daemon started: interval={args.interval_hours}h deepseek={use_ds} "
+        f"dry_run={DRY_RUN}")
+    loop_h = max(0.05, min(args.interval_hours, 1.0))  # 触发检查频率上限 1h
+    last_sched = time.time()
+    while True:
+        # P3-D 链动（O7）：HEXP 参数变更 → re-pin live baseline，避免 PSI churn
+        try:
+            hexp_config_link()
+        except Exception as e:
+            log(f"[daemon] hexp_config_link crashed (non-fatal): {e}")
+        try:
+            monitor_and_trigger(use_deepseek=use_ds)  # P3-B 数据驱动触发
+        except Exception as e:
+            log(f"[daemon] monitor_and_trigger crashed (non-fatal): {e}")
+        # P3-A 联动：每轮落库四视图监控报表（PSI/校准/置信/行情环境）
+        try:
+            run_monitor_report()
+        except Exception as e:
+            log(f"[daemon] monitor_report crashed (non-fatal): {e}")
+        if time.time() - last_sched >= args.interval_hours * 3600.0:
+            try:
+                retrain_once(use_deepseek=use_ds)
+            except Exception as e:
+                log(f"[daemon] retrain_once crashed (non-fatal): {e}")
+            last_sched = time.time()
+        _heartbeat()  # 不论成功/崩溃都刷新存活标记
+        time.sleep(loop_h * 3600.0)
+
+
+if __name__ == "__main__":
+    main()

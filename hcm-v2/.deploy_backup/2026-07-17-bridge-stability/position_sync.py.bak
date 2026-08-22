@@ -1,0 +1,544 @@
+"""Position Sync Engine — PG + Redis dual-write for MT5 positions.
+
+同步 MT5 实时持仓到 PostgreSQL 和 Redis，每次主循环执行。
+独立于 _update_trailing_stops()，专注数据同步（SL 管理与状态同步解耦）。
+
+Usage:
+    from tools.position_sync import sync_positions
+    await sync_positions(mt5, pool, redis_conn)
+"""
+
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+log = logging.getLogger("mt5_bridge")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Public API
+# ═══════════════════════════════════════════════════════════════
+
+
+async def sync_positions(mt5, pool, redis_conn) -> None:
+    """主入口：遍历 MT5 持仓，对每个持仓执行 PG + Redis 双写。
+
+    PG 和 Redis 写入使用独立 try/except，一方失败不影响另一方。
+    每次主循环都执行（~5s 间隔），确保 PG/Redis 与 MT5 实时一致。
+
+    Args:
+        mt5: MT5 connection object.
+        pool: asyncpg connection pool.
+        redis_conn: Redis connection (sync client, decode_responses=True).
+    """
+    try:
+        positions = mt5.positions_get()
+    except Exception as e:
+        log.error(f"sync_positions: mt5.positions_get() failed: {e}")
+        return
+
+    # 读取 ATR 用于 trail_tier 判定
+    atr = _get_atr_from_redis(redis_conn, "XAUUSD")
+
+    # 解析真实账户（active master，生产=6），供同步与对账共用
+    account_id = await _resolve_account_id(pool)
+
+    live_tickets: set[int] = set()
+    for pos in positions:
+        ticket = pos.ticket
+        try:
+            tick = mt5.symbol_info_tick(pos.symbol)
+            if not tick:
+                log.warning(f"Pos sync #{ticket}: no tick data, skipping")
+                continue
+
+            # 计算当前价格与浮动盈亏（以 MT5 实时数据为准，不读 PG stale 数据）
+            if pos.type == 0:  # BUY
+                current_price = tick.bid
+                # float_profit: (bid - open_price) * lot * 100
+                float_profit = round((tick.bid - pos.price_open) * pos.volume * 100, 2)
+                direction = "BUY"
+            elif pos.type == 1:  # SELL
+                current_price = tick.ask
+                # float_profit: (open_price - ask) * lot * 100
+                float_profit = round((pos.price_open - tick.ask) * pos.volume * 100, 2)
+                direction = "SELL"
+            else:
+                log.warning(f"Pos sync #{ticket}: unknown pos.type={pos.type}")
+                continue
+
+            # 判定当前 trail tier
+            trail_tier = _compute_trail_tier(pos, atr, redis_conn)
+
+            # 读取 PG 中已有的 trail_state（用于追加 SL 变更记录）
+            existing_trail_state = None
+            try:
+                async with pool.acquire() as conn:
+                    row = await conn.fetchrow(
+                        "SELECT trail_state FROM hcm_trading.positions WHERE mt5_ticket=$1",
+                        ticket,
+                    )
+                    if row and row["trail_state"]:
+                        raw = row["trail_state"]
+                        if isinstance(raw, str):
+                            existing_trail_state = json.loads(raw)
+                        else:
+                            existing_trail_state = raw
+            except Exception:
+                pass  # 静默继续，不影响主流程
+
+            # 构建 trail_state（追加 SL 变更，保留最近 20 条）
+            trail_state = _build_trail_state(
+                pos, trail_tier, existing_trail_state
+            )
+
+            live_tickets.add(ticket)
+
+            # PG 写入（独立 try/except）
+            try:
+                await _pg_update_position(
+                    pool, pos, current_price, float_profit, trail_state, account_id
+                )
+            except Exception as e:
+                log.error(f"PG sync failed for #{ticket}: {e}")
+
+            # Redis 写入（独立 try/except）
+            try:
+                _redis_update_position(
+                    redis_conn, pos, current_price, float_profit, trail_tier, trail_state
+                )
+            except Exception as e:
+                log.error(f"Redis sync failed for #{ticket}: {e}")
+
+            log.info(
+                f"Pos sync #{ticket}: price={round(current_price, 5)}, "
+                f"profit={float_profit}, tier={trail_tier}"
+            )
+
+        except Exception as e:
+            log.error(f"Pos sync FAIL #{ticket}: {e}")
+
+    # ═══ 对账：PG 记 open 但 MT5 已不存在(已平仓)的持仓 → 标记 closed ═══
+    # 修复「幽灵持仓」核心缺陷：原逻辑只同步活持仓，从不把已平持仓清出 PG，
+    # 导致 hcm_trading.positions 永远残留 open → 风险引擎限仓计数虚高 → 不下单。
+    try:
+        await _close_stale_positions(pool, account_id, live_tickets, redis_conn)
+    except Exception as e:
+        log.error(f"Stale position reconciliation failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PG 操作
+# ═══════════════════════════════════════════════════════════════
+
+
+# module-level 缓存，避免每轮 sync 重复查 DB
+_RESOLVED_ACCOUNT_ID: Optional[int] = None
+
+
+async def _resolve_account_id(pool) -> int:
+    """解析 active master 的 account_id（与信号塔 _resolve_account_id 逻辑一致）。
+
+    持仓落库必须使用真实交易账户，严禁硬编码种子账户。
+    生产环境唯一主号为 account_id=6 (MT5-1610093605)。
+    """
+    global _RESOLVED_ACCOUNT_ID
+    if _RESOLVED_ACCOUNT_ID is not None:
+        return _RESOLVED_ACCOUNT_ID
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """SELECT account_id FROM hcm_broker.accounts
+                   WHERE is_active = true AND account_type = 'master'
+                   ORDER BY account_id LIMIT 1"""
+            )
+            if row is not None:
+                _RESOLVED_ACCOUNT_ID = int(row["account_id"])
+                return _RESOLVED_ACCOUNT_ID
+    except Exception as e:
+        log.warning(f"_resolve_account_id failed: {e}")
+    # DB/配置异常时的安全兜底：生产唯一主号
+    _RESOLVED_ACCOUNT_ID = 6
+    return _RESOLVED_ACCOUNT_ID
+
+
+async def _pg_update_position(pool, pos, current_price, float_profit, trail_state, account_id: int) -> None:
+    """更新或插入持仓行到 PostgreSQL。
+
+    先执行 UPDATE，若 rowcount==0（持仓未在 PG 中）则 INSERT 兜底。
+    写入字段: sl, tp, current_price, float_profit, trail_state, snapshot_time, updated_at
+
+    Args:
+        pool: asyncpg connection pool.
+        pos: MT5 position object.
+        current_price: 当前 bid/ask 价格，已 round(x, 5)。
+        float_profit: 浮动盈亏，已 round(x, 2)。
+        trail_state: trail_state JSON dict。
+        account_id: 真实交易账户 ID（active master，生产=6）。
+    """
+    trail_state_json = json.dumps(trail_state) if trail_state else None
+    now = datetime.now(timezone.utc)
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE hcm_trading.positions SET
+                sl = $1,
+                tp = $2,
+                current_price = $3,
+                float_profit = $4,
+                trail_state = $5,
+                snapshot_time = $6,
+                updated_at = $6
+            WHERE mt5_ticket = $7
+            RETURNING position_id
+            """,
+            round(pos.sl, 5) if pos.sl else 0.0,
+            round(pos.tp, 5) if pos.tp else 0.0,
+            round(current_price, 5),
+            float_profit,
+            trail_state_json,
+            now,
+            pos.ticket,
+        )
+
+        if row is None:
+            # UPSERT 兜底：持仓尚未写入 PG（例如在 bridge 之外手动开仓）
+            open_time = (
+                datetime.fromtimestamp(pos.time, tz=timezone.utc)
+                if pos.time else now
+            )
+            await conn.execute(
+                """
+                INSERT INTO hcm_trading.positions
+                    (account_id, symbol, direction, open_price, current_price, lot,
+                     sl, tp, float_profit, trail_state, open_time, snapshot_time, updated_at,
+                     mt5_ticket, status, signal_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, 'open', $14)
+                """,
+                account_id,  # 真实交易账户（active master，生产=6），不再硬编码
+                pos.symbol,
+                "BUY" if pos.type == 0 else "SELL",
+                round(pos.price_open, 5),
+                round(current_price, 5),
+                pos.volume,
+                round(pos.sl, 5) if pos.sl else 0.0,
+                round(pos.tp, 5) if pos.tp else 0.0,
+                float_profit,
+                trail_state_json,
+                open_time,
+                now,
+                pos.ticket,
+                getattr(pos, "signal_id", None),
+            )
+            log.info(f"Pos sync #{pos.ticket}: UPSERT (was not in PG)")
+
+
+def _redis_ticket_signal(redis_conn, ticket) -> Optional[int]:
+    """P3 归因修复：从 ticket→signal_id 映射找回 signal_id（开仓时由 bridge 写入）。
+
+    MT5 持仓对象无 signal_id 属性，UPSERT 路径无法获取，故在开仓时建立 Redis 映射，
+    平仓对账时按 ticket 找回。返回 int 或 None（含 bytes / 异常兜底）。
+    """
+    if redis_conn is None or not ticket:
+        return None
+    try:
+        raw = redis_conn.get(f"hcm:signal_for_ticket:{ticket}")
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode()
+        return int(raw)
+    except Exception:
+        return None
+
+
+async def _close_stale_positions(pool, account_id: int, live_tickets: set[int], redis_conn) -> None:
+    """对账：将 PG 中记着 open、但 MT5 已不存在的持仓标记 closed，并落库订单。
+
+    根因修复：原 sync_positions 只遍历 mt5.positions_get() 返回的活持仓，
+    对已平仓（MT5 不再返回）的持仓从不处理，导致 PG 永远残留 open →
+    风险引擎按 hcm_trading.positions 统计持仓数虚高 → 限仓误拦 → 不下单。
+
+    P2-1 新增：平仓时把**已实现 PnL 写入 hcm_trading.orders**（修复历史 PnL
+    黑洞）。realized profit ≈ 最后同步的 float_profit（5s 粒度，SL/TP 平仓时
+    与成交价几乎一致）；close_price ≈ 最后同步的 current_price。
+    """
+    now = datetime.now(timezone.utc)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT position_id, mt5_ticket, signal_id, symbol, direction,
+                      open_price, current_price, lot, sl, tp, float_profit, open_time
+               FROM hcm_trading.positions
+               WHERE account_id=$1 AND status='open'
+                 AND mt5_ticket IS NOT NULL AND mt5_ticket > 0""",
+            account_id,
+        )
+        closed = 0
+        for r in rows:
+            tid = r["mt5_ticket"]
+            if tid not in live_tickets:
+                # ── P2-1: 落库已实现订单（去重：同一 mt5_ticket 仅写一次）──
+                try:
+                    existing = await conn.fetchval(
+                        "SELECT 1 FROM hcm_trading.orders WHERE mt5_ticket=$1 LIMIT 1",
+                        tid,
+                    )
+                    if not existing:
+                        _sid = r["signal_id"]
+                        if not _sid and redis_conn is not None:
+                            _sid = _redis_ticket_signal(redis_conn, tid)
+                        await conn.execute(
+                            """
+                            INSERT INTO hcm_trading.orders
+                                (signal_id, account_id, mt5_ticket, symbol, direction,
+                                 open_price, close_price, lot, sl, tp, profit,
+                                 order_status, open_time, close_time, close_reason)
+                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,1,$12,$13,'sync_reconcile')
+                            """,
+                            _sid, account_id, tid, r["symbol"], r["direction"],
+                            r["open_price"], r["current_price"], r["lot"],
+                            r["sl"], r["tp"], r["float_profit"],
+                            r["open_time"], now,
+                        )
+                        log.info(
+                            f"P2-1 orders write #{tid}: profit={r['float_profit']} "
+                            f"close={r['current_price']} signal={_sid}"
+                        )
+                except Exception as e:
+                    log.error(f"P2-1 orders write failed for #{tid}: {e}")
+
+                await conn.execute(
+                    """UPDATE hcm_trading.positions
+                       SET status='closed', updated_at=$1
+                       WHERE position_id=$2""",
+                    now, r["position_id"],
+                )
+                closed += 1
+                log.info(f"Pos reconcile #{tid}: MT5 closed → PG status=closed (orders written)")
+        if closed:
+            log.info(f"Stale reconciliation: closed {closed} ghost position(s) for account {account_id}")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  Redis 操作
+# ═══════════════════════════════════════════════════════════════
+
+
+def _redis_update_position(redis_conn, pos, current_price, float_profit, trail_tier, trail_state) -> None:
+    """写入持仓状态到 Redis Hash，TTL=3600s。
+
+    Key:   hcm:position:{mt5_ticket}
+    Type:  Hash
+    TTL:   3600s（自动清理已平仓 key；活跃持仓每次 sync 刷新 TTL）
+
+    Fields: symbol, direction, entry, sl, tp, profit, lot, trail_tier, current_price, updated_at
+
+    Args:
+        redis_conn: Redis connection (sync client, decode_responses=True)。
+        pos: MT5 position object。
+        current_price: 当前价格。
+        float_profit: 浮动盈亏。
+        trail_tier: 分级追踪字符串 ("none"|"tier1"|"tier2"|"tier3")。
+        trail_state: trail_state dict（用于提取 last_sl_move_time）。
+    """
+    key = f"hcm:position:{pos.ticket}"
+    direction = "BUY" if pos.type == 0 else "SELL"
+
+    # 提取 last_sl_move_time
+    last_move_time = ""
+    if trail_state:
+        last_move_time = trail_state.get("last_sl_move_time", "")
+
+    mapping = {
+        "symbol": pos.symbol,
+        "direction": direction,
+        "entry": str(round(pos.price_open, 5)),
+        "sl": str(round(pos.sl, 5)) if pos.sl else "0.0",
+        "tp": str(round(pos.tp, 5)) if pos.tp else "0.0",
+        "profit": str(float_profit),
+        "lot": str(pos.volume),
+        "trail_tier": trail_tier,
+        "current_price": str(round(current_price, 5)),
+        "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    redis_conn.hset(key, mapping=mapping)
+    redis_conn.expire(key, 3600)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  trail 分级判定
+# ═══════════════════════════════════════════════════════════════
+
+
+def _compute_trail_tier(pos, atr: float, redis_conn) -> str:
+    """根据当前 SL 与 entry/各级阈值的关系判定 trail tier。
+
+    阈值 key 与 mt5_bridge._get_close_config() 保持一致：
+      - close.lock_amount_atr_mult (default 1.0) — Tier2 锁利幅度
+
+    判定逻辑（以 BUY 为例）：
+      - SL == 0                      → "none"（无 SL）
+      - SL <= entry                  → "tier1"（保本已触发，SL 在 entry）
+      - entry < SL <= entry+lock_amt → "tier2"（锁利已触发）
+      - SL > entry+lock_amt          → "tier3"（正在跟进）
+
+    Args:
+        pos: MT5 position object。
+        atr: 当前 ATR 值（0.0 时使用保守默认）。
+        redis_conn: Redis connection。
+
+    Returns:
+        "none" | "tier1" | "tier2" | "tier3"
+    """
+    if pos.sl == 0 or pos.sl is None:
+        return "none"
+
+    entry = pos.price_open
+    current_sl = pos.sl
+
+    # 读取锁利幅度阈值（与 _get_close_config 同 key + default）
+    # 使用安全 fallback: atr==0 时 lock_amount=0，保守全部归为 tier1
+    if atr <= 0:
+        lock_amount = 0.0
+    else:
+        lock_amount = atr * _read_close_config(redis_conn, "close.lock_amount_atr_mult", 1.0)
+
+    if pos.type == 0:  # BUY
+        if current_sl <= entry:
+            return "tier1"
+        elif current_sl <= entry + lock_amount:
+            return "tier2"
+        else:
+            return "tier3"
+    elif pos.type == 1:  # SELL
+        if current_sl >= entry:
+            return "tier1"
+        elif current_sl >= entry - lock_amount:
+            return "tier2"
+        else:
+            return "tier3"
+
+    return "none"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  trail_state 构建
+# ═══════════════════════════════════════════════════════════════
+
+
+def _build_trail_state(pos, current_tier: str, existing_trail_state: dict | None) -> dict:
+    """构建 trail_state JSONB 结构。
+
+    若已有 PG 中的 trail_state，则追加新的 SL 变更记录到 sl_history，
+    保留最近 20 条（FIFO）。若已有记录与当前 SL 相同则跳过追加。
+
+    sl_history 每条记录包含:
+      - time: ISO8601 时间字符串
+      - sl: 当前 SL 值
+      - tier: 当前分级
+      - reason: "initial"|"breakeven"|"lock_profit"|"trail"
+
+    Args:
+        pos: MT5 position object。
+        current_tier: 当前 trail tier 字符串。
+        existing_trail_state: PG 中已有的 trail_state dict（可为 None）。
+
+    Returns:
+        trail_state dict。
+    """
+    now = datetime.now(timezone.utc)
+    now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    current_sl = round(pos.sl, 5) if pos.sl else 0.0
+
+    # 从已有 trail_state 继承 sl_history
+    sl_history = []
+    if existing_trail_state and isinstance(existing_trail_state, dict):
+        sl_history = existing_trail_state.get("sl_history", [])
+        if not isinstance(sl_history, list):
+            sl_history = []
+
+    # 仅当 SL 与上一条记录不同时才追加
+    should_append = True
+    if sl_history:
+        last_entry = sl_history[-1]
+        if isinstance(last_entry, dict) and last_entry.get("sl") == current_sl:
+            should_append = False
+
+    if should_append:
+        sl_entry = {
+            "time": now_str,
+            "sl": current_sl,
+            "tier": current_tier,
+            "reason": _tier_to_reason(current_tier),
+        }
+        sl_history.append(sl_entry)
+        # FIFO: 保留最近 20 条
+        if len(sl_history) > 20:
+            sl_history = sl_history[-20:]
+
+    return {
+        "current_tier": current_tier,
+        "last_sl_move_time": now_str,
+        "sl_history": sl_history,
+    }
+
+
+def _tier_to_reason(tier: str) -> str:
+    """tier 字符串 → sl_history reason 字段映射。"""
+    mapping = {
+        "none": "initial",
+        "tier1": "breakeven",
+        "tier2": "lock_profit",
+        "tier3": "trail",
+    }
+    return mapping.get(tier, "initial")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  内部辅助
+# ═══════════════════════════════════════════════════════════════
+
+
+def _read_close_config(redis_conn, key: str, default: float) -> float:
+    """读取 Redis hcm:config:v2 中的 float 配置值。
+
+    与 mt5_bridge._get_close_config() 使用相同的 key namespace 和 fallback 默认值。
+    不带 WARNING（避免 position_sync 重复告警——WARNING 统一在 mt5_bridge 侧输出）。
+
+    Args:
+        redis_conn: Redis connection。
+        key: 配置 key（如 "close.lock_amount_atr_mult"）。
+        default: 缺省默认值。
+
+    Returns:
+        float 配置值。
+    """
+    val = redis_conn.hget("hcm:config:v2", key)
+    if val is None or val == "":
+        return float(default)
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return float(default)
+
+
+def _get_atr_from_redis(redis_conn, symbol: str) -> float:
+    """从 Redis 读取 ATR 缓存值。
+
+    Args:
+        redis_conn: Redis connection。
+        symbol: 交易品种。
+
+    Returns:
+        ATR 值，不可用时返回 0.0。
+    """
+    try:
+        atr = redis_conn.get(f"hcm:atr:{symbol}")
+        if atr:
+            return float(atr)
+        return 0.0
+    except Exception:
+        return 0.0

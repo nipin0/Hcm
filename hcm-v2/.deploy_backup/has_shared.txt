@@ -1,0 +1,8 @@
+hcm-v2-hcm-gateway-1
+hcm-v2-hcm-collector-1
+hcm-v2-hcm-signal-tower-1
+hcm-v2-hcm-market-intel-1
+hcm-v2-hcm-risk-engine-1
+hcm-v2-hcm-dispatcher-1
+hcm-v2-hcm-copy-trading-1
+hcm-v2-hcm-web-1

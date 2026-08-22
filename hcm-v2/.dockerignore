@@ -1,0 +1,43 @@
+# HCM v2 build-context ignore file
+# Goal: shrink docker build context from ~358MB to ~10MB
+# Only excludes host-side artifacts/caches/secrets; never excludes paths
+# that Dockerfiles COPY. Preserved on purpose: shared/, hcm-*/, proto/
+
+# ---- Frontend build artifacts & deps (the big one: 353MB node_modules) ----
+# NOTE: dist MUST NOT be excluded, Dockerfile copies it into the image.
+hcm-web/frontend/node_modules
+# hcm-web/frontend/dist   # deliberately kept for docker COPY
+hcm-web/frontend/.vite
+
+# ---- Python caches & virtual environments ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# ---- Backups & logs ----
+.deploy_backup/
+*.log
+logs/
+
+# ---- Docs / tests / tools (not needed for build) ----
+docs/
+tests/
+tools/
+
+# ---- VCS, editor & OS junk ----
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- Env files (avoid leaking secrets; not needed for build) ----
+.env
+.env.example
+
+# ---- Host-side deploy helpers (not COPY'd by any Dockerfile) ----
+deploy/

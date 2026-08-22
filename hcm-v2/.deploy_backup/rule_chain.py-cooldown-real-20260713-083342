@@ -1,0 +1,585 @@
+"""Rule Chain — sequential risk rule evaluation from ConfigProviderV3.
+
+Evaluates trading signals against a chain of risk rules with configurable
+parameters read from ConfigProviderV3. Rules are evaluated in order and
+short-circuit on the first rejection.
+
+Rule Chain Order (matching PRD spec):
+  risk_min_confidence → risk_max_lot_single → risk_max_total_lot →
+  risk_max_open_positions → risk_max_daily_loss → risk_min_margin →
+  risk_max_spread_pips → risk_cool_minutes → risk_spread_check_enabled
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# ── Rule result types ──────────────────────────
+
+
+@dataclass
+class RuleResult:
+    """Result of a single rule evaluation."""
+    rule_name: str = ""
+    passed: bool = True
+    actual_value: float = 0.0
+    threshold: float = 0.0
+    message: str = ""
+
+
+@dataclass
+class RuleChainResult:
+    """Aggregate result of the rule chain evaluation."""
+    passed: bool = True
+    results: list[RuleResult] = field(default_factory=list)
+    rejected_rules: list[str] = field(default_factory=list)
+    violations: dict[str, dict] = field(default_factory=dict)
+
+    @property
+    def first_rejection(self) -> Optional[RuleResult]:
+        """Get the first rule that rejected the signal."""
+        for r in self.results:
+            if not r.passed:
+                return r
+        return None
+
+
+class RuleChain:
+    """Sequential risk rule chain for validating trading signals.
+
+    Each rule is evaluated in order. The chain short-circuits on the
+    first rejection (fail-fast). All thresholds are loaded from
+    ConfigProviderV3 at startup and can be hot-reloaded.
+
+    Example:
+        chain = RuleChain(config_provider)
+        await chain.load_config()
+        result = await chain.evaluate(signal_data)
+        if result.passed:
+            print("Signal passed all risk checks")
+    """
+
+    def __init__(
+        self,
+        config_provider: Any = None,
+        db_pool: Any = None,
+        redis_client: Any = None,
+    ):
+        """Initialize RuleChain.
+
+        Args:
+            config_provider: ConfigProviderV3 instance for rule thresholds.
+            db_pool: DatabasePool for querying open positions/daily losses.
+            redis_client: RedisClient for cooldown tracking.
+        """
+        self._config = config_provider
+        self._db = db_pool
+        self._redis = redis_client
+
+        # Cached thresholds (hot-reloadable) — MUST call load_config() before evaluate()
+        self._min_confidence: float = -1.0
+        self._max_lot_single: float = -1.0
+        self._max_total_lot: float = -1.0
+        self._max_open_positions: int = -1
+        self._max_daily_loss: float = -1.0
+        self._min_margin: float = -1.0
+        self._max_spread_pips: float = -1.0
+        self._cool_minutes: int = -1
+        self._spread_check_enabled: bool = False
+
+    # ── Main API ────────────────────────────────
+
+    async def evaluate(self, signal_data: dict) -> RuleChainResult:
+        """Evaluate a signal through the full rule chain.
+
+        Rules are evaluated in order with short-circuit on first rejection.
+
+        Args:
+            signal_data: Signal dict from Redis Stream message.
+
+        Returns:
+            RuleChainResult with all individual rule results.
+        """
+        result = RuleChainResult()
+
+        # Rule 1: Minimum Confidence
+        r = self._check_confidence(signal_data)
+        result.results.append(r)
+        if not r.passed:
+            result.passed = False
+            result.rejected_rules.append(r.rule_name)
+            result.violations[r.rule_name] = {
+                "actual": r.actual_value,
+                "threshold": r.threshold,
+            }
+            return result
+
+        # Rule 2: Maximum Single Lot
+        r = self._check_max_single_lot(signal_data)
+        result.results.append(r)
+        if not r.passed:
+            result.passed = False
+            result.rejected_rules.append(r.rule_name)
+            result.violations[r.rule_name] = {
+                "actual": r.actual_value,
+                "threshold": r.threshold,
+            }
+            return result
+
+        # Rule 3: Maximum Total Lot
+        r = await self._check_max_total_lot(signal_data)
+        result.results.append(r)
+        if not r.passed:
+            result.passed = False
+            result.rejected_rules.append(r.rule_name)
+            result.violations[r.rule_name] = {
+                "actual": r.actual_value,
+                "threshold": r.threshold,
+            }
+            return result
+
+        # Rule 4: Maximum Open Positions
+        r = await self._check_open_positions(signal_data)
+        result.results.append(r)
+        if not r.passed:
+            result.passed = False
+            result.rejected_rules.append(r.rule_name)
+            result.violations[r.rule_name] = {
+                "actual": r.actual_value,
+                "threshold": r.threshold,
+            }
+            return result
+
+        # Rule 5: Maximum Daily Loss
+        r = await self._check_daily_loss(signal_data)
+        result.results.append(r)
+        if not r.passed:
+            result.passed = False
+            result.rejected_rules.append(r.rule_name)
+            result.violations[r.rule_name] = {
+                "actual": r.actual_value,
+                "threshold": r.threshold,
+            }
+            return result
+
+        # Rule 6: Minimum Margin
+        r = await self._check_margin(signal_data)
+        result.results.append(r)
+        if not r.passed:
+            result.passed = False
+            result.rejected_rules.append(r.rule_name)
+            result.violations[r.rule_name] = {
+                "actual": r.actual_value,
+                "threshold": r.threshold,
+            }
+            return result
+
+        # Rule 7: Maximum Spread (if enabled)
+        if self._spread_check_enabled:
+            r = self._check_spread(signal_data)
+            result.results.append(r)
+            if not r.passed:
+                result.passed = False
+                result.rejected_rules.append(r.rule_name)
+                result.violations[r.rule_name] = {
+                    "actual": r.actual_value,
+                    "threshold": r.threshold,
+                }
+                return result
+
+        # Rule 8: Cooldown Period (delegated to signal-tower — always pass-through)
+        r = RuleResult(
+            rule_name="risk_cool_minutes",
+            passed=True,
+            actual_value=0.0,
+            threshold=float(self._cool_minutes * 60),
+            message="Cooldown enforced by signal-tower regime engine",
+        )
+        result.results.append(r)
+
+        # Rule 9: Spread Check Enabled flag (pass-through, already handled in #7)
+        r = RuleResult(
+            rule_name="risk_spread_check_enabled",
+            passed=True,
+            actual_value=float(self._spread_check_enabled),
+            threshold=1.0,
+            message="Spread check is enabled" if self._spread_check_enabled else "Spread check is disabled",
+        )
+        result.results.append(r)
+
+        return result
+
+    # ── Individual Rule Checks ──────────────────
+
+    def _check_confidence(self, signal_data: dict) -> RuleResult:
+        """Check signal confidence meets minimum threshold.
+
+        Args:
+            signal_data: Signal data dict.
+
+        Returns:
+            RuleResult for risk_min_confidence.
+        """
+        confidence = float(signal_data.get("confidence", 0))
+        passed = confidence >= self._min_confidence
+        return RuleResult(
+            rule_name="risk_min_confidence",
+            passed=passed,
+            actual_value=confidence,
+            threshold=self._min_confidence,
+            message=f"Confidence {confidence:.2f} >= {self._min_confidence:.2f}" if passed
+            else f"Confidence {confidence:.2f} < {self._min_confidence:.2f}",
+        )
+
+    def _check_max_single_lot(self, signal_data: dict) -> RuleResult:
+        """Check single signal lot does not exceed maximum.
+
+        Args:
+            signal_data: Signal data dict.
+
+        Returns:
+            RuleResult for risk_max_lot_single.
+        """
+        lot = float(signal_data.get("lot", 0))
+        passed = lot <= self._max_lot_single
+        return RuleResult(
+            rule_name="risk_max_lot_single",
+            passed=passed,
+            actual_value=lot,
+            threshold=self._max_lot_single,
+            message=f"Lot {lot} <= {self._max_lot_single}" if passed
+            else f"Lot {lot} > {self._max_lot_single}",
+        )
+
+    async def _check_max_total_lot(self, signal_data: dict) -> RuleResult:
+        """Check total lot (existing positions + new) does not exceed max.
+
+        Args:
+            signal_data: Signal data dict.
+
+        Returns:
+            RuleResult for risk_max_total_lot.
+        """
+        lot = float(signal_data.get("lot", 0))
+        account_id = int(signal_data.get("account_id", 0))
+
+        # Sum existing positions from DB if available
+        existing_lot = 0.0
+        if self._db is not None and self._db.is_initialized and account_id > 0:
+            try:
+                existing_lot = await self._get_account_total_lot(account_id)
+            except Exception as exc:
+                logger.warning("Failed to query existing total lot for account_id=%s: %s", account_id, exc)
+
+        total_lot = existing_lot + lot
+        passed = total_lot <= self._max_total_lot
+        return RuleResult(
+            rule_name="risk_max_total_lot",
+            passed=passed,
+            actual_value=total_lot,
+            threshold=self._max_total_lot,
+            message=f"Total lot {total_lot} (existing={existing_lot} + new={lot}) <= {self._max_total_lot}" if passed
+            else f"Total lot {total_lot} (existing={existing_lot} + new={lot}) > {self._max_total_lot}",
+        )
+
+    async def _check_open_positions(self, signal_data: dict) -> RuleResult:
+        """Check number of open positions does not exceed max.
+
+        Args:
+            signal_data: Signal data dict.
+
+        Returns:
+            RuleResult for risk_max_open_positions.
+        """
+        account_id = int(signal_data.get("account_id", 0))
+        symbol = signal_data.get("symbol", "")
+
+        open_count = 0
+        if self._db is not None and self._db.is_initialized and account_id > 0:
+            try:
+                open_count = await self._get_open_positions_count(account_id, symbol)
+            except Exception as exc:
+                logger.warning("Failed to query open positions for account_id=%s: %s", account_id, exc)
+
+        passed = open_count < self._max_open_positions
+        return RuleResult(
+            rule_name="risk_max_open_positions",
+            passed=passed,
+            actual_value=float(open_count),
+            threshold=float(self._max_open_positions),
+            message=f"Open positions {open_count} < {self._max_open_positions}" if passed
+            else f"Open positions {open_count} >= {self._max_open_positions}",
+        )
+
+    async def _check_daily_loss(self, signal_data: dict) -> RuleResult:
+        """Check daily realized loss does not exceed max.
+
+        Args:
+            signal_data: Signal data dict.
+
+        Returns:
+            RuleResult for risk_max_daily_loss.
+        """
+        account_id = int(signal_data.get("account_id", 0))
+
+        daily_loss = 0.0
+        if self._db is not None and self._db.is_initialized and account_id > 0:
+            try:
+                daily_loss = await self._get_daily_loss(account_id)
+            except Exception as exc:
+                logger.warning("Failed to query daily loss for account_id=%s: %s", account_id, exc)
+
+        passed = abs(daily_loss) <= self._max_daily_loss
+        return RuleResult(
+            rule_name="risk_max_daily_loss",
+            passed=passed,
+            actual_value=abs(daily_loss),
+            threshold=self._max_daily_loss,
+            message=f"Daily loss |{daily_loss:.2f}| <= {self._max_daily_loss}" if passed
+            else f"Daily loss |{daily_loss:.2f}| > {self._max_daily_loss}",
+        )
+
+    async def _check_margin(self, signal_data: dict) -> RuleResult:
+        """Check free margin meets minimum requirement.
+
+        Args:
+            signal_data: Signal data dict.
+
+        Returns:
+            RuleResult for risk_min_margin.
+        """
+        account_id = int(signal_data.get("account_id", 0))
+
+        free_margin = float("inf")
+        if self._db is not None and self._db.is_initialized and account_id > 0:
+            try:
+                free_margin = await self._get_free_margin(account_id)
+            except Exception as exc:
+                logger.warning("Failed to query free margin for account_id=%s: %s", account_id, exc)
+
+        passed = free_margin >= self._min_margin
+        return RuleResult(
+            rule_name="risk_min_margin",
+            passed=passed,
+            actual_value=free_margin,
+            threshold=self._min_margin,
+            message=f"Free margin {free_margin:.2f} >= {self._min_margin}" if passed
+            else f"Free margin {free_margin:.2f} < {self._min_margin}",
+        )
+
+    def _check_spread(self, signal_data: dict) -> RuleResult:
+        """Check current spread does not exceed max.
+
+        Uses spread value from signal if available, otherwise passes.
+
+        Args:
+            signal_data: Signal data dict.
+
+        Returns:
+            RuleResult for risk_max_spread_pips.
+        """
+        spread = float(signal_data.get("spread", 0))
+        if spread == 0:
+            # No spread data in signal — pass
+            return RuleResult(
+                rule_name="risk_max_spread_pips",
+                passed=True,
+                actual_value=0.0,
+                threshold=self._max_spread_pips,
+                message="No spread data in signal — skipping",
+            )
+
+        passed = spread <= self._max_spread_pips
+        return RuleResult(
+            rule_name="risk_max_spread_pips",
+            passed=passed,
+            actual_value=spread,
+            threshold=self._max_spread_pips,
+            message=f"Spread {spread:.1f} pips <= {self._max_spread_pips:.1f}" if passed
+            else f"Spread {spread:.1f} pips > {self._max_spread_pips:.1f}",
+        )
+
+    async def _check_cooldown(self, signal_data: dict) -> RuleResult:
+        """Check signal cooldown period for the symbol/account.
+
+        Uses Redis key: hcm:cooldown:{account_id}:{symbol} with TTL.
+
+        Args:
+            signal_data: Signal data dict.
+
+        Returns:
+            RuleResult for risk_cool_minutes.
+        """
+        account_id = int(signal_data.get("account_id", 0))
+        symbol = signal_data.get("symbol", "")
+
+        if self._redis is not None and self._redis.is_initialized:
+            try:
+                raw_redis = self._redis.raw
+                cooldown_key = f"hcm:cooldown:{account_id}:{symbol}"
+                remaining_ttl = raw_redis.ttl(cooldown_key)  # sync redis-py call
+
+                if remaining_ttl > 0:
+                    # Still in cooldown
+                    remaining_sec = remaining_ttl
+                    threshold_sec = self._cool_minutes * 60
+                    return RuleResult(
+                        rule_name="risk_cool_minutes",
+                        passed=False,
+                        actual_value=float(remaining_sec),
+                        threshold=float(threshold_sec),
+                        message=f"Cooldown active: {remaining_sec:.0f}s remaining of {threshold_sec:.0f}s",
+                    )
+
+                # Not in cooldown — set new cooldown
+                cool_seconds = self._cool_minutes * 60
+                raw_redis.setex(cooldown_key, cool_seconds, str(time.time()))  # sync
+                return RuleResult(
+                    rule_name="risk_cool_minutes",
+                    passed=True,
+                    actual_value=0.0,
+                    threshold=float(cool_seconds),
+                    message=f"Cooldown set: {cool_seconds}s",
+                )
+
+            except Exception as exc:
+                logger.warning("Cooldown check failed for signal_id=%s: %s",
+                              signal_data.get("signal_id", "?"), exc)
+
+        # If Redis unavailable, pass through
+        return RuleResult(
+            rule_name="risk_cool_minutes",
+            passed=True,
+            actual_value=0.0,
+            threshold=float(self._cool_minutes * 60),
+            message="Redis unavailable — cooldown skipped",
+        )
+
+    # ── Database Helpers ────────────────────────
+
+    async def _get_account_total_lot(self, account_id: int) -> float:
+        """Get total lot size of all open positions for an account.
+
+        Args:
+            account_id: MT5 account ID.
+
+        Returns:
+            Total lot size.
+        """
+        if self._db is None:
+            return 0.0
+        try:
+            row = await self._db.fetchval(
+                "SELECT COALESCE(SUM(volume), 0) FROM hcm_trade.open_positions "
+                "WHERE account_id=$1",
+                account_id,
+            )
+            return float(row) if row else 0.0
+        except Exception:
+            return 0.0
+
+    async def _get_open_positions_count(self, account_id: int, symbol: str) -> int:
+        """Get number of open positions for an account/symbol.
+
+        Args:
+            account_id: MT5 account ID.
+            symbol: Trading symbol (empty = all).
+
+        Returns:
+            Count of open positions.
+        """
+        if self._db is None:
+            return 0
+        try:
+            if symbol:
+                row = await self._db.fetchval(
+                    "SELECT COUNT(*) FROM hcm_trade.open_positions "
+                    "WHERE account_id=$1 AND symbol=$2",
+                    account_id, symbol,
+                )
+            else:
+                row = await self._db.fetchval(
+                    "SELECT COUNT(*) FROM hcm_trade.open_positions "
+                    "WHERE account_id=$1",
+                    account_id,
+                )
+            return int(row) if row else 0
+        except Exception:
+            return 0
+
+    async def _get_daily_loss(self, account_id: int) -> float:
+        """Get realized daily loss for an account.
+
+        Args:
+            account_id: MT5 account ID.
+
+        Returns:
+            Realized loss for today (negative = loss).
+        """
+        if self._db is None:
+            return 0.0
+        try:
+            row = await self._db.fetchval(
+                "SELECT COALESCE(SUM(realized_pnl), 0) FROM hcm_trade.closed_positions "
+                "WHERE account_id=$1 AND close_time >= CURRENT_DATE",
+                account_id,
+            )
+            return float(row) if row else 0.0
+        except Exception:
+            return 0.0
+
+    async def _get_free_margin(self, account_id: int) -> float:
+        """Get free margin for an account.
+
+        Args:
+            account_id: MT5 account ID.
+
+        Returns:
+            Free margin value.
+        """
+        if self._db is None:
+            return float("inf")
+        try:
+            row = await self._db.fetchval(
+                "SELECT COALESCE(free_margin, 0) FROM hcm_trade.account_snapshots "
+                "WHERE account_id=$1 ORDER BY created_at DESC LIMIT 1",
+                account_id,
+            )
+            return float(row) if row else float("inf")
+        except Exception:
+            return float("inf")
+
+    # ── Config Loading ──────────────────────────
+
+    async def load_config(self) -> None:
+        """Load rule thresholds from ConfigProviderV3 — must be set in Redis/PG, no defaults."""
+        if self._config is None:
+            raise RuntimeError("RuleChain: ConfigProviderV3 required — no hardcoded defaults allowed")
+
+        try:
+            self._min_confidence = await self._config.get_float("risk.score_tier_low")
+            self._max_lot_single = await self._config.get_float("risk.max_lot_per_trade")
+            self._max_total_lot = await self._config.get_float("risk.max_total_exposure")
+            self._max_open_positions = await self._config.get_int("risk.max_concurrent_signals")
+            self._max_daily_loss = await self._config.get_float("risk.max_daily_loss")
+            self._min_margin = await self._config.get_float("risk.margin_call_level")
+            self._max_spread_pips = await self._config.get_float("risk_spread_max_multiplier", 999.0)
+            self._cool_minutes = await self._config.get_int("risk.cooldown_minutes")
+            self._spread_check_enabled = await self._config.get_bool("risk.news_filter_enabled", False)
+        except Exception as exc:
+            logger.error("RuleChain config load failed: %s", exc)
+            raise
+
+        logger.info(
+            "RuleChain config loaded: confidence=%.2f, single_lot=%.2f, "
+            "total_exposure=%.2f, max_pos=%d, daily_loss=%.2f, min_margin=%.2f, "
+            "max_spread=%.1f, cool_min=%d, spread_check(→news_filter)=%s",
+            self._min_confidence, self._max_lot_single, self._max_total_lot,
+            self._max_open_positions, self._max_daily_loss, self._min_margin,
+            self._max_spread_pips, self._cool_minutes, self._spread_check_enabled,
+        )

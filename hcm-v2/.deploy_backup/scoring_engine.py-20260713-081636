@@ -1,0 +1,709 @@
+"""Scoring Engine — Weighted Indicator Scoring with Regime-Aware Schemes.
+
+Core scoring logic for signal production:
+1. Computes pre_score from technical indicators using regime-specific weights
+2. Determines signal direction (BUY/SELL/NO_TRADE)
+3. Applies threshold gating with regime-adjusted thresholds
+4. Implements five-level regime weight schemes:
+   - PRE_TREND_WEIGHTS, TREND_WEIGHTS, TREND_FADE_WEIGHTS, RANGE_WEIGHTS, NEUTRAL_WEIGHTS
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Optional, Tuple
+
+import numpy as np
+
+from signal_tower.indicator_calculator import IndicatorResults
+from signal_tower.regime_classifier import Regime, RegimeResult
+from signal_tower.range_bonus import RangeBonus, RangePosition
+
+logger = logging.getLogger(__name__)
+
+# ── Default Scoring / Cooldown Config ────────
+# Sourced from shared.signal_tower_defaults (single source of truth)
+
+from shared.signal_tower_defaults import (
+    DEFAULT_SCORE_THRESHOLD,
+    DEFAULT_PRETREND_COOLDOWN, DEFAULT_TREND_COOLDOWN,
+    DEFAULT_TREND_SAME_DIR_BYPASS_SCORE, DEFAULT_TREND_SAME_DIR_MID_COOLDOWN,
+    DEFAULT_TREND_REVERSE_COOLDOWN, DEFAULT_FADE_COOLDOWN,
+    DEFAULT_RANGE_COOLDOWN, DEFAULT_NEUTRAL_COOLDOWN,
+    DEFAULT_COOLDOWN_VOL_ENABLE, DEFAULT_COOLDOWN_VOL_SCALE,
+    DEFAULT_TF_COOLDOWN_MULTIPLIER_MIN, DEFAULT_TF_COOLDOWN_MULTIPLIER_MAX,
+    DEFAULT_BAR_SECONDS_M5,
+)
+
+# PRE_TREND weights: trend direction 70% / oscillator 30%
+PRE_TREND_WEIGHTS = {
+    "macd": 0.25,
+    "ma_alignment": 0.20,
+    "di_diff": 0.15,
+    "adx": 0.10,
+    "rsi": 0.10,
+    "stoch": 0.10,
+    "pct_b": 0.10,
+}
+
+# TREND weights: trend direction 70% / oscillator 30%
+TREND_WEIGHTS = {
+    "macd": 0.25,
+    "ma_alignment": 0.20,
+    "di_diff": 0.15,
+    "adx": 0.10,
+    "rsi": 0.12,
+    "stoch": 0.10,
+    "pct_b": 0.08,
+}
+
+# TREND_FADE weights: conservative, more reversal indicators
+TREND_FADE_WEIGHTS = {
+    "macd": 0.20,
+    "ma_alignment": 0.15,
+    "di_diff": 0.10,
+    "adx": 0.10,
+    "rsi": 0.20,
+    "stoch": 0.15,
+    "pct_b": 0.10,
+}
+
+# RANGE weights: reversal indicators 70% / trend 30%
+RANGE_WEIGHTS = {
+    "rsi_extreme": 0.25,
+    "stoch_extreme": 0.25,
+    "pct_b": 0.20,
+    "macd_histogram": 0.15,
+    "ma_alignment": 0.08,
+    "di_diff": 0.05,
+    "adx": 0.02,
+}
+
+# NEUTRAL weights: balanced conservative
+NEUTRAL_WEIGHTS = {
+    "macd": 0.20,
+    "ma_alignment": 0.15,
+    "di_diff": 0.15,
+    "adx": 0.10,
+    "rsi": 0.15,
+    "stoch": 0.15,
+    "pct_b": 0.10,
+}
+
+
+@dataclass
+class ScoreResult:
+    """Scoring result with direction and breakdown."""
+    pre_score: float = 0.0
+    direction: str = "NO_TRADE"  # BUY / SELL / NO_TRADE
+    buy_score: float = 0.0
+    sell_score: float = 0.0
+    threshold: float = DEFAULT_SCORE_THRESHOLD
+    threshold_passed: bool = False
+    regime: Regime = Regime.NEUTRAL
+    regime_strength: float = 0.0
+    weight_scheme: str = "NEUTRAL_WEIGHTS"
+    component_scores: dict[str, Tuple[float, float]] = field(default_factory=dict)
+    # component_scores: {component: (buy_contribution, sell_contribution)}
+    range_position: Optional[RangePosition] = None
+    range_bonus_applied: float = 0.0
+
+
+class ScoringEngine:
+    """Weighted technical indicator scoring engine.
+
+    Computes pre_score from indicator values using regime-specific
+    weight schemes, determines direction, and applies threshold gating.
+
+    Example:
+        engine = ScoringEngine(config_provider)
+        score = engine.compute_pre_score(indicator_results, regime_result)
+        if score.threshold_passed:
+            print(f"Signal: {score.direction} (pre_score={score.pre_score:.2f})")
+    """
+
+    def __init__(
+        self,
+        config_provider: Any = None,
+        range_bonus: Optional[RangeBonus] = None,
+    ):
+        """Initialize ScoringEngine.
+
+        Args:
+            config_provider: ConfigProviderV3 for runtime parameters.
+            range_bonus: RangeBonus instance for range position scoring.
+        """
+        self._config = config_provider
+        self._range_bonus = range_bonus or RangeBonus()
+
+        # Default parameters — can be overridden via config_provider
+        self._base_threshold: float = DEFAULT_SCORE_THRESHOLD
+        self._pretrend_threshold_floor: float = 0.42
+        self._fade_threshold_ceiling: float = 0.78
+        self._range_threshold_floor: float = 0.40
+        self._neutral_threshold_offset: float = 0.10
+        self._trend_strong_adx_threshold: float = 28.0
+        self._trend_strong_threshold_offset: float = -0.05
+
+        # P1 — Volatility-adaptive cooldown (off by default)
+        self._cooldown_vol_enable: bool = False
+        self._cooldown_vol_scale: float = 0.0
+
+    # ── Main API ────────────────────────────────
+
+    def compute_pre_score(
+        self,
+        indicators: IndicatorResults,
+        regime: RegimeResult,
+    ) -> ScoreResult:
+        """Compute pre_score and direction from indicators and regime.
+
+        Args:
+            indicators: Computed indicator values.
+            regime: Regime classification result.
+
+        Returns:
+            ScoreResult with pre_score, direction, threshold, and breakdown.
+        """
+        result = ScoreResult(
+            regime=regime.regime,
+            regime_strength=regime.strength,
+        )
+
+        # Select weight scheme based on regime
+        weight_scheme = self._select_weight_scheme(regime.regime)
+        result.weight_scheme = f"{regime.regime.value}_WEIGHTS"
+
+        # Compute buy/sell component scores
+        buy_score, sell_score, components = self._compute_component_scores(
+            indicators, weight_scheme, regime.regime
+        )
+        result.component_scores = components
+
+        # Apply range bonus if in RANGE regime
+        range_bonus = 0.0
+        if regime.regime == Regime.RANGE:
+            range_pos = self._range_bonus.compute_range_position(
+                close=indicators.close,
+                rsi=indicators.rsi_14,
+                recent_highs=indicators.recent_highs,
+                recent_lows=indicators.recent_lows,
+                boll_upper=indicators.boll_upper,
+                boll_lower=indicators.boll_lower,
+            )
+            result.range_position = range_pos
+            range_bonus = range_pos.bonus
+
+            # Apply range bonus to direction
+            if range_pos.direction_hint == "BUY-biased":
+                buy_score += range_bonus
+            elif range_pos.direction_hint == "SELL-biased":
+                sell_score += range_bonus
+
+        result.buy_score = round(buy_score, 4)
+        result.sell_score = round(sell_score, 4)
+        result.range_bonus_applied = round(range_bonus, 4)
+
+        # Determine direction and pre_score
+        score_diff = buy_score - sell_score
+        if abs(score_diff) < 0.01:
+            result.direction = "NO_TRADE"
+            result.pre_score = max(buy_score, sell_score)
+        elif score_diff > 0:
+            result.direction = "BUY"
+            result.pre_score = round(buy_score, 4)
+        else:
+            result.direction = "SELL"
+            result.pre_score = round(sell_score, 4)
+
+        # Compute regime-adjusted threshold
+        result.threshold = self._compute_threshold(regime)
+        result.threshold_passed = result.pre_score >= result.threshold
+
+        return result
+
+    # ── Weight Scheme Selection ─────────────────
+
+    def _select_weight_scheme(self, regime: Regime) -> dict[str, float]:
+        """Select weight scheme for the given regime.
+
+        Args:
+            regime: Current market regime.
+
+        Returns:
+            Dict mapping component name to weight.
+        """
+        schemes = {
+            Regime.PRE_TREND: PRE_TREND_WEIGHTS,
+            Regime.TREND: TREND_WEIGHTS,
+            Regime.TREND_FADE: TREND_FADE_WEIGHTS,
+            Regime.RANGE: RANGE_WEIGHTS,
+            Regime.NEUTRAL: NEUTRAL_WEIGHTS,
+        }
+        return schemes.get(regime, NEUTRAL_WEIGHTS)
+
+    # ── Component Scoring ───────────────────────
+
+    def _compute_component_scores(
+        self,
+        ind: IndicatorResults,
+        weights: dict[str, float],
+        regime: Regime,
+    ) -> Tuple[float, float, dict[str, Tuple[float, float]]]:
+        """Compute buy/sell scores for each component.
+
+        Each component generates a raw score in [-1, 1] where:
+          +1 = strongly BUY
+          -1 = strongly SELL
+
+        This is then split: buy_score = max(raw, 0), sell_score = max(-raw, 0).
+
+        Args:
+            ind: Indicator results.
+            weights: Weight scheme dict.
+            regime: Current regime.
+
+        Returns:
+            Tuple of (buy_score, sell_score, components_dict).
+        """
+        components: dict[str, Tuple[float, float]] = {}
+        total_buy = 0.0
+        total_sell = 0.0
+
+        # MACD
+        if "macd" in weights:
+            raw = self._score_macd(ind)
+            w = weights["macd"]
+            components["macd"] = (max(0, raw) * w, max(0, -raw) * w)
+            total_buy += components["macd"][0]
+            total_sell += components["macd"][1]
+
+        # MACD histogram (for RANGE regime)
+        if "macd_histogram" in weights:
+            raw = self._score_macd_histogram(ind)
+            w = weights["macd_histogram"]
+            components["macd_histogram"] = (max(0, raw) * w, max(0, -raw) * w)
+            total_buy += components["macd_histogram"][0]
+            total_sell += components["macd_histogram"][1]
+
+        # MA Alignment
+        if "ma_alignment" in weights:
+            raw = self._score_ma_alignment(ind)
+            w = weights["ma_alignment"]
+            components["ma_alignment"] = (max(0, raw) * w, max(0, -raw) * w)
+            total_buy += components["ma_alignment"][0]
+            total_sell += components["ma_alignment"][1]
+
+        # DI Diff
+        if "di_diff" in weights:
+            raw = self._score_di_diff(ind)
+            w = weights["di_diff"]
+            components["di_diff"] = (max(0, raw) * w, max(0, -raw) * w)
+            total_buy += components["di_diff"][0]
+            total_sell += components["di_diff"][1]
+
+        # ADX (trend strength, not direction)
+        if "adx" in weights:
+            raw = self._score_adx_direction(ind)
+            w = weights["adx"]
+            components["adx"] = (max(0, raw) * w, max(0, -raw) * w)
+            total_buy += components["adx"][0]
+            total_sell += components["adx"][1]
+
+        # RSI
+        if "rsi" in weights:
+            raw = self._score_rsi(ind, use_extreme=(regime == Regime.RANGE))
+            w = weights["rsi"]
+            components["rsi"] = (max(0, raw) * w, max(0, -raw) * w)
+            total_buy += components["rsi"][0]
+            total_sell += components["rsi"][1]
+
+        # RSI Extreme (RANGE regime)
+        if "rsi_extreme" in weights:
+            raw = self._score_rsi_extreme(ind)
+            w = weights["rsi_extreme"]
+            components["rsi_extreme"] = (max(0, raw) * w, max(0, -raw) * w)
+            total_buy += components["rsi_extreme"][0]
+            total_sell += components["rsi_extreme"][1]
+
+        # Stochastic
+        if "stoch" in weights:
+            raw = self._score_stoch(ind)
+            w = weights["stoch"]
+            components["stoch"] = (max(0, raw) * w, max(0, -raw) * w)
+            total_buy += components["stoch"][0]
+            total_sell += components["stoch"][1]
+
+        # Stochastic Extreme (RANGE regime)
+        if "stoch_extreme" in weights:
+            raw = self._score_stoch_extreme(ind)
+            w = weights["stoch_extreme"]
+            components["stoch_extreme"] = (max(0, raw) * w, max(0, -raw) * w)
+            total_buy += components["stoch_extreme"][0]
+            total_sell += components["stoch_extreme"][1]
+
+        # %b (Bollinger)
+        if "pct_b" in weights:
+            raw = self._score_pct_b(ind)
+            w = weights["pct_b"]
+            components["pct_b"] = (max(0, raw) * w, max(0, -raw) * w)
+            total_buy += components["pct_b"][0]
+            total_sell += components["pct_b"][1]
+
+        return round(total_buy, 4), round(total_sell, 4), components
+
+    # ── Individual Component Scorers ────────────
+
+    @staticmethod
+    def _score_macd(ind: IndicatorResults) -> float:
+        """Score MACD: histogram positive = BUY, negative = SELL.
+
+        Returns:
+            Raw score in [-1, 1].
+        """
+        # Normalize histogram by close
+        if ind.close == 0:
+            return 0.0
+        raw = ind.macd_histogram / (ind.close * 0.01)  # ~1% of price
+        return round(max(-1.0, min(1.0, raw)), 4)
+
+    @staticmethod
+    def _score_macd_histogram(ind: IndicatorResults) -> float:
+        """Score MACD histogram拐头 (for RANGE regime).
+
+        Histogram rising → BUY; falling → SELL.
+
+        Returns:
+            Raw score in [-1, 1].
+        """
+        diff = ind.macd_histogram - ind.macd_histogram_previous
+        if ind.close == 0:
+            return 0.0
+        raw = diff / (ind.close * 0.005)
+        return round(max(-1.0, min(1.0, raw)), 4)
+
+    @staticmethod
+    def _score_ma_alignment(ind: IndicatorResults) -> float:
+        """Score MA alignment.
+
+        bullish → +1, bearish → -1, neutral → 0.
+
+        Returns:
+            Raw score in [-1, 1].
+        """
+        if ind.ma_alignment == "bullish":
+            return 1.0
+        elif ind.ma_alignment == "bearish":
+            return -1.0
+        else:
+            # Partial score from MA cross proximity
+            if ind.ma_long == 0:
+                return 0.0
+            diff_pct = (ind.ma_short - ind.ma_long) / ind.ma_long
+            return round(max(-1.0, min(1.0, diff_pct * 20)), 4)
+
+    @staticmethod
+    def _score_di_diff(ind: IndicatorResults) -> float:
+        """Score DI difference (+DI - -DI).
+
+        +DI > -DI → BUY, reverse → SELL.
+
+        Returns:
+            Raw score in [-1, 1].
+        """
+        # Normalize: di_diff of 20 = full signal
+        raw = ind.di_diff / 20.0
+        return round(max(-1.0, min(1.0, raw)), 4)
+
+    @staticmethod
+    def _score_adx_direction(ind: IndicatorResults) -> float:
+        """Score based on ADX directional component.
+
+        Uses +DI/-DI spread as direction signal when ADX is significant.
+
+        Returns:
+            Raw score in [-1, 1].
+        """
+        # Same as DI diff but scaled by ADX presence
+        if ind.adx_14 < 20:
+            return 0.0  # ADX too low for direction
+        raw = ind.di_diff / 25.0
+        return round(max(-1.0, min(1.0, raw)), 4)
+
+    @staticmethod
+    def _score_rsi(ind: IndicatorResults, use_extreme: bool = False) -> float:
+        """Score RSI.
+
+        Standard: RSI < 30 = oversold (BUY), RSI > 70 = overbought (SELL)
+        Trend mode: RSI < 40 = BUY, RSI > 60 = SELL (trend-following)
+
+        Args:
+            ind: Indicator results.
+            use_extreme: If True, use wider extreme thresholds.
+
+        Returns:
+            Raw score in [-1, 1].
+        """
+        rsi = ind.rsi_14
+
+        if use_extreme:
+            # Range: wider thresholds
+            if rsi < 25:
+                return 1.0
+            elif rsi < 35:
+                return (35 - rsi) / 10.0  # 0.0 → 1.0
+            elif rsi > 75:
+                return -1.0
+            elif rsi > 65:
+                return -(rsi - 65) / 10.0  # 0.0 → -1.0
+            else:
+                return 0.0
+        else:
+            # Trend: normal thresholds
+            if rsi < 30:
+                return 1.0
+            elif rsi < 50:
+                return (50 - rsi) / 20.0
+            elif rsi > 70:
+                return -1.0
+            elif rsi > 50:
+                return -(rsi - 50) / 20.0
+            else:
+                return 0.0
+
+    @staticmethod
+    def _score_rsi_extreme(ind: IndicatorResults) -> float:
+        """Score RSI for extreme reversal signals (RANGE regime).
+
+        RSI < 20 → strong BUY; RSI > 80 → strong SELL.
+
+        Returns:
+            Raw score in [-1, 1].
+        """
+        rsi = ind.rsi_14
+        if rsi < 20:
+            return 1.0
+        elif rsi < 30:
+            return (30 - rsi) / 10.0
+        elif rsi > 80:
+            return -1.0
+        elif rsi > 70:
+            return -(rsi - 70) / 10.0
+        else:
+            return 0.0
+
+    @staticmethod
+    def _score_stoch(ind: IndicatorResults) -> float:
+        """Score Stochastic oscillator.
+
+        %K < 20 → oversold (BUY); %K > 80 → overbought (SELL).
+
+        Returns:
+            Raw score in [-1, 1].
+        """
+        k = ind.stoch_k
+        if k < 20:
+            return (20 - k) / 20.0
+        elif k > 80:
+            return -(k - 80) / 20.0
+        else:
+            return 0.0
+
+    @staticmethod
+    def _score_stoch_extreme(ind: IndicatorResults) -> float:
+        """Score Stochastic for extreme reversals (RANGE regime).
+
+        Returns:
+            Raw score in [-1, 1].
+        """
+        k = ind.stoch_k
+        if k < 10:
+            return 1.0
+        elif k < 25:
+            return (25 - k) / 15.0
+        elif k > 90:
+            return -1.0
+        elif k > 75:
+            return -(k - 75) / 15.0
+        else:
+            return 0.0
+
+    @staticmethod
+    def _score_pct_b(ind: IndicatorResults) -> float:
+        """Score Bollinger %b.
+
+        %b < 0.1 → oversold (BUY); %b > 0.9 → overbought (SELL).
+
+        Returns:
+            Raw score in [-1, 1].
+        """
+        pct = ind.pct_b
+        if pct < 0.1:
+            return (0.1 - pct) / 0.1
+        elif pct > 0.9:
+            return -(pct - 0.9) / 0.1
+        else:
+            return 0.0
+
+    # ── Threshold Computation ───────────────────
+
+    def _compute_threshold(self, regime: RegimeResult) -> float:
+        """Compute regime-adjusted score threshold.
+
+        Per PRD §6.1.2:
+          PRE_TREND: max(0.42, base - 0.08)
+          TREND: base (ADX ≥ 28: base - 0.05)
+          TREND_FADE: min(0.78, base + 0.08)
+          RANGE: max(0.40, base - 0.10)
+          NEUTRAL: min(0.80, base + 0.10)
+
+        Args:
+            regime: Regime result.
+
+        Returns:
+            Adjusted threshold value.
+        """
+        base = self._base_threshold
+        r = regime.regime
+
+        if r == Regime.PRE_TREND:
+            return round(max(self._pretrend_threshold_floor, base - 0.08), 4)
+
+        elif r == Regime.TREND:
+            if regime.adx >= self._trend_strong_adx_threshold:
+                return round(base + self._trend_strong_threshold_offset, 4)
+            return round(base, 4)
+
+        elif r == Regime.TREND_FADE:
+            return round(min(self._fade_threshold_ceiling, base + 0.08), 4)
+
+        elif r == Regime.RANGE:
+            return round(max(self._range_threshold_floor, base - 0.10), 4)
+
+        else:  # NEUTRAL
+            return round(min(0.80, base + self._neutral_threshold_offset), 4)
+
+    # ── Cooldown Logic ──────────────────────────
+
+    def compute_cooldown(
+        self,
+        regime: Regime,
+        pre_score: float,
+        direction: str,
+        last_direction: str,
+        vol_ratio: float = 1.0,
+        bar_seconds: int = 300,
+    ) -> int:
+        """Compute cooldown in seconds based on regime, signal quality, and live config.
+
+        P1: when volatility-adaptive cooldown is enabled, the base cooldown is
+        scaled by relative band width (vol_ratio = bbw / bbw_ma20):
+          high vol (vol_ratio > 1) -> shorter cooldown (re-enter trends faster)
+          low vol  (vol_ratio < 1) -> longer cooldown (reduce choppy over-trading)
+        Scaling is clipped to +/-30% to stay safe. vol_ratio defaults to 1.0,
+        preserving exact legacy behaviour when not supplied.
+
+        P2: time-frame-aware cooldown multiplier — M1 shrinks cooldown 5×,
+        H1 grows 12×, clamped to [0.3, 3.0] relative to M5 (300 s).
+        bar_seconds defaults to 300 (M5), preserving legacy behaviour.
+        """
+        # Base cooldown by regime
+        if regime == Regime.PRE_TREND:
+            base = self._pretrend_cool
+        elif regime == Regime.TREND:
+            same_dir = direction == last_direction
+            if same_dir and pre_score > self._trend_bypass_score:
+                base = 0
+            elif same_dir and pre_score > 0.50:
+                base = self._trend_mid_cool
+            elif not same_dir:
+                base = self._trend_reverse_cool
+            else:
+                base = self._trend_cool
+        elif regime == Regime.TREND_FADE:
+            base = self._fade_cool
+        elif regime == Regime.RANGE:
+            base = self._range_cool
+        else:  # NEUTRAL
+            base = self._neutral_cool
+
+        # P1 — volatility-adaptive scaling
+        if self._cooldown_vol_enable:
+            mult = 1.0 + max(-0.3, min(0.3, (vol_ratio - 1.0) * self._cooldown_vol_scale))
+            base = int(round(base * mult))
+
+        # P2 — time-frame-aware multiplier: M1 shrinks 5×, H1 grows 12×,
+        # clamped to [DEFAULT_TF_COOLDOWN_MULTIPLIER_MIN, DEFAULT_TF_COOLDOWN_MULTIPLIER_MAX]
+        tf_mult = max(DEFAULT_TF_COOLDOWN_MULTIPLIER_MIN,
+                      min(DEFAULT_TF_COOLDOWN_MULTIPLIER_MAX,
+                          bar_seconds / DEFAULT_BAR_SECONDS_M5))
+        base = int(round(base * tf_mult))
+
+        return base
+
+    # ── Config ──────────────────────────────────
+
+    async def load_config(self) -> None:
+        """Load scoring parameters from config_provider."""
+        if self._config is None:
+            return
+
+        try:
+            self._base_threshold = await self._config.get_float(
+                "score_threshold", DEFAULT_SCORE_THRESHOLD
+            )
+            self._pretrend_threshold_floor = await self._config.get_float(
+                "pretrend_threshold_floor", 0.42
+            )
+            self._fade_threshold_ceiling = await self._config.get_float(
+                "fade_threshold_ceiling", 0.78
+            )
+            self._range_threshold_floor = await self._config.get_float(
+                "range_threshold_floor", 0.40
+            )
+            self._neutral_threshold_offset = await self._config.get_float(
+                "neutral_threshold_offset", 0.10
+            )
+            self._trend_strong_adx_threshold = await self._config.get_float(
+                "trend_strong_adx_threshold", 28.0
+            )
+            self._trend_strong_threshold_offset = await self._config.get_float(
+                "trend_strong_threshold_offset", -0.05
+            )
+            # ── Cooldown config ──
+            self._pretrend_cool = await self._config.get_int(
+                "pretrend_cooldown_seconds", DEFAULT_PRETREND_COOLDOWN
+            )
+            self._trend_cool = await self._config.get_int(
+                "trend_cooldown_seconds", DEFAULT_TREND_COOLDOWN
+            )
+            self._trend_bypass_score = await self._config.get_float(
+                "trend_same_dir_bypass_score", DEFAULT_TREND_SAME_DIR_BYPASS_SCORE
+            )
+            self._trend_mid_cool = await self._config.get_int(
+                "trend_same_dir_mid_cooldown", DEFAULT_TREND_SAME_DIR_MID_COOLDOWN
+            )
+            self._trend_reverse_cool = await self._config.get_int(
+                "trend_reverse_cooldown_seconds", DEFAULT_TREND_REVERSE_COOLDOWN
+            )
+            self._fade_cool = await self._config.get_int(
+                "fade_cooldown_seconds", DEFAULT_FADE_COOLDOWN
+            )
+            self._range_cool = await self._config.get_int(
+                "range_boundary_cooldown_seconds", DEFAULT_RANGE_COOLDOWN
+            )
+            self._neutral_cool = await self._config.get_int(
+                "neutral_cooldown_seconds", DEFAULT_NEUTRAL_COOLDOWN
+            )
+            # ── P1: Volatility-adaptive cooldown ──
+            self._cooldown_vol_enable = await self._config.get_bool(
+                "cooldown_vol_enable", DEFAULT_COOLDOWN_VOL_ENABLE
+            )
+            self._cooldown_vol_scale = await self._config.get_float(
+                "cooldown_vol_scale", DEFAULT_COOLDOWN_VOL_SCALE
+            )
+            logger.info("ScoringEngine config loaded: base_threshold=%.2f cooldown_vol=%s",
+                        self._base_threshold, self._cooldown_vol_enable)
+        except Exception as exc:
+            logger.warning("ScoringEngine config load failed: %s (using defaults)", exc)

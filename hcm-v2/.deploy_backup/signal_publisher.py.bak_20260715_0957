@@ -1,0 +1,403 @@
+"""Signal Publisher — Redis Stream XADD + PostgreSQL INSERT dual-write.
+
+Publishes trading signals to:
+1. Redis Stream: XADD signal:stream (primary, event-driven)
+2. PostgreSQL: INSERT hcm_signal.signals (authoritative, queryable)
+
+Features:
+- Dual-write with retry (3 attempts)
+- Dead letter queue on persistent failure
+- Prometheus metrics
+- Signal ID generation
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+# ── Constants ──────────────────────────────────
+
+SIGNAL_STREAM = "signal:stream"
+DEAD_LETTER_STREAM = "signal:dead"
+DEFAULT_RETRY_MAX = 3
+DEFAULT_RETRY_DELAY = 0.5
+STREAM_MAXLEN = 10000
+
+
+@dataclass
+class SignalData:
+    """Complete signal data for publishing."""
+    signal_id: int = 0
+    task_id: int = 0
+    account_id: int = 0
+    symbol: str = ""
+    time_frame: str = "M5"
+    direction: str = "NO_TRADE"
+    entry_price: float = 0.0
+    sl_price: float = 0.0
+    tp1: float = 0.0
+    tp2: float = 0.0
+    lot: float = 0.0
+    confidence: float = 0.0
+    signal_mode: str = "indicator_scoring"
+    indicator_values: dict = field(default_factory=dict)
+    macro_snapshot_id: Optional[int] = None
+    sentiment_snapshot_id: Optional[int] = None
+    fallback_reason: Optional[str] = None
+    regime: Optional[str] = None
+    pre_score: Optional[float] = None
+    weight_scheme: Optional[str] = None
+    position_in_range: Optional[float] = None
+    trace_id: str = ""
+
+
+class SignalPublisher:
+    """Publishes trading signals to Redis Stream and PostgreSQL.
+
+    Dual-write ensures both real-time event delivery (Redis Stream
+    for consumer groups) and durable storage (PostgreSQL for querying).
+
+    Example:
+        publisher = SignalPublisher(redis_client, db_pool)
+        success = await publisher.publish(signal_data)
+    """
+
+    def __init__(
+        self,
+        redis_client: Any = None,
+        db_pool: Any = None,
+        retry_max: int = DEFAULT_RETRY_MAX,
+        retry_delay: float = DEFAULT_RETRY_DELAY,
+    ):
+        """Initialize SignalPublisher.
+
+        Args:
+            redis_client: RedisClient instance for Stream operations.
+            db_pool: DatabasePool instance for PostgreSQL writes.
+            retry_max: Max retries per operation.
+            retry_delay: Delay between retries in seconds.
+        """
+        self._redis = redis_client
+        self._db = db_pool
+        self._retry_max = retry_max
+        self._retry_delay = retry_delay
+
+        self._stats: dict[str, int] = {
+            "signals_published_redis": 0,
+            "signals_published_pg": 0,
+            "signals_failed_redis": 0,
+            "signals_failed_pg": 0,
+            "signals_dead_letter": 0,
+        }
+
+    # ── Main API ────────────────────────────────
+
+    async def publish(self, signal: SignalData) -> bool:
+        """Publish a signal via dual-write.
+
+        Order: Redis Stream first (real-time), then PostgreSQL (durable).
+
+        Args:
+            signal: SignalData to publish.
+
+        Returns:
+            True if at least Redis Stream publish succeeded.
+        """
+        t0 = time.time()
+
+        # 1. Redis Stream XADD (primary)
+        redis_ok = await self._publish_to_redis(signal)
+
+        # 2. PostgreSQL INSERT (authoritative)
+        pg_ok = await self._publish_to_pg(signal)
+
+        latency_ms = int((time.time() - t0) * 1000)
+
+        if redis_ok and pg_ok:
+            logger.info(
+                "Signal published: id=%d, symbol=%s, direction=%s, latency=%dms",
+                signal.signal_id, signal.symbol, signal.direction, latency_ms,
+            )
+            return True
+
+        if redis_ok and not pg_ok:
+            logger.warning(
+                "Signal partial publish: Redis OK, PG failed (id=%d). "
+                "Signal available via Stream but not durable.",
+                signal.signal_id,
+            )
+            return True  # Redis is primary path
+
+        if not redis_ok:
+            # Both failed or Redis failed — write to dead letter
+            await self._publish_to_dead_letter(signal, "redis_stream_failed")
+            return False
+
+        return False
+
+    # ── Redis Stream ────────────────────────────
+
+    async def _publish_to_redis(self, signal: SignalData) -> bool:
+        """Publish signal to Redis Stream with retry.
+
+        Args:
+            signal: SignalData.
+
+        Returns:
+            True on success.
+        """
+        if self._redis is None or not self._redis.is_initialized:
+            logger.warning("Redis not available — skipping Stream publish")
+            self._stats["signals_failed_redis"] += 1
+            return False
+
+        stream_data = {
+            "event": "signal_created",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "signal_id": signal.signal_id,
+            "task_id": signal.task_id,
+            "account_id": signal.account_id,
+            "symbol": signal.symbol,
+            "time_frame": signal.time_frame,
+            "direction": signal.direction,
+            "entry_price": signal.entry_price,
+            "sl_price": signal.sl_price,
+            "tp1": signal.tp1,
+            "tp2": signal.tp2,
+            "lot": signal.lot,
+            "confidence": signal.confidence,
+            "signal_mode": signal.signal_mode,
+            "indicator_values": signal.indicator_values,
+            "macro_snapshot_id": signal.macro_snapshot_id or 0,
+            "sentiment_snapshot_id": signal.sentiment_snapshot_id or 0,
+            "fallback_reason": signal.fallback_reason or "",
+            "regime": signal.regime or "",
+            "pre_score": signal.pre_score or 0.0,
+            "weight_scheme": signal.weight_scheme or "",
+            "position_in_range": signal.position_in_range or 0.0,
+            "trace_id": signal.trace_id,
+        }
+
+        for attempt in range(1, self._retry_max + 1):
+            try:
+                msg_id = await self._redis.xadd(
+                    SIGNAL_STREAM,
+                    stream_data,
+                    maxlen=STREAM_MAXLEN,
+                )
+                if msg_id:
+                    self._stats["signals_published_redis"] += 1
+                    logger.debug("Signal XADD: id=%d → %s (msg_id=%s)",
+                               signal.signal_id, SIGNAL_STREAM, msg_id)
+                    return True
+
+            except Exception as exc:
+                logger.warning(
+                    "Redis XADD attempt %d/%d failed (signal_id=%d): %s",
+                    attempt, self._retry_max, signal.signal_id, exc,
+                )
+
+            if attempt < self._retry_max:
+                await asyncio.sleep(self._retry_delay * attempt)
+
+        self._stats["signals_failed_redis"] += 1
+        logger.error("Redis XADD all retries exhausted (signal_id=%d)", signal.signal_id)
+        return False
+
+    # ── PostgreSQL ──────────────────────────────
+
+    async def _publish_to_pg(self, signal: SignalData) -> bool:
+        """Insert signal into PostgreSQL with retry.
+
+        Args:
+            signal: SignalData.
+
+        Returns:
+            True on success.
+        """
+        if self._db is None or not self._db.is_initialized:
+            logger.warning("PostgreSQL not available — skipping PG insert")
+            self._stats["signals_failed_pg"] += 1
+            return False
+
+        for attempt in range(1, self._retry_max + 1):
+            try:
+                await self._db.execute(
+                    """INSERT INTO hcm_signal.signals 
+                       (signal_id, task_id, account_id, symbol, time_frame,
+                        signal_dir, entry_price, sl_price, tp1, tp2, lot,
+                        confidence, signal_tower_mode, indicator_values,
+                        macro_snapshot_id, sentiment_snapshot_id,
+                        fallback_reason, pre_score, weight_scheme,
+                        position_in_range, regime,
+                        created_at)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                               $12, $13, $14, $15, $16, $17, $18,
+                               $19, $20, $21, $22)""",
+                    signal.signal_id,
+                    signal.task_id if signal.task_id > 0 else None,
+                    signal.account_id,
+                    signal.symbol,
+                    signal.time_frame,
+                    signal.direction,
+                    signal.entry_price,
+                    signal.sl_price,
+                    signal.tp1,
+                    signal.tp2,
+                    signal.lot,
+                    signal.confidence,
+                    signal.signal_mode,
+                    json.dumps(signal.indicator_values) if signal.indicator_values else "{}",
+                    signal.macro_snapshot_id,
+                    signal.sentiment_snapshot_id,
+                    signal.fallback_reason or "",
+                    signal.pre_score,
+                    signal.weight_scheme or "",
+                    signal.position_in_range,
+                    signal.regime or "",
+                    datetime.now(timezone.utc),
+                )
+                self._stats["signals_published_pg"] += 1
+                return True
+
+            except Exception as exc:
+                logger.warning(
+                    "PG INSERT attempt %d/%d failed (signal_id=%d): %s",
+                    attempt, self._retry_max, signal.signal_id, exc,
+                )
+
+            if attempt < self._retry_max:
+                await asyncio.sleep(self._retry_delay * attempt)
+
+        self._stats["signals_failed_pg"] += 1
+        logger.error("PG INSERT all retries exhausted (signal_id=%d)", signal.signal_id)
+        return False
+
+    # ── Dead Letter Queue ───────────────────────
+
+    async def _publish_to_dead_letter(self, signal: SignalData, reason: str) -> None:
+        """Write failed signal to dead letter queue.
+
+        Args:
+            signal: Failed SignalData.
+            reason: Failure reason.
+        """
+        self._stats["signals_dead_letter"] += 1
+
+        dead_data = {
+            "original_signal_id": signal.signal_id,
+            "symbol": signal.symbol,
+            "direction": signal.direction,
+            "failed_at": "redis_stream",
+            "error": reason,
+            "retry_count": self._retry_max,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if self._redis is not None and self._redis.is_initialized:
+            try:
+                await self._redis.xadd(DEAD_LETTER_STREAM, dead_data, maxlen=STREAM_MAXLEN)
+                logger.error(
+                    "Signal dead letter: id=%d, reason=%s → %s",
+                    signal.signal_id, reason, DEAD_LETTER_STREAM,
+                )
+            except Exception as exc:
+                logger.critical(
+                    "CRITICAL: Cannot write to dead letter queue (signal_id=%d): %s",
+                    signal.signal_id, exc,
+                )
+        else:
+            logger.critical(
+                "CRITICAL: No Redis available for dead letter (signal_id=%d, reason=%s)",
+                signal.signal_id, reason,
+            )
+
+    # ── Signal ID Generation ────────────────────
+
+    async def generate_signal_id(self) -> int:
+        """Generate a unique signal ID.
+
+        Uses Redis INCR for distributed ID generation, falling back
+        to timestamp-based IDs if Redis is unavailable.
+
+        Returns:
+            Unique signal ID.
+        """
+        if self._redis is not None and self._redis.is_initialized:
+            try:
+                return await self._redis.raw.incr("hcm:signal_id_counter")
+            except Exception:
+                pass
+
+        # Fallback: timestamp-based
+        return int(time.time() * 1000000) % 1000000000
+
+    # ── Stats & Health ──────────────────────────
+
+    def get_stats(self) -> dict:
+        """Get publisher statistics.
+
+        Returns:
+            Dict with publish counts.
+        """
+        return dict(self._stats)
+
+    async def health_check(self) -> dict:
+        """Check publisher health.
+
+        Returns:
+            Dict with status and stats.
+        """
+        redis_ok = False
+        pg_ok = False
+
+        if self._redis and self._redis.is_initialized:
+            try:
+                redis_ok = await self._redis.ping()
+            except Exception:
+                pass
+
+        if self._db and self._db.is_initialized:
+            try:
+                pg_check = await self._db.health_check()
+                pg_ok = pg_check.get("status") == "healthy"
+            except Exception:
+                pass
+
+        return {
+            "status": "healthy" if redis_ok else "degraded",
+            "redis_ok": redis_ok,
+            "pg_ok": pg_ok,
+            "stats": self.get_stats(),
+        }
+
+    # ── Consumer Group Setup ────────────────────
+
+    async def setup_consumer_groups(self) -> None:
+        """Create Redis Stream consumer groups for signal consumption.
+        
+        Uses start_id="0" so that messages published before consumers
+        come online are NOT missed (the group starts from stream beginning
+        on first creation; BUSYGROUP on subsequent calls is harmless)."""
+        if self._redis is None or not self._redis.is_initialized:
+            return
+
+        groups = [
+            (SIGNAL_STREAM, "risk-engine-group"),
+            (SIGNAL_STREAM, "web-push-group"),
+        ]
+
+        for stream, group in groups:
+            try:
+                await self._redis.xgroup_create(stream, group, mkstream=True, start_id="0")
+                logger.info("Consumer group created: %s on %s", group, stream)
+            except Exception as exc:
+                logger.debug("Consumer group %s on %s: %s", group, stream, exc)

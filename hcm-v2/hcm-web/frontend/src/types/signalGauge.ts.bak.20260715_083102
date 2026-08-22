@@ -1,0 +1,87 @@
+/** Single factor signal gauge data */
+export interface FactorGauge {
+  /** Factor identifier: RSI | MACD | STOCH | BOLL | MA5 | MA20 | CCI | ATR | ADX */
+  key: string;
+  /** Bullish percentage 0-100 */
+  long_pct: number;
+  /** Neutral percentage 0-100 */
+  neutral_pct: number;
+  /** Bearish percentage 0-100 */
+  short_pct: number;
+  /** Raw indicator value */
+  raw_value: number;
+  /** Factor weight 0-1 */
+  weight: number;
+}
+
+/** Composite signal gauge summary */
+export interface SignalGaugeSummary {
+  /** Composite bullish score */
+  long: number;
+  /** Composite neutral score */
+  neutral: number;
+  /** Composite bearish score */
+  short: number;
+}
+
+/** Latest inference data from the most recent signal */
+export interface LatestInference {
+  score: number;
+  symbol: string;
+  timeframe: string;
+  direction: string;
+  regime: string;
+  updated_at: string | null;
+}
+
+/** Scoring gate thresholds for all 6 regime types */
+export interface ScoringThresholds {
+  base: number;
+  trend_strong: number;
+  trend: number;
+  pretrend: number;
+  fade: number;
+  range: number;
+  neutral: number;
+  strong_adx_threshold: number;
+}
+
+/** Full API response body */
+export interface SignalGaugeResponse {
+  code: number;
+  message: string;
+  data: {
+    factors: FactorGauge[];
+    summary: SignalGaugeSummary;
+    latest_inference: LatestInference | null;
+    scoring_thresholds: ScoringThresholds | null;
+  };
+}
+
+/** Real-time quote data (subset of realtime API kline fields) */
+export interface RealtimeQuote {
+  symbol: string;
+  last: number;
+  change: number;
+  change_pct: number;
+  bid: number;
+  ask: number;
+  high: number;
+  low: number;
+  open: number;
+  volume: number;
+  updated_at: string;
+}
+
+/** Static default factors for initial/placeholder rendering */
+export const DEFAULT_FACTORS: FactorGauge[] = [
+  { key: 'MACD', long_pct: 0, neutral_pct: 100, short_pct: 0, raw_value: 0, weight: 0.20 },
+  { key: 'MA5', long_pct: 0, neutral_pct: 100, short_pct: 0, raw_value: 0, weight: 0.15 },
+  { key: 'MA20', long_pct: 0, neutral_pct: 100, short_pct: 0, raw_value: 0, weight: 0.15 },
+  { key: 'CCI', long_pct: 0, neutral_pct: 100, short_pct: 0, raw_value: 0, weight: 0.10 },
+  { key: 'ATR', long_pct: 0, neutral_pct: 100, short_pct: 0, raw_value: 0, weight: 0.10 },
+  { key: 'ADX', long_pct: 0, neutral_pct: 100, short_pct: 0, raw_value: 0, weight: 0.20 },
+  { key: 'AO', long_pct: 0, neutral_pct: 100, short_pct: 0, raw_value: 0, weight: 0.10 },
+];
+
+export const DEFAULT_SUMMARY: SignalGaugeSummary = { long: 0, neutral: 100, short: 0 };

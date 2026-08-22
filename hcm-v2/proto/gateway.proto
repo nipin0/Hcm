@@ -1,0 +1,130 @@
+// gateway.proto — HCM v2 gRPC 网关接口定义
+// 版本: v1.0 | 基于 PRD v1.3
+
+syntax = "proto3";
+
+package hcm.gateway;
+
+option go_package = "hcm-v2/proto/gateway";
+
+// ──────────────────────────────────────────────
+// Gateway Service — MT5 桥接核心服务
+// ──────────────────────────────────────────────
+
+service Gateway {
+  // 下单（unary）
+  rpc PlaceOrder(PlaceOrderRequest) returns (PlaceOrderResponse);
+
+  // 撤单（unary）
+  rpc CancelOrder(CancelOrderRequest) returns (CancelOrderResponse);
+
+  // 实时报价流（server-streaming）
+  rpc StreamPrices(PriceStreamRequest) returns (stream PriceTick);
+
+  // 查询账户信息（unary）
+  rpc GetAccountInfo(AccountRequest) returns (AccountInfo);
+
+  // 健康检查（unary）
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+// ──────────────────────────────────────────────
+// PlaceOrder
+// ──────────────────────────────────────────────
+
+message PlaceOrderRequest {
+  string client_id = 1;        // 客户端订单 ID（幂等键）
+  int64 account_id = 2;        // MT5 账户 ID
+  string symbol = 3;           // 交易品种（XAUUSD、BTCUSD 等）
+  string direction = 4;        // BUY / SELL
+  double lot = 5;              // 手数
+  double sl = 6;               // 止损价（0 = 不设）
+  double tp = 7;               // 止盈价（0 = 不设）
+  int32 magic = 8;             // EA Magic Number
+  string comment = 9;          // 订单注释
+  string order_type = 10;      // MARKET / LIMIT / STOP
+  double entry_price = 11;     // 入场价（市价单可省略）
+  int32 slippage = 12;         // 滑点（点数）
+}
+
+message PlaceOrderResponse {
+  int32 code = 1;              // 0=成功
+  string message = 2;          // 状态消息
+  int64 mt5_ticket = 3;        // MT5 订单号
+  double filled_price = 4;     // 实际成交价
+  double commission = 5;       // 佣金
+  int64 latency_ms = 6;        // Gateway 处理延迟（ms）
+}
+
+// ──────────────────────────────────────────────
+// CancelOrder
+// ──────────────────────────────────────────────
+
+message CancelOrderRequest {
+  int64 account_id = 1;        // MT5 账户 ID
+  int64 mt5_ticket = 2;        // MT5 订单号
+  string client_id = 3;        // 客户端订单 ID（可选）
+}
+
+message CancelOrderResponse {
+  int32 code = 1;
+  string message = 2;
+  int64 mt5_ticket = 3;
+}
+
+// ──────────────────────────────────────────────
+// StreamPrices
+// ──────────────────────────────────────────────
+
+message PriceStreamRequest {
+  string account_id = 1;       // MT5 账户 ID（登录用）
+  repeated string symbols = 2; // 订阅品种列表
+  bool include_ticks = 3;      // 是否推送 Tick 级别报价
+}
+
+message PriceTick {
+  string symbol = 1;           // 品种
+  double bid = 2;              // 卖价
+  double ask = 3;              // 买价
+  double spread = 4;           // 点差
+  int64 timestamp = 5;         // Unix 毫秒时间戳
+  int32 volume = 6;            // 成交量
+}
+
+// ──────────────────────────────────────────────
+// GetAccountInfo
+// ──────────────────────────────────────────────
+
+message AccountRequest {
+  int64 account_id = 1;        // MT5 账户 ID
+}
+
+message AccountInfo {
+  int32 code = 1;
+  string message = 2;
+  int64 account_id = 3;
+  string account_name = 4;
+  double balance = 5;          // 余额
+  double equity = 6;           // 净值
+  double margin = 7;           // 已用保证金
+  double free_margin = 8;      // 可用保证金
+  double margin_level = 9;     // 保证金比例（%）
+  int32 leverage = 10;         // 杠杆
+  string currency = 11;        // 账户币种
+  int64 server_time = 12;      // 服务器时间（Unix 毫秒）
+  bool is_connected = 13;      // MT5 连接状态
+}
+
+// ──────────────────────────────────────────────
+// HealthCheck
+// ──────────────────────────────────────────────
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  string status = 1;           // healthy / degraded / unhealthy
+  int64 uptime_sec = 2;        // 运行时间（秒）
+  bool mt5_connected = 3;      // MT5 连接状态
+  bool redis_connected = 4;    // Redis 连接状态
+  string version = 5;          // Gateway 版本
+}

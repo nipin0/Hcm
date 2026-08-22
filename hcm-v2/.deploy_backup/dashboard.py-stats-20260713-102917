@@ -1,0 +1,902 @@
+"""Dashboard API — Aggregated stats and analytics.
+
+Provides:
+- GET /api/v1/dashboard/today — Today's statistics
+- GET /api/v1/dashboard/pnl — P&L summary
+- GET /api/v1/dashboard/winrate — Win rate analysis
+- GET /api/v1/dashboard/symbols-compare — Symbol comparison
+- GET /api/v1/dashboard/external-factors — External factor status
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+
+logger = logging.getLogger(__name__)
+
+# Lazy import to avoid circular dependency
+_signal_gauge_engine: Any = None
+
+
+def _get_signal_gauge_engine() -> Any:
+    """Lazy-load the signal_gauge module."""
+    global _signal_gauge_engine
+    if _signal_gauge_engine is None:
+        from web.api import signal_gauge as _sg  # noqa: F811
+        _signal_gauge_engine = _sg
+    return _signal_gauge_engine
+
+
+# ── Router Factory ─────────────────────────────
+
+def create_dashboard_router(
+    db_pool: Any = None,
+    redis_client: Any = None,
+    auth_handler: Any = None,
+) -> APIRouter:
+    """Create FastAPI router with dashboard analytics endpoints.
+
+    Args:
+        db_pool: DatabasePool instance.
+        redis_client: RedisClient instance.
+        auth_handler: AuthHandler instance for RBAC.
+
+    Returns:
+        APIRouter with dashboard routes.
+    """
+    router = APIRouter(prefix="/api/v1/dashboard", tags=["dashboard"])
+
+    # ── Today's Statistics ──────────────────────
+
+    @router.get("/today")
+    async def today_stats(
+        request: Request,
+        account_id: Optional[int] = Query(None),
+    ):
+        """Get today's trading statistics.
+
+        Returns signals count, trades placed, orders executed,
+        and active positions for the current day.
+
+        Args:
+            account_id: Optional account filter.
+        """
+        if db_pool is None or not db_pool.is_initialized:
+            return {"code": "SYS_DB_001", "data": None, "message": "Database not available"}
+
+        try:
+            account_filter = "AND s.account_id = $1" if account_id is not None else ""
+            params: list[Any] = [account_id] if account_id is not None else []
+
+            # Today's signals
+            signal_row = await db_pool.fetchrow(
+                f"""SELECT COUNT(*) as total_signals,
+                           COUNT(*) FILTER (WHERE s.signal_dir = 'BUY') as buy_signals,
+                           COUNT(*) FILTER (WHERE s.signal_dir = 'SELL') as sell_signals,
+                           AVG(s.confidence) as avg_confidence,
+                           AVG(s.pre_score) as avg_pre_score
+                    FROM hcm_signal.signals s
+                    WHERE s.created_at >= CURRENT_DATE
+                      {account_filter}""",
+                *params,
+            )
+
+            # Today's orders
+            order_row = await db_pool.fetchrow(
+                f"""SELECT COUNT(*) as total_orders,
+                           COUNT(*) FILTER (WHERE o.close_time IS NOT NULL) as closed_orders,
+                           SUM(o.profit) as total_profit,
+                           SUM(o.commission) as total_commission,
+                           SUM(o.swap) as total_swap
+                    FROM hcm_trading.orders o
+                    WHERE o.created_at >= CURRENT_DATE
+                      {account_filter.replace('s.', 'o.')}""",
+                *params,
+            )
+
+            # Active positions
+            pos_row = await db_pool.fetchrow(
+                f"""SELECT COUNT(DISTINCT p.mt5_ticket) as active_positions,
+                           SUM(p.float_profit) as total_float
+                    FROM hcm_trading.positions p
+                    WHERE p.snapshot_time >= now() - interval '10 minutes'
+                      {account_filter.replace('s.', 'p.')}""",
+                *params,
+            )
+
+            return {
+                "code": 0,
+                "data": {
+                    "signals": {
+                        "total": signal_row["total_signals"] if signal_row else 0,
+                        "buy": signal_row["buy_signals"] if signal_row else 0,
+                        "sell": signal_row["sell_signals"] if signal_row else 0,
+                        "avg_confidence": round(float(signal_row["avg_confidence"] or 0), 4) if signal_row else 0,
+                        "avg_pre_score": round(float(signal_row["avg_pre_score"] or 0), 4) if signal_row else 0,
+                    },
+                    "orders": {
+                        "total": order_row["total_orders"] if order_row else 0,
+                        "closed": order_row["closed_orders"] if order_row else 0,
+                        "total_profit": round(float(order_row["total_profit"] or 0), 2) if order_row else 0,
+                        "total_commission": round(float(order_row["total_commission"] or 0), 2) if order_row else 0,
+                        "total_swap": round(float(order_row["total_swap"] or 0), 2) if order_row else 0,
+                    },
+                    "positions": {
+                        "active": pos_row["active_positions"] if pos_row else 0,
+                        "total_float": round(float(pos_row["total_float"] or 0), 2) if pos_row else 0,
+                    },
+                },
+                "message": "ok",
+            }
+
+        except Exception as exc:
+            logger.error("Dashboard today stats failed: %s", exc)
+            return {"code": "WB_DB_001", "data": None, "message": str(exc)}
+
+    # ── P&L Summary ─────────────────────────────
+
+    @router.get("/pnl")
+    async def pnl_summary(
+        request: Request,
+        account_id: Optional[int] = Query(None),
+        days: int = Query(7, ge=1, le=365),
+    ):
+        """Get P&L summary for a period.
+
+        Aggregates from hcm_trading.positions (live open positions) plus
+        hcm_trading.orders (closed trades). Falls back gracefully when
+        schema columns don't exist yet.
+        """
+        if db_pool is None or not db_pool.is_initialized:
+            return {"code": "SYS_DB_001", "data": None, "message": "Database not available"}
+
+        try:
+            total_profit = 0.0
+            total_trades = 0
+            wins = 0
+            losses = 0
+            wins_sum = 0.0
+            losses_sum = 0.0
+            max_win = 0.0
+            max_loss = 0.0
+            daily_map: dict[str, dict] = {}
+
+            # Try orders (closed trades) — schema has profit
+            try:
+                rows = await db_pool.fetch(
+                    """SELECT DATE(close_time) AS trade_date,
+                              mt5_ticket, profit, commission, swap, lot
+                       FROM hcm_trading.orders
+                       WHERE close_time IS NOT NULL
+                         AND close_time >= now() - ($1 || ' days')::interval
+                       ORDER BY close_time DESC
+                       LIMIT 500""",
+                    str(days),
+                )
+                for r in rows:
+                    profit = float(r["profit"] or 0)
+                    total_profit += profit
+                    total_trades += 1
+                    if profit > 0:
+                        wins += 1
+                        wins_sum += profit
+                    elif profit < 0:
+                        losses += 1
+                        losses_sum += profit
+                    if profit > max_win: max_win = profit
+                    if profit < max_loss: max_loss = profit
+                    d = r["trade_date"].isoformat() if r["trade_date"] else "unknown"
+                    if d not in daily_map: daily_map[d] = {"profit":0.0,"trades":0}
+                    daily_map[d]["profit"] += profit
+                    daily_map[d]["trades"] += 1
+            except Exception:
+                pass
+
+            # Also count signals (proxies for trade count)
+            try:
+                sig_count = await db_pool.fetchval(
+                    "SELECT count(*) FROM hcm_signal.signals WHERE created_at >= now() - ($1 || ' days')::interval",
+                    str(days),
+                )
+                if total_trades == 0 and sig_count:
+                    total_trades = int(sig_count)
+            except Exception:
+                pass
+
+            # Add open positions floating P&L (live unrealized)
+            try:
+                position_rows = await db_pool.fetch(
+                    """SELECT symbol, direction, lot, open_price, current_price, float_profit
+                       FROM hcm_trading.positions""")
+                for p in position_rows:
+                    fp = float(p["float_profit"] or 0)
+                    total_profit += fp
+                    if fp > 0: wins += 1
+                    elif fp < 0: losses += 1
+            except Exception:
+                pass
+
+            daily = [{"date": d, **v} for d, v in daily_map.items()]
+            daily.sort(key=lambda x: x["date"], reverse=True)
+
+            win_rate = round(wins / (wins + losses) * 100, 2) if (wins + losses) > 0 else 0
+            profit_loss_ratio = round(wins_sum / abs(losses_sum), 2) if losses_sum < 0 else 0
+            avg_win = round(wins_sum / wins, 2) if wins > 0 else 0
+            avg_loss = round(losses_sum / losses, 2) if losses > 0 else 0
+            avg_profit_per_trade = round(total_profit / total_trades, 2) if total_trades > 0 else 0
+
+            return {
+                "code": 0,
+                "data": {
+                    "total_profit": round(total_profit, 2),
+                    "total_trades": total_trades,
+                    "wins": wins,
+                    "losses": losses,
+                    "win_rate": win_rate,
+                    "profit_loss_ratio": profit_loss_ratio,
+                    "avg_win": avg_win,
+                    "avg_loss": avg_loss,
+                    "avg_profit_per_trade": avg_profit_per_trade,
+                    "max_win": round(max_win, 2),
+                    "max_loss": round(max_loss, 2),
+                    "days": days,
+                    "winning_days": sum(1 for d in daily if d["profit"] > 0),
+                    "losing_days": sum(1 for d in daily if d["profit"] < 0),
+                    "daily": daily,
+                },
+                "message": "ok",
+            }
+
+        except Exception as exc:
+            logger.error("Dashboard P&L failed: %s", exc)
+            return {"code": "WB_DB_001", "data": None, "message": str(exc)}
+
+    # ── Win Rate Analysis ───────────────────────
+
+    @router.get("/winrate")
+    async def winrate_analysis(
+        request: Request,
+        account_id: Optional[int] = Query(None),
+        days: int = Query(30, ge=1, le=365),
+    ):
+        """Get win rate analysis from closed orders + signals (proxies)."""
+        if db_pool is None or not db_pool.is_initialized:
+            return {"code": "SYS_DB_001", "data": None, "message": "Database not available"}
+
+        try:
+            wins = losses = total = 0
+            avg_win = avg_loss = 0.0
+            symbol_rows: list = []
+            dir_rows: list = []
+            max_drawdown = 0.0
+
+            # Real closed trades from orders
+            try:
+                overall = await db_pool.fetchrow(
+                    """SELECT COUNT(*) AS total,
+                              COUNT(*) FILTER (WHERE profit > 0) AS wins,
+                              COUNT(*) FILTER (WHERE profit < 0) AS losses,
+                              COUNT(*) FILTER (WHERE profit = 0) AS breakeven,
+                              AVG(profit) FILTER (WHERE profit > 0) AS avg_win,
+                              AVG(profit) FILTER (WHERE profit < 0) AS avg_loss,
+                              MIN(profit) AS max_loss,
+                              MAX(profit) AS max_win
+                       FROM hcm_trading.orders
+                       WHERE close_time IS NOT NULL""")
+                if overall:
+                    total = overall["total"] or 0
+                    wins = overall["wins"] or 0
+                    losses = overall["losses"] or 0
+                    avg_win = float(overall["avg_win"] or 0)
+                    avg_loss = float(overall["avg_loss"] or 0)
+                    if overall["max_loss"] and float(overall["max_loss"]) < max_drawdown:
+                        max_drawdown = float(overall["max_loss"])
+
+                symbol_rows = await db_pool.fetch(
+                    """SELECT symbol,
+                              COUNT(*) AS total,
+                              COUNT(*) FILTER (WHERE profit > 0) AS wins,
+                              SUM(profit) AS total_profit
+                       FROM hcm_trading.orders
+                       WHERE close_time IS NOT NULL
+                       GROUP BY symbol ORDER BY total DESC""")
+                dir_rows = await db_pool.fetch(
+                    """SELECT direction,
+                              COUNT(*) AS total,
+                              COUNT(*) FILTER (WHERE profit > 0) AS wins,
+                              SUM(profit) AS total_profit
+                       FROM hcm_trading.orders
+                       WHERE close_time IS NOT NULL
+                       GROUP BY direction""")
+            except Exception:
+                pass
+
+            # If no closed orders, fall back to signals (proxy)
+            if total == 0:
+                try:
+                    sig_rows = await db_pool.fetch(
+                        """SELECT signal_dir AS direction, count(*) AS total,
+                                  count(*) FILTER (WHERE signal_status = 3) AS wins,
+                                  count(*) FILTER (WHERE signal_status = 2) AS losses
+                           FROM hcm_signal.signals
+                           GROUP BY signal_dir""")
+                    for r in sig_rows:
+                        total += r["total"]; wins += r["wins"]; losses += r["losses"]
+                    avg_win = 0.0
+                    avg_loss = 0.0
+                    dir_rows = list(sig_rows)
+                except Exception:
+                    pass
+
+            # Compute max drawdown from open positions (live unrealized)
+            try:
+                pos_rows = await db_pool.fetch(
+                    """SELECT float_profit FROM hcm_trading.positions WHERE float_profit < 0""")
+                if pos_rows:
+                    worst = min(float(p["float_profit"]) for p in pos_rows)
+                    if worst < max_drawdown:
+                        max_drawdown = worst
+            except Exception:
+                pass
+
+            total_trades = total
+            win_rate = round(wins / total * 100, 2) if total > 0 else 0
+            profit_factor = round(abs(avg_win / avg_loss), 2) if avg_loss != 0 and total > 0 else 0
+
+            return {
+                "code": 0,
+                "data": {
+                    "overall": {
+                        "total_trades": total_trades,
+                        "wins": wins,
+                        "losses": losses,
+                        "breakeven": 0,
+                        "win_rate": win_rate,
+                        "avg_win": round(avg_win, 2),
+                        "avg_loss": round(avg_loss, 2),
+                        "profit_factor": profit_factor,
+                    },
+                    "by_symbol": [
+                        {
+                            "symbol": r["symbol"],
+                            "total": r["total"],
+                            "wins": r["wins"],
+                            "win_rate": round(r["wins"] / r["total"] * 100, 2) if r["total"] > 0 else 0,
+                            "total_profit": round(float(r["total_profit"] or 0), 2),
+                        } for r in symbol_rows
+                    ],
+                    "by_direction": [
+                        {
+                            "direction": r["direction"],
+                            "total": r["total"],
+                            "wins": r["wins"],
+                            "win_rate": round(r["wins"] / r["total"] * 100, 2) if r["total"] > 0 else 0,
+                            "total_profit": round(float(r.get("total_profit") or 0), 2),
+                        } for r in dir_rows
+                    ],
+                    "max_drawdown": round(max_drawdown, 2),
+                    "days": days,
+                },
+                "message": "ok",
+            }
+
+        except Exception as exc:
+            logger.error("Dashboard winrate failed: %s", exc)
+            return {"code": "WB_DB_001", "data": None, "message": str(exc)}
+
+    # ── KPI Summary (used by /statistics page) ──
+
+    @router.get("/statistics")
+    async def statistics_summary(
+        request: Request,
+        symbol: Optional[str] = Query(None, description="Optional symbol filter"),
+        days: int = Query(30, ge=1, le=365),
+        start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+        end_date: Optional[str] = Query(None, description="End date YYYY-MM-DD (inclusive)"),
+    ):
+        """Aggregate KPI summary with real-time P&L from bridge price feed.
+
+        Supports both legacy ``days`` parameter (N days back from now) and
+        explicit ``start_date``/``end_date`` range queries.
+        """
+        if db_pool is None or not db_pool.is_initialized:
+            return {"code": "SYS_DB_001", "data": None, "message": "Database not available"}
+
+        # ── Build time-filter SQL fragments ──
+        if start_date and end_date:
+            # Explicit date range: inclusive start, exclusive end+1day
+            sig_time_filter = "s.created_at >= $1::date AND s.created_at < ($2::date + interval '1 day')"
+            sig_time_params: list[Any] = [start_date, end_date]
+            ord_time_filter = "o.close_time >= $1::date AND o.close_time < ($2::date + interval '1 day')"
+            ord_time_params: list[Any] = [start_date, end_date]
+        else:
+            # Legacy days-based window
+            sig_time_filter = "s.created_at >= now() - ($1 || ' days')::interval"
+            sig_time_params = [str(days)]
+            ord_time_filter = "o.close_time >= now() - ($1 || ' days')::interval"
+            ord_time_params = [str(days)]
+
+        try:
+            total_signals = 0
+            wins = losses = 0
+            total_profit = 0.0
+            wins_sum = losses_sum = 0.0
+            max_drawdown = 0.0
+
+            # === 1. Get live prices from Redis (bridge pushes every 2s) ===
+            live_prices: dict[str, dict] = {}  # symbol -> {bid, ask}
+            try:
+                if redis_client is not None and redis_client.is_initialized:
+                    for sym in ["XAUUSD"]:
+                        price_raw = await redis_client.hget("hcm:config:v2", f"market:latest:{sym}")
+                        if price_raw:
+                            import json as _json
+                            data = _json.loads(price_raw)
+                            bid = float(data.get("bid", 0))
+                            ask = float(data.get("ask", 0))
+                            if bid > 0 and ask > 0:
+                                live_prices[sym] = {"bid": bid, "ask": ask}
+            except Exception:
+                pass
+
+            # Fallback: latest kline close
+            if not live_prices:
+                try:
+                    row = await db_pool.fetchrow(
+                        "SELECT close FROM hcm_market.klines WHERE symbol='XAUUSD' ORDER BY open_time DESC LIMIT 1")
+                    if row:
+                        close = float(row["close"])
+                        live_prices["XAUUSD"] = {"bid": close - 0.2, "ask": close + 0.2}
+                except Exception:
+                    pass
+
+            # === 2. Count signals ===
+            try:
+                sig_rows = await db_pool.fetch(
+                    f"""SELECT signal_id, signal_status, signal_dir, symbol
+                       FROM hcm_signal.signals s
+                       WHERE {sig_time_filter}
+                       ORDER BY s.created_at DESC""", *sig_time_params)
+                total_signals = len(sig_rows)
+            except Exception:
+                pass
+
+            # === 3. Closed orders (realized P&L) ===
+            pnl_rows: list = []
+            try:
+                pnl_rows = await db_pool.fetch(
+                    f"""SELECT o.profit FROM hcm_trading.orders o
+                       WHERE o.close_time IS NOT NULL
+                         AND {ord_time_filter}
+                       LIMIT 5000""", *ord_time_params)
+            except Exception:
+                pass
+
+            for r in pnl_rows:
+                p = float(r["profit"] or 0)
+                total_profit += p
+                if p > 0:
+                    wins += 1; wins_sum += p
+                elif p < 0:
+                    losses += 1; losses_sum += p
+                if p < max_drawdown:
+                    max_drawdown = p
+
+            # === 4. Open positions (unrealized P&L using live prices) ===
+            open_pnl_rows: list = []
+            try:
+                open_pnl_rows = await db_pool.fetch(
+                    """SELECT position_id, symbol, direction, open_price, lot, float_profit
+                       FROM hcm_trading.positions""")
+            except Exception:
+                pass
+
+            position_profit = 0.0
+            for pos in open_pnl_rows:
+                fp = float(pos["float_profit"] or 0)
+                if fp != 0:
+                    total_profit += fp
+                    if fp > 0: wins += 1; wins_sum += fp
+                    elif fp < 0: losses += 1; losses_sum += fp
+                    position_profit += fp
+                    if fp < max_drawdown: max_drawdown = fp
+                else:
+                    # Compute real-time unrealized P&L from live price
+                    sym = pos["symbol"]
+                    direction = pos["direction"]
+                    open_price = float(pos["open_price"])
+                    lot = float(pos["lot"])
+                    prices = live_prices.get(sym, {})
+                    bid = prices.get("bid", open_price)
+                    ask = prices.get("ask", open_price)
+                    live_price = bid if direction == "SELL" else ask if direction == "BUY" else open_price
+                    if live_price and open_price > 0:
+                        pip_value = 100.0  # XAUUSD: 1 lot = $100 per $1 move
+                        if direction == "BUY":
+                            unrealized = (live_price - open_price) * lot * pip_value
+                        else:
+                            unrealized = (open_price - live_price) * lot * pip_value
+                        total_profit += unrealized
+                        if unrealized > 0:
+                            wins += 1; wins_sum += unrealized
+                        elif unrealized < 0:
+                            losses += 1; losses_sum += unrealized
+                        if unrealized < max_drawdown:
+                            max_drawdown = unrealized
+
+            # === 5. Compute KPIs ===
+            total_trades = wins + losses
+            win_rate = wins / total_trades * 100 if total_trades > 0 else 0
+            profit_factor = (abs(wins_sum / losses_sum) if losses_sum < 0
+                           else (wins_sum if wins > 0 else 0))
+            if wins > 0: avg_win = wins_sum / wins
+            else: avg_win = 0.0
+            if losses > 0: avg_loss = losses_sum / losses
+            else: avg_loss = 0.0
+
+            # Sharpe ratio (annualized)
+            sharpe_ratio = 0.0
+            if total_trades >= 5:
+                mean = total_profit / total_trades
+                try:
+                    diffs = []
+                    for r in pnl_rows:
+                        diffs.append((float(r["profit"] or 0) - mean) ** 2)
+                    if diffs:
+                        variance = sum(diffs) / len(diffs)
+                        stddev = variance ** 0.5
+                        if stddev > 0:
+                            sharpe_ratio = mean / stddev * (252 ** 0.5)
+                except Exception:
+                    pass
+
+            # Get total trade count (orders + positions)
+            total_trades_final = total_trades or total_signals or 0
+
+            return {
+                "code": 0,
+                "data": {
+                    "total_trades": total_trades_final,
+                    "total_signals": total_signals,
+                    "total_profit": round(total_profit, 2),
+                    "win_rate": round(win_rate, 2),
+                    "profit_factor": round(profit_factor, 2),
+                    "max_drawdown": round(max_drawdown, 2),
+                    "avg_profit": round(avg_win, 2),
+                    "avg_loss": round(avg_loss, 2),
+                    "sharpe_ratio": round(sharpe_ratio, 2),
+                    "days": days,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "symbol": symbol or "ALL",
+                },
+                "message": "ok",
+            }
+        except Exception as exc:
+            logger.error("Dashboard statistics failed: %s", exc)
+            return {"code": "WB_DB_001", "data": None, "message": str(exc)}
+
+    # ── Symbol Comparison ───────────────────────
+
+    @router.get("/symbols-compare")
+    async def symbols_compare(
+        request: Request,
+        days: int = Query(7, ge=1, le=90),
+    ):
+        """Compare performance across symbols.
+
+        Args:
+            days: Lookback period.
+        """
+        if db_pool is None or not db_pool.is_initialized:
+            return {"code": "SYS_DB_001", "data": None, "message": "Database not available"}
+
+        try:
+            rows = await db_pool.fetch(
+                """SELECT symbol,
+                          COUNT(*) as total_trades,
+                          COUNT(*) FILTER (WHERE profit > 0) as wins,
+                          COUNT(*) FILTER (WHERE profit < 0) as losses,
+                          SUM(profit) as total_profit,
+                          AVG(profit) as avg_profit_per_trade,
+                          AVG(lot) as avg_lot,
+                          SUM(commission) as total_commission
+                   FROM hcm_trading.orders
+                   WHERE close_time >= now() - make_interval(days => $1)
+                     AND close_time IS NOT NULL
+                   GROUP BY symbol
+                   ORDER BY total_profit DESC""",
+                days,
+            )
+
+            comparison = []
+            for r in rows:
+                total = r["total_trades"]
+                wins = r["wins"]
+                comparison.append({
+                    "symbol": r["symbol"],
+                    "total_trades": total,
+                    "wins": wins,
+                    "losses": r["losses"],
+                    "win_rate": round(wins / total * 100, 2) if total > 0 else 0,
+                    "total_profit": round(float(r["total_profit"] or 0), 2),
+                    "avg_profit_per_trade": round(float(r["avg_profit_per_trade"] or 0), 2),
+                    "avg_lot": round(float(r["avg_lot"] or 0), 2),
+                    "total_commission": round(float(r["total_commission"] or 0), 2),
+                })
+
+            return {
+                "code": 0,
+                "data": {
+                    "symbols": comparison,
+                    "days": days,
+                },
+                "message": "ok",
+            }
+
+        except Exception as exc:
+            logger.error("Dashboard symbols compare failed: %s", exc)
+            return {"code": "WB_DB_001", "data": None, "message": str(exc)}
+
+    # ── External Factor Status ──────────────────
+
+    @router.get("/external-factors")
+    async def external_factors(request: Request):
+        """Get current external factor status from Redis cache.
+
+        Returns latest macro, sentiment, event, and liquidity data
+        from Redis cached snapshots.
+        """
+        result: dict[str, Any] = {
+            "macro": {},
+            "sentiment": {},
+            "event": {},
+            "liquidity": {},
+        }
+
+        # Try Redis cache for each factor type
+        if redis_client is not None and redis_client.is_initialized:
+            try:
+                for category in ("metals", "crypto", "forex"):
+                    import json
+                    # Macro
+                    macro_raw = await redis_client.get(f"macro:latest:{category}")
+                    if macro_raw:
+                        result["macro"][category] = json.loads(macro_raw) if isinstance(macro_raw, str) else macro_raw
+
+                    # Sentiment
+                    sent_raw = await redis_client.get(f"sentiment:latest:{category}")
+                    if sent_raw:
+                        result["sentiment"][category] = json.loads(sent_raw) if isinstance(sent_raw, str) else sent_raw
+
+                # Event
+                event_raw = await redis_client.get("event:active")
+                if event_raw:
+                    result["event"] = json.loads(event_raw) if isinstance(event_raw, str) else event_raw
+
+                # Liquidity
+                liq_raw = await redis_client.get("liquidity:current")
+                if liq_raw:
+                    result["liquidity"] = json.loads(liq_raw) if isinstance(liq_raw, str) else liq_raw
+
+            except Exception as exc:
+                logger.warning("Redis external factors read failed: %s", exc)
+
+        # Fallback to PG if Redis is empty
+        if not result["macro"] and db_pool is not None and db_pool.is_initialized:
+            try:
+                for category in ("metals", "crypto", "forex"):
+                    macro_row = await db_pool.fetchrow(
+                        """SELECT macro_risk_score, macro_bias, ai_summary
+                           FROM hcm_market.macro_snapshots
+                           WHERE category = $1
+                           ORDER BY snapshot_time DESC LIMIT 1""",
+                        category,
+                    )
+                    if macro_row:
+                        result["macro"][category] = {
+                            "score": macro_row["macro_risk_score"],
+                            "bias": macro_row["macro_bias"],
+                            "summary": macro_row["ai_summary"],
+                        }
+
+                    sent_row = await db_pool.fetchrow(
+                        """SELECT sentiment_risk_score, sentiment_bias, ai_summary
+                           FROM hcm_market.sentiment_snapshots
+                           WHERE category = $1
+                           ORDER BY snapshot_time DESC LIMIT 1""",
+                        category,
+                    )
+                    if sent_row:
+                        result["sentiment"][category] = {
+                            "score": sent_row["sentiment_risk_score"],
+                            "bias": sent_row["sentiment_bias"],
+                            "summary": sent_row["ai_summary"],
+                        }
+            except Exception as exc:
+                logger.warning("PG external factors fallback failed: %s", exc)
+
+        return {"code": 0, "data": result, "message": "ok"}
+
+    # ── Realtime Signal Stream ──────────────────
+
+    @router.get("/realtime")
+    async def realtime_stream(
+        request: Request,
+        symbol: str = Query(default="XAUUSD"),
+        timeframe: str = Query(default="M5"),
+    ):
+        """Get real-time signal stream data for the dashboard.
+
+        Returns latest signals, current kline, and open positions
+        for the specified symbol and timeframe.
+        """
+        result: dict[str, Any] = {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "signals": [],
+            "latest_kline": None,
+            "positions": [],
+        }
+
+        if db_pool is None or not db_pool.is_initialized:
+            return {"code": 0, "data": result, "message": "ok"}
+
+        # Query latest kline
+        try:
+            kline_row = await db_pool.fetchrow(
+                """SELECT open_time, open, high, low, close, tick_volume
+                   FROM hcm_market.klines
+                   WHERE symbol=$1 AND time_frame=$2
+                   ORDER BY open_time DESC LIMIT 1""",
+                symbol, timeframe,
+            )
+            if kline_row:
+                result["latest_kline"] = {
+                    "open_time": kline_row["open_time"].isoformat() if kline_row["open_time"] else None,
+                    "open": float(kline_row["open"]) if kline_row["open"] else 0,
+                    "high": float(kline_row["high"]) if kline_row["high"] else 0,
+                    "low": float(kline_row["low"]) if kline_row["low"] else 0,
+                    "close": float(kline_row["close"]) if kline_row["close"] else 0,
+                    "tick_volume": kline_row.get("tick_volume", 0),
+                }
+        except Exception as exc:
+            logger.warning("Realtime kline query failed: %s", exc)
+
+        # Query latest signals
+        try:
+            signal_rows = await db_pool.fetch(
+                """SELECT signal_id, account_id, symbol, time_frame, signal_dir,
+                          entry_price, sl_price, tp1, tp2, lot, confidence,
+                          signal_status, regime, pre_score, reason, created_at
+                   FROM hcm_signal.signals
+                   WHERE symbol=$1 AND time_frame=$2
+                   ORDER BY created_at DESC LIMIT 10""",
+                symbol, timeframe,
+            )
+            for row in signal_rows:
+                result["signals"].append({
+                    "signal_id": row["signal_id"],
+                    "account_id": row["account_id"],
+                    "symbol": row["symbol"],
+                    "time_frame": row["time_frame"],
+                    "signal_dir": row["signal_dir"],
+                    "entry_price": float(row["entry_price"]) if row["entry_price"] else 0,
+                    "sl_price": float(row["sl_price"]) if row["sl_price"] else None,
+                    "tp1": float(row["tp1"]) if row["tp1"] else None,
+                    "tp2": float(row["tp2"]) if row["tp2"] else None,
+                    "lot": float(row["lot"]) if row["lot"] else 0.01,
+                    "confidence": float(row["confidence"]) if row["confidence"] else 0,
+                    "signal_status": row["signal_status"],
+                    "regime": row["regime"] or "NEUTRAL",
+                    "pre_score": float(row["pre_score"]) if row["pre_score"] else 0,
+                    "reason": row["reason"] or "",
+                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                })
+        except Exception as exc:
+            logger.warning("Realtime signals query failed: %s", exc)
+
+        # Query open positions
+        try:
+            pos_rows = await db_pool.fetch(
+                """SELECT position_id, account_id, symbol, direction,
+                          entry_price, current_price, lot, floating_pnl,
+                          realized_pnl, status, opened_at
+                   FROM hcm_trading.positions
+                   WHERE symbol=$1 AND status='open'
+                   ORDER BY opened_at DESC LIMIT 20""",
+                symbol,
+            )
+            for row in pos_rows:
+                result["positions"].append({
+                    "position_id": row["position_id"],
+                    "account_id": row["account_id"],
+                    "symbol": row["symbol"],
+                    "direction": row["direction"],
+                    "entry_price": float(row["entry_price"]) if row["entry_price"] else 0,
+                    "current_price": float(row["current_price"]) if row.get("current_price") else 0,
+                    "lot": float(row["lot"]) if row["lot"] else 0,
+                    "floating_pnl": float(row["floating_pnl"]) if row.get("floating_pnl") else 0,
+                    "realized_pnl": float(row["realized_pnl"]) if row.get("realized_pnl") else 0,
+                    "status": row["status"],
+                    "opened_at": row["opened_at"].isoformat() if row["opened_at"] else None,
+                })
+        except Exception:
+            pass
+
+        return {"code": 0, "data": result, "message": "ok"}
+
+    # ── Signal Gauges ───────────────────────────
+
+    @router.get("/signal-gauges")
+    async def signal_gauges(
+        request: Request,
+        symbol: str = Query(default="XAUUSD"),
+    ):
+        """Get 8-factor signal gauge data for the dashboard.
+
+        Computes RSI, MACD, STOCH, BOLL, MA5, MA20, CCI, ATR
+        from the most recent M5 klines and maps each to
+        long/neutral/short percentage scores.
+
+        Args:
+            symbol: Trading symbol, e.g. "XAUUSD".
+        """
+        try:
+            engine = _get_signal_gauge_engine()
+            result = await engine.compute_all(symbol, db_pool)
+            return {"code": 0, "data": result, "message": "ok"}
+        except Exception as exc:
+            logger.error("Signal gauges computation failed for %s: %s", symbol, exc)
+            return {"code": "WB_DB_001", "data": None, "message": str(exc)}
+
+    # ── Legacy path aliases ──────────────────────
+
+    # Create a second router for legacy paths (no /v1 prefix)
+    legacy_router = APIRouter(tags=["dashboard-legacy"], include_in_schema=False)
+
+    @legacy_router.get("/api/dashboard/realtime")
+    async def _legacy_realtime(request: Request, symbol: str = Query("XAUUSD"), timeframe: str = Query("M5")):
+        """[Legacy] alias for /api/v1/dashboard/realtime."""
+        return await realtime_stream(request, symbol, timeframe)
+
+    @legacy_router.get("/api/dashboard/signal-gauges")
+    async def _legacy_signal_gauges(request: Request, symbol: str = Query("XAUUSD")):
+        """[Legacy] alias for /api/v1/dashboard/signal-gauges."""
+        return await signal_gauges(request, symbol)
+
+    # --- P0 修复：新增 Legacy aliases ---
+
+    @legacy_router.get("/api/dashboard/statistics")
+    async def _legacy_statistics(
+        request: Request,
+        symbol: str = Query("XAUUSD"),
+        timeframe: str = Query("D1"),
+        indicator: str = Query("returns"),
+        lookback: int = Query(90),
+    ):
+        """[Legacy] alias for /api/v1/dashboard/statistics."""
+        return await statistics_summary(request, symbol=symbol, days=lookback)
+
+    @legacy_router.get("/api/dashboard/symbols-compare")
+    async def _legacy_symbols_compare(request: Request):
+        """[Legacy] alias for /api/v1/dashboard/symbols-compare."""
+        return await symbols_compare(request)
+
+    @legacy_router.get("/api/dashboard/compare")
+    async def _legacy_compare(request: Request):
+        """[Legacy] alias: routes /api/dashboard/compare → /api/v1/dashboard/symbols-compare."""
+        return await symbols_compare(request)
+
+    # --- equity-curve stub (P0 修复：前端需要此端点，当前返回空数据兜底) ---
+
+    @router.get("/equity-curve")
+    async def equity_curve_stub(request: Request, symbol: str = Query("XAUUSD")):
+        """[待实现] 权益曲线端点——当前返回空数据兜底，防止前端 404 崩溃。"""
+        return {"code": 0, "data": {"symbol": symbol, "curve": [], "message": "待实现"}, "message": "ok"}
+
+    return router, legacy_router

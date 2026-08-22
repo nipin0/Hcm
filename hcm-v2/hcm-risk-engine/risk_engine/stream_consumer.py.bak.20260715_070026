@@ -1,0 +1,570 @@
+"""Risk Engine Stream Consumer — Redis Stream XREADGROUP consumer.
+
+Consumes from signal:stream using the risk-engine-group consumer group.
+Features:
+- XGROUP CREATE on startup (idempotent)
+- Pending message recovery (unacknowledged from previous crashes)
+- ACK on successful processing
+- Dead letter queue on persistent failure (3 retries)
+- Graceful shutdown with inflight message drain
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from shared.redis_client import RedisClient, StreamMessage, validate_safety_config, CRITICAL_SAFETY_KEYS
+from shared.errors import ErrorCode, HcmError
+
+logger = logging.getLogger(__name__)
+
+# ── Constants ──────────────────────────────────
+
+SIGNAL_STREAM = "signal:stream"
+RISK_PASSED_STREAM = "signal:risk_passed"
+DEAD_LETTER_STREAM = "signal:dead"
+GROUP_NAME = "risk-engine-group"
+DEFAULT_CONSUMER_NAME = "risk-consumer-1"
+DEFAULT_BLOCK_MS = 5000
+DEFAULT_RETRY_MAX = 3
+DEFAULT_RETRY_DELAY = 0.5
+
+
+@dataclass
+class RiskConsumerConfig:
+    """Configuration for the risk engine stream consumer."""
+    group_name: str = GROUP_NAME
+    consumer_name: str = DEFAULT_CONSUMER_NAME
+    signal_stream: str = SIGNAL_STREAM
+    risk_passed_stream: str = RISK_PASSED_STREAM
+    dead_stream: str = DEAD_LETTER_STREAM
+    block_ms: int = DEFAULT_BLOCK_MS
+    retry_max: int = DEFAULT_RETRY_MAX
+    retry_delay: float = DEFAULT_RETRY_DELAY
+
+
+class RiskStreamConsumer:
+    """Redis Stream consumer that reads trading signals and feeds them
+    into the risk rule chain.
+
+    Operates as part of the risk-engine-group consumer group on
+    signal:stream. Each message is processed through the rule chain
+    and either published to signal:risk_passed (PASS/DEGRADE) or
+    blocked (REJECT — recorded and discarded).
+
+    Example:
+        consumer = RiskStreamConsumer(
+            redis_client=redis_client,
+            rule_chain=rule_chain,
+            decision_engine=decision_engine,
+        )
+        await consumer.start()
+    """
+
+    def __init__(
+        self,
+        redis_client: RedisClient,
+        rule_chain: Any = None,
+        decision_engine: Any = None,
+        config: Optional[RiskConsumerConfig] = None,
+        db_pool: Any = None,
+    ):
+        """Initialize RiskStreamConsumer.
+
+        Args:
+            redis_client: Initialized RedisClient instance.
+            rule_chain: RuleChain instance for signal validation.
+            decision_engine: DecisionEngine instance for PASS/REJECT/DEGRADE.
+            config: Optional consumer configuration.
+            db_pool: DatabasePool for updating signal status.
+        """
+        self._redis = redis_client
+        self._rule_chain = rule_chain
+        self._decision = decision_engine
+        self._config = config or RiskConsumerConfig()
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+        self._db = db_pool
+
+        # Statistics
+        self._stats: dict[str, int] = {
+            "messages_consumed": 0,
+            "messages_passed": 0,
+            "messages_rejected": 0,
+            "messages_degraded": 0,
+            "messages_dead_letter": 0,
+            "messages_ack_failed": 0,
+        }
+
+    async def _apply_dynamic_lot(self, signal_data: dict) -> None:
+        """Compute dynamic lot size based on confidence (config-driven, no hardcode)."""
+        try:
+            if self._redis is None:
+                return
+
+            async def get(key: str, default: float) -> float:
+                try:
+                    v = await self._redis.hget("hcm:config:v2", key)
+                    return float(v) if v is not None else default
+                except Exception:
+                    return default
+
+            base = await get("risk.lot_base", 0.01)
+            score = float(signal_data.get("confidence", 0.0))
+            high_threshold = await get("risk.score_tier_high", 0.85)
+            mid_threshold = await get("risk.score_tier_mid", 0.65)
+            low_threshold = await get("risk.score_tier_low", 0.50)
+            mult_high = await get("risk.lot_multiplier_high", 2.0)
+            mult_mid = await get("risk.lot_multiplier_mid", 1.0)
+            mult_low = await get("risk.lot_multiplier_low", 0.5)
+
+            if score >= high_threshold:
+                multiplier = mult_high
+                tier = "high"
+            elif score >= mid_threshold:
+                multiplier = mult_mid
+                tier = "mid"
+            elif score >= low_threshold:
+                multiplier = mult_low
+                tier = "low"
+            else:
+                multiplier = 0.0
+                tier = "none"
+
+            new_lot = round(base * multiplier, 4) if multiplier > 0 else 0.0
+            old_lot = float(signal_data.get("lot", 0.0))
+            if new_lot != old_lot:
+                signal_data["lot"] = new_lot
+                logger.info(
+                    "Dynamic lot: signal_id=%s score=%.2f → tier=%s, lot=%.4f (was %.4f)",
+                    signal_data.get("signal_id", 0), score, tier, new_lot, old_lot,
+                )
+        except Exception as exc:
+            logger.warning("Dynamic lot calc failed: %s (keeping original lot)", exc)
+
+    # ── Lifecycle ───────────────────────────────
+
+    async def start(self) -> None:
+        """Start the consumer loop as a background task."""
+        if self._running:
+            return
+
+        # Ensure consumer group exists.
+        # start_id="0" means: if the group is being created for the first
+        # time, start consuming from the very first message in the stream.
+        # This guarantees no signal is missed even if signals were published
+        # before the risk engine came online.  On subsequent restarts the
+        # group already exists (BUSYGROUP) and start_id is ignored — the
+        # group continues from its last delivered position.
+        await self._redis.xgroup_create(
+            self._config.signal_stream,
+            self._config.group_name,
+            mkstream=True,
+            start_id="$",
+        )
+
+        # Also create group for risk_passed stream (for future consumers)
+        await self._redis.xgroup_create(
+            self._config.risk_passed_stream,
+            "dispatcher-group",
+            mkstream=True,
+            start_id="$",
+        )
+        await self._redis.xgroup_create(
+            self._config.risk_passed_stream,
+            "copy-trading-group",
+            mkstream=True,
+            start_id="$",
+        )
+
+        # ── Safety Rail: validate critical config values ──
+        try:
+            config_hash = await self._redis.hgetall("hcm:config:v2")
+            ok, errors = validate_safety_config(config_hash)
+            if not ok:
+                for e in errors:
+                    logger.critical("SAFETY FAIL: %s", e)
+                logger.critical("Aborting startup — safety config validation failed")
+                return
+            logger.info("Safety config validated: %d keys OK", len(CRITICAL_SAFETY_KEYS))
+        except Exception as exc:
+            logger.critical("Safety validation failed: %s — aborting startup", exc)
+            return
+
+        self._running = True
+        self._task = asyncio.create_task(self._consume_loop())
+        logger.info(
+            "RiskStreamConsumer started: group=%s, stream=%s",
+            self._config.group_name, self._config.signal_stream,
+        )
+
+    async def stop(self) -> None:
+        """Gracefully stop the consumer loop."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        logger.info("RiskStreamConsumer stopped (stats=%s)", self._stats)
+
+    # ── Main Loop ───────────────────────────────
+
+    async def _consume_loop(self) -> None:
+        """Main consumption loop: XREADGROUP → validate → decide → ACK."""
+        logger.info(
+            "RiskStreamConsumer loop started: consumer=%s",
+            self._config.consumer_name,
+        )
+
+        # 1. Recover pending messages first
+        await self._recover_pending()
+
+        # 2. Main consumption loop
+        while self._running:
+            try:
+                messages = await self._redis.xreadgroup(
+                    group=self._config.group_name,
+                    consumer=self._config.consumer_name,
+                    streams={self._config.signal_stream: ">"},
+                    count=1,
+                    block=self._config.block_ms,
+                )
+
+                for msg in messages:
+                    await self._process_message(msg)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error("RiskStreamConsumer loop error: %s", exc)
+                await asyncio.sleep(1.0)
+
+        logger.info("RiskStreamConsumer loop ended")
+
+    # ── Message Processing ──────────────────────
+
+    async def _process_message(self, msg: StreamMessage) -> None:
+        """Process a single stream message through the risk pipeline.
+
+        Args:
+            msg: StreamMessage from Redis Stream.
+        """
+        self._stats["messages_consumed"] += 1
+        trace_id = msg.data.get("trace_id", "")
+        symbol = msg.data.get("symbol", "?")
+        signal_id = msg.data.get("signal_id", 0)
+        t0 = time.time()
+
+        logger.debug(
+            "Risk processing: signal_id=%s, symbol=%s, msg_id=%s",
+            signal_id, symbol, msg.message_id,
+        )
+
+        success = False
+        last_error: Optional[str] = None
+
+        for attempt in range(1, self._config.retry_max + 1):
+            try:
+                # Run rule chain
+                if self._rule_chain is not None:
+                    rule_result = await self._rule_chain.evaluate(msg.data)
+                else:
+                    # Default: pass all if no rule chain configured
+                    from risk_engine.rule_chain import RuleChainResult
+                    rule_result = RuleChainResult(passed=True)
+
+                # Make decision — DecisionEngine expects RuleChainResult
+                if self._decision is not None:
+                    decision = await self._decision.decide(msg.data, rule_result)
+                else:
+                    decision = "PASS"
+
+                # ── Dynamic lot sizing (config-driven, no hardcode) ──
+                await self._apply_dynamic_lot(msg.data)
+
+                # Handle decision
+                if decision == "REJECT":
+                    self._stats["messages_rejected"] += 1
+                    logger.info(
+                        "Signal REJECTED: signal_id=%s, symbol=%s, rules=%s",
+                        signal_id, symbol, rule_result.rejected_rules,
+                    )
+                    await self._update_signal_status(signal_id, 2, decision)
+                elif decision == "DEGRADE":
+                    self._stats["messages_degraded"] += 1
+                    # Publish degraded signal to risk_passed
+                    await self._publish_risk_passed(msg.data, decision, rule_result)
+                    await self._update_signal_status(signal_id, 1, decision)
+                else:  # PASS
+                    self._stats["messages_passed"] += 1
+                    logger.info(
+                        "Signal PASSED: signal_id=%s, symbol=%s, direction=%s, score=%.3f, rules=%s",
+                        signal_id, symbol,
+                        msg.data.get("direction", "?"),
+                        float(msg.data.get("pre_score", 0)),
+                        ", ".join(r.rule_name for r in rule_result.results if r.passed)
+                        if rule_result and rule_result.results else "n/a",
+                    )
+                    await self._publish_risk_passed(msg.data, decision, rule_result)
+                    await self._update_signal_status(signal_id, 1, decision)
+
+                success = True
+                break
+
+            except HcmError as exc:
+                last_error = f"[{exc.code.value}] {exc.message}"
+                logger.warning(
+                    "Risk processing attempt %d/%d failed (signal_id=%s): %s",
+                    attempt, self._config.retry_max, signal_id, exc,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                logger.warning(
+                    "Risk processing attempt %d/%d failed (signal_id=%s): %s",
+                    attempt, self._config.retry_max, signal_id, exc,
+                )
+
+            if attempt < self._config.retry_max:
+                await asyncio.sleep(self._config.retry_delay * attempt)
+
+        # ACK or dead letter
+        if success:
+            acked = await self._redis.xack(
+                self._config.signal_stream,
+                self._config.group_name,
+                msg.message_id,
+            )
+            if acked == 0:
+                self._stats["messages_ack_failed"] += 1
+                logger.warning("ACK returned 0 for msg_id=%s", msg.message_id)
+        else:
+            # Move to dead letter queue
+            self._stats["messages_dead_letter"] += 1
+            await self._send_to_dead_letter(msg, last_error or "unknown error")
+            # Still ACK so we don't reprocess indefinitely
+            await self._redis.xack(
+                self._config.signal_stream,
+                self._config.group_name,
+                msg.message_id,
+            )
+
+        latency_ms = int((time.time() - t0) * 1000)
+        logger.debug(
+            "Risk processing done: signal_id=%s, latency=%dms, success=%s",
+            signal_id, latency_ms, success,
+        )
+
+    # ── Risk Passed Publishing ──────────────────
+
+    async def _publish_risk_passed(
+        self,
+        signal_data: dict,
+        decision: str,
+        rule_result: Any,
+    ) -> Optional[str]:
+        """Publish a risk-passed signal to signal:risk_passed stream.
+
+        Args:
+            signal_data: Original signal data from signal:stream.
+            decision: PASS or DEGRADE.
+            rule_result: Rule chain evaluation result.
+
+        Returns:
+            Message ID of the published message, or None on failure.
+        """
+        risk_passed_data = {
+            "event": "risk_check_passed" if decision == "PASS" else "risk_check_degraded",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "signal_id": signal_data.get("signal_id", 0),
+            "task_id": signal_data.get("task_id", 0),
+            "account_id": signal_data.get("account_id", 0),
+            "symbol": signal_data.get("symbol", ""),
+            "time_frame": signal_data.get("time_frame", "M5"),
+            "direction": signal_data.get("direction", ""),
+            "entry_price": signal_data.get("entry_price", 0.0),
+            "sl_price": signal_data.get("sl_price", 0.0),
+            "tp1": signal_data.get("tp1", 0.0),
+            "tp2": signal_data.get("tp2", 0.0),
+            "lot": signal_data.get("lot", 0.0),
+            "confidence": signal_data.get("confidence", 0.0),
+            "decision": decision,
+            "passed_rules": json.dumps(
+                [r.rule_name for r in rule_result.results if r.passed]
+            ) if rule_result.results else "[]",
+            "rejected_rules": json.dumps(rule_result.rejected_rules),
+            "violations": json.dumps(rule_result.violations),
+            "trace_id": signal_data.get("trace_id", ""),
+        }
+
+        try:
+            msg_id = await self._redis.xadd(
+                self._config.risk_passed_stream,
+                risk_passed_data,
+            )
+            if msg_id:
+                logger.debug(
+                    "Risk passed published: signal_id=%s, decision=%s → %s",
+                    signal_data.get("signal_id"), decision, msg_id,
+                )
+            return msg_id
+        except Exception as exc:
+            logger.error(
+                "Failed to publish risk_passed for signal_id=%s: %s",
+                signal_data.get("signal_id"), exc,
+            )
+            return None
+
+    # ── Dead Letter ─────────────────────────────
+
+    async def _send_to_dead_letter(
+        self,
+        msg: StreamMessage,
+        error: str,
+    ) -> None:
+        """Send a failed message to the dead letter queue.
+
+        Args:
+            msg: Original StreamMessage that failed.
+            error: Error description.
+        """
+        dead_data = {
+            "original_signal_id": msg.data.get("signal_id", 0),
+            "symbol": msg.data.get("symbol", "?"),
+            "direction": msg.data.get("direction", "?"),
+            "failed_consumer": self._config.group_name,
+            "error": error,
+            "retry_count": self._config.retry_max,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "original_stream": msg.stream,
+            "original_payload": json.dumps(msg.data, default=str),
+        }
+
+        try:
+            await self._redis.xadd(self._config.dead_stream, dead_data)
+            logger.error(
+                "Signal dead letter: signal_id=%s, error=%s → %s",
+                dead_data["original_signal_id"], error, self._config.dead_stream,
+            )
+        except Exception as exc:
+            logger.critical(
+                "CRITICAL: Cannot write to dead letter queue (signal_id=%s): %s",
+                dead_data["original_signal_id"], exc,
+            )
+
+    # ── Pending Recovery ────────────────────────
+
+    async def _recover_pending(self) -> None:
+        """Recover and reprocess pending (unacknowledged) messages from
+        the previous session's crash or disconnection."""
+        try:
+            pending_count = await self._redis.xpending(
+                self._config.signal_stream,
+                self._config.group_name,
+            )
+            if pending_count == 0:
+                return
+
+            logger.warning(
+                "Found %d pending messages in group=%s — recovering",
+                pending_count, self._config.group_name,
+            )
+
+            # Read pending messages using "0" (beginning of pending list)
+            messages = await self._redis.xreadgroup(
+                group=self._config.group_name,
+                consumer=self._config.consumer_name,
+                streams={self._config.signal_stream: "0"},
+                count=min(pending_count, 50),
+                block=1000,
+            )
+
+            for msg in messages:
+                logger.info(
+                    "Recovering pending message: signal_id=%s, msg_id=%s",
+                    msg.data.get("signal_id"), msg.message_id,
+                )
+                await self._process_message(msg)
+
+            # Check remaining
+            remaining = await self._redis.xpending(
+                self._config.signal_stream,
+                self._config.group_name,
+            )
+            if remaining > 0:
+                logger.warning(
+                    "%d pending messages still remain after recovery", remaining,
+                )
+            else:
+                logger.info("All pending messages recovered")
+
+        except Exception as exc:
+            logger.error("Pending message recovery failed: %s", exc)
+
+    # ── Stats & Health ──────────────────────────
+
+    def get_stats(self) -> dict:
+        """Get consumer statistics.
+
+        Returns:
+            Dict with consumption counts.
+        """
+        return dict(self._stats)
+
+    async def _update_signal_status(self, signal_id: int, status: int, decision: str = "") -> None:
+        """Update signal_status in PostgreSQL.
+
+        Args:
+            signal_id: Signal identifier.
+            status: 1=PASS, 2=REJECT.
+            decision: Decision string for logging.
+        """
+        if self._db is None or not self._db.is_initialized:
+            return
+        try:
+            await self._db.execute(
+                "UPDATE hcm_signal.signals SET signal_status=$1, updated_at=now() WHERE signal_id=$2",
+                status, signal_id,
+            )
+            logger.debug("Signal status updated: signal_id=%s, status=%s", signal_id, status)
+        except Exception as exc:
+            logger.warning("Failed to update signal_status: signal_id=%s: %s", signal_id, exc)
+
+    async def health_check(self) -> dict:
+        """Check consumer health.
+
+        Returns:
+            Dict with status and stats.
+        """
+        redis_ok = False
+        if self._redis.is_initialized:
+            try:
+                redis_ok = await self._redis.ping()
+            except Exception:
+                pass
+
+        pending = 0
+        if redis_ok:
+            try:
+                pending = await self._redis.xpending(
+                    self._config.signal_stream,
+                    self._config.group_name,
+                )
+            except Exception:
+                pass
+
+        return {
+            "status": "healthy" if redis_ok and self._running else "degraded",
+            "redis_ok": redis_ok,
+            "running": self._running,
+            "pending_messages": pending,
+            "stats": self.get_stats(),
+        }

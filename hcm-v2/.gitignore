@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+*.local
+
+# Docker
+pgdata/
+redisdata/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Frontend
+node_modules/
+hcm-web/frontend/dist/
+hcm-web/frontend/.vite/
+
+# Logs
+*.log
+logs/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+
+# Test
+.pytest_cache/

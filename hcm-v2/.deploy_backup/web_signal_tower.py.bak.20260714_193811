@@ -1,0 +1,1248 @@
+"""Signal Tower API — Cooldown config, dual-mode switching, symbol-level config, prompt, watchdog.
+
+Provides:
+- GET /api/v1/signal-tower/cooldown — Cooldown config (global + per-symbol overrides)
+- PUT /api/v1/signal-tower/cooldown — Batch update cooldown config
+- GET /api/v1/signal-tower/cooldown/status — Current cooldown status (per symbol)
+- GET /api/v1/signal-tower/mode — Current mode (AI dynamic / manual)
+- PUT /api/v1/signal-tower/mode — Switch mode and set manual_regime_score
+- GET /api/v1/signal-tower/symbol-config — Symbol-level tower config list
+- PUT /api/v1/signal-tower/symbol-config — Batch update symbol-level tower config
+- GET /api/v1/signal-tower/prompt — Prompt configuration (9 fields)
+- PUT /api/v1/signal-tower/prompt — Update prompt configuration
+- GET /api/v1/signal-tower/watchdog — Watchdog status and services
+- POST /api/v1/signal-tower/watchdog/{action} — Watchdog pause/resume/restart
+- Legacy aliases: /api/signal-tower/threshold, /mode, /symbol-config, /prompt, /watchdog
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+# ── Constants ───────────────────────────────────
+
+# Cooldown config keys and their defaults (stored in hcm_config.metadata)
+COOLDOWN_CONFIG_DEFAULTS: dict[str, Any] = {
+    # ── Cooldown (regime-specific seconds) ──
+    "pretrend_cooldown_seconds": 180,
+    "trend_cooldown_seconds": 120,
+    "trend_same_dir_bypass_score": 0.60,
+    "trend_same_dir_mid_cooldown": 60,
+    "trend_reverse_cooldown_seconds": 300,
+    "fade_cooldown_seconds": 300,
+    "range_boundary_cooldown_seconds": 0,
+    "neutral_cooldown_seconds": 300,
+    # ── Score tower entry thresholds (0-100 scale, used by score tower engine) ──
+    "pretrend_threshold": 70,
+    "trend_threshold": 70,
+    "fade_threshold": 30,
+    # ── Scoring engine config (must match scoring_engine.py keys exactly) ──
+    "score_threshold": 0.50,
+    "scoring.pretrend_threshold_floor": 0.42,
+    "scoring.fade_threshold_ceiling": 0.78,
+    "scoring.range_threshold_floor": 0.40,
+    "scoring.neutral_threshold_offset": 0.10,
+    "scoring.trend_strong_adx_threshold": 28,
+    "scoring.trend_strong_threshold_offset": -0.05,
+    "scoring.pretrend_threshold_offset": -0.08,
+    "scoring.fade_threshold_offset": 0.08,
+    "scoring.range_threshold_offset": -0.10,
+    "scoring.neutral_threshold_ceiling": 0.80,
+}
+
+COOLDOWN_CONFIG_KEYS: list[str] = list(COOLDOWN_CONFIG_DEFAULTS.keys())
+
+# Threshold panel config keys & defaults — MUST match frontend buildFields() in
+# hcm-web/frontend/src/pages/signaltower/Threshold.tsx (4 groups: cooldown /
+# scoring thresholds / midbar early-bird / dispute). Stored as their real types
+# so the frontend can parse them directly (numbers stay numeric, bool/str as-is).
+THRESHOLD_CONFIG_DEFAULTS: dict[str, Any] = {
+    # ── ① Cooldown (regime-specific seconds) ──
+    "pretrend_cooldown_seconds": 180,
+    "trend_cooldown_seconds": 120,
+    "fade_cooldown_seconds": 300,
+    "range_boundary_cooldown_seconds": 0,
+    "neutral_cooldown_seconds": 300,
+    # ── ② Scoring thresholds (base + offset + clamp) ──
+    "score_threshold": 0.10,
+    "scoring.pretrend_threshold_floor": 0.45,
+    "scoring.pretrend_threshold_offset": -0.08,
+    "scoring.fade_threshold_ceiling": 0.65,
+    "scoring.fade_threshold_offset": 0.08,
+    "scoring.range_threshold_floor": 0.45,
+    "scoring.range_threshold_offset": -0.10,
+    "scoring.neutral_threshold_offset": 0.05,
+    "scoring.neutral_threshold_ceiling": 0.80,
+    "scoring.trend_strong_adx_threshold": 25,
+    "scoring.trend_strong_threshold_offset": -0.05,
+    # ── ③ Midbar early-bird inference (M5 sub-period) ──
+    "midbar.M5.enabled": True,
+    "midbar.M5.sub_period": "M1",
+    "midbar.M5.inference_bars": "[2,3,4,5]",
+    "midbar.M5.min_confirm_bars": 2,
+    "midbar.M5.liquidity_bidask_max": 0.08,
+    # ── ④ Dispute / AI dispatch ──
+    "scoring.M5.dispute_diff_threshold": 0.05,
+    "scoring.M5.min_score_threshold": 0.15,
+    "scoring.M5.trend_adx_threshold": 22,
+    "scoring.M5.trend_adx_exit_threshold": 18,
+}
+
+# Symbol tower config keys and their defaults
+SYMBOL_TOWER_FIELDS: dict[str, Any] = {
+    "enable": True,
+    "lot_size": 0.01,
+    "max_positions": 3,
+    "stop_loss_pips": 200,
+    "take_profit_pips": 800,
+    "signal_weight": 1.0,
+    "trading_hours": "00:00-23:59",
+    "news_filter": True,
+}
+
+# Prompt config keys. `user_prompt_template` is the only key actually read
+# by the scheduler (via _load_prompt_template → _build_prompt). It supports
+# {variable} interpolation: {symbol} {timeframe} {rsi} {macd} {adx} {bbw}
+# {pct_b} {stoch_k} {atr} {bar_open} {close} {bar_momentum} {ma_alignment}
+# {regime} {regime_strength} {pre_dir} {pre_score} {trend_note} {momentum_note}.
+# If missing or broken, falls back to hardcoded compact prompt.
+PROMPT_CONFIG_FIELDS: dict[str, Any] = {
+    "system_prompt": "XAUUSD M5 quant analyst. Output compact JSON without markdown.",
+    "regime_prompt_template": "Regime: TREND(ADX>24+MACD) PRE_TREND(ADX 18-24) FADE(falling) RANGE(BBW<1)",
+    "signal_prompt_template": "RSI/MACD/ADX/BBW/ATR/bar_momentum → direction+confidence. TREND:align MACD. RANGE:extreme %b.",
+    "risk_prompt_template": "Hard: max_pos>limit→reject. Soft: drawdown>30%→risk=high. Daily loss>limit→kill_switch.",
+    "user_prompt_template": (
+        "XAUUSD {timeframe} | {regime} r={regime_strength}\n"
+        "RSI={rsi} MACD={macd} ADX={adx} %b={pct_b} StochK={stoch_k}\n"
+        "ATR14={atr} bar_open={bar_open} close={close} bar_momentum={bar_momentum} (range/ATR)\n"
+        "MA={ma_alignment} pre_dir={pre_dir} pre_score={pre_score}\n"
+        "{trend_note} {momentum_note}\n"
+        'Output JSON: {{"direction":"BUY|SELL|NO_TRADE","confidence":0-1,'
+        '"sl_atr_mult":1.5-2.5,"tp_atr_mult":2.0-4.0,"reason":"<50chars","risk":"<30chars"}}'
+    ),
+    "max_context_length": 4096,
+    "include_market_data": True,
+    "include_news": True,
+    "include_position_info": True,
+    "prompt_version": "2.1-template",
+}
+
+PROMPT_CONFIG_KEYS: list[str] = list(PROMPT_CONFIG_FIELDS.keys())
+
+# Watchdog default services to monitor
+WATCHDOG_DEFAULT_SERVICES: list[dict[str, str]] = [
+    {"name": "collector", "status": "unknown", "last_heartbeat": None},
+    {"name": "signal-tower", "status": "unknown", "last_heartbeat": None},
+    {"name": "risk-engine", "status": "unknown", "last_heartbeat": None},
+]
+
+
+# ── Pydantic Models ─────────────────────────────
+
+class CooldownConfigItem(BaseModel):
+    """A single cooldown config key-value pair."""
+    config_key: str = Field(..., description="Cooldown config key (e.g. 'pretrend_cooldown_seconds')")
+    value: str = Field(..., description="New value (as string)")
+
+
+class CooldownBatchUpdate(BaseModel):
+    """Batch cooldown config update request."""
+    updates: list[CooldownConfigItem] = Field(..., min_items=1, max_items=100)
+
+
+class CooldownConfigResponse(BaseModel):
+    """Cooldown config response model."""
+    symbol: str = ""
+    config: dict = Field(default_factory=dict)
+
+
+class CooldownStatusResponse(BaseModel):
+    """Cooldown status for a given symbol."""
+    symbol: str = ""
+    last_signal_at: Optional[str] = None
+    seconds_since_last_signal: Optional[int] = None
+    remaining_cooldown_seconds: int = 0
+    current_regime: str = "NEUTRAL"
+    is_cooling_down: bool = False
+
+
+class SignalTowerModeUpdate(BaseModel):
+    """Mode switch request body."""
+    mode: str = Field("ai_dynamic", description="'ai_dynamic' or 'manual'")
+    manual_regime_score: int = Field(50, ge=0, le=100, description="0-100, only used in manual mode")
+
+
+class SignalTowerModeResponse(BaseModel):
+    """Signal tower mode response (per symbol)."""
+    symbol: str = ""
+    mode: str = "ai_dynamic"
+    ai_dynamic: bool = True
+    manual_score: int = 50
+    current_regime: Optional[str] = None
+    regime_confidence: Optional[float] = None
+    ai_score: Optional[int] = None
+    last_updated: Optional[str] = None
+    indicators: dict = Field(default_factory=dict)
+
+
+class SymbolTowerConfigItem(BaseModel):
+    """Symbol-level tower config for a single field update."""
+    symbol: str = Field(..., description="Trading symbol, e.g. 'XAUUSD'")
+    enable: Optional[bool] = None
+    lot_size: Optional[float] = None
+    max_positions: Optional[int] = None
+    stop_loss_pips: Optional[int] = None
+    take_profit_pips: Optional[int] = None
+    signal_weight: Optional[float] = None
+    trading_hours: Optional[str] = None
+    news_filter: Optional[bool] = None
+
+
+class SymbolTowerConfigBatchUpdate(BaseModel):
+    """Batch update for symbol-level tower configs."""
+    symbols: list[SymbolTowerConfigItem] = Field(..., min_items=1, max_items=200)
+
+
+class PromptConfigResponse(BaseModel):
+    """Prompt configuration response model."""
+    system_prompt: str = ""
+    regime_prompt_template: str = ""
+    signal_prompt_template: str = ""
+    risk_prompt_template: str = ""
+    user_prompt_template: str = ""
+    max_context_length: int = 4096
+    include_market_data: bool = True
+    include_news: bool = True
+    include_position_info: bool = True
+    prompt_version: str = "1.0"
+
+
+class PromptConfigUpdate(BaseModel):
+    """Prompt configuration update request."""
+    system_prompt: Optional[str] = None
+    regime_prompt_template: Optional[str] = None
+    signal_prompt_template: Optional[str] = None
+    risk_prompt_template: Optional[str] = None
+    user_prompt_template: Optional[str] = None
+    max_context_length: Optional[int] = None
+    include_market_data: Optional[bool] = None
+    include_news: Optional[bool] = None
+    include_position_info: Optional[bool] = None
+    prompt_version: Optional[str] = None
+
+
+class WatchdogServiceInfo(BaseModel):
+    """Individual service status in watchdog."""
+    name: str = ""
+    status: str = "unknown"
+    last_heartbeat: Optional[str] = None
+
+
+class WatchdogAlertInfo(BaseModel):
+    """Watchdog alert entry."""
+    level: str = "info"
+    message: str = ""
+    time: Optional[str] = None
+
+
+class WatchdogInfoResponse(BaseModel):
+    """Watchdog information response."""
+    status: str = "running"
+    uptime_seconds: int = 0
+    last_check: Optional[str] = None
+    watched_services: list[WatchdogServiceInfo] = Field(default_factory=list)
+    restarts: int = 0
+    alerts: list[WatchdogAlertInfo] = Field(default_factory=list)
+
+
+# ── Helpers ─────────────────────────────────────
+
+def _coerce_value(raw: Any, default: Any, target_type: type = str) -> Any:
+    """Coerce a raw config value to the target type, falling back to default."""
+    if raw is None or raw == "":
+        return default
+    try:
+        if target_type is int:
+            return int(raw)
+        if target_type is float:
+            return float(raw)
+        if target_type is bool:
+            if isinstance(raw, bool):
+                return raw
+            return str(raw).lower() in ("true", "1", "yes", "on")
+        return str(raw)
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_cooldown_value(key: str, raw: Any) -> Any:
+    """Parse a cooldown config value to its proper type."""
+    default = COOLDOWN_CONFIG_DEFAULTS.get(key)
+    if default is None:
+        return str(raw) if raw else ""
+    if isinstance(default, bool):
+        return _coerce_value(raw, default, bool)
+    if isinstance(default, int):
+        return _coerce_value(raw, default, int)
+    if isinstance(default, float):
+        return _coerce_value(raw, default, float)
+    return str(raw) if raw else str(default)
+
+
+# ── Router Factory ──────────────────────────────
+
+def create_signal_tower_router(
+    db_pool: Any = None,
+    config_provider: Any = None,
+    auth_handler: Any = None,
+) -> APIRouter:
+    """Create FastAPI router with signal tower endpoints.
+
+    Args:
+        db_pool: DatabasePool instance (asyncpg wrapper).
+        config_provider: ConfigProviderV3 instance.
+        auth_handler: AuthHandler instance for RBAC authentication.
+
+    Returns:
+        APIRouter with /api/v1/signal-tower routes and legacy /api/signal-tower aliases.
+    """
+    router = APIRouter(tags=["signal-tower"])
+
+    # ═════════════════════════════════════════════
+    # Shared handler implementations
+    # ═════════════════════════════════════════════
+
+    async def _read_cooldown_from_db(symbol: Optional[str] = None) -> dict:
+        """Read cooldown config via ConfigProviderV3 (unified GET path).
+
+        Reads the 8 global cooldown keys with per-symbol override resolution
+        (symbol.{SYMBOL}.{key} → {key}) via get_with_resolution.
+        """
+        config: dict[str, Any] = dict(COOLDOWN_CONFIG_DEFAULTS)
+
+        if config_provider is None:
+            return config
+
+        for key in COOLDOWN_CONFIG_KEYS:
+            try:
+                if symbol:
+                    val = await config_provider.get_with_resolution(key, symbol=symbol)
+                else:
+                    val = await config_provider.get(key)
+                if val:
+                    config[key] = _parse_cooldown_value(key, val)
+            except Exception as exc:
+                logger.warning("Cooldown config read failed for %s: %s", key, exc)
+
+        return config
+
+    async def _get_cooldown_impl(symbol: Optional[str]) -> dict:
+        """Handler: GET cooldown configuration from config_provider (same source as PUT)."""
+        config: dict[str, Any] = dict(COOLDOWN_CONFIG_DEFAULTS)
+        if config_provider is not None:
+            for key in COOLDOWN_CONFIG_KEYS:
+                try:
+                    val = await config_provider.get(key)
+                    if val is not None:
+                        config[key] = _parse_cooldown_value(key, val)
+                except Exception:
+                    pass
+        return {
+            "code": 0,
+            "data": {
+                "symbol": symbol or "*",
+                "config": config,
+            },
+            "message": "ok",
+        }
+
+    async def _get_threshold_impl(symbol: Optional[str]) -> dict:
+        """Handler: GET full Threshold panel config (cooldown + scoring + midbar + dispute).
+
+        Fix for "保存刷新复原": the legacy GET alias previously delegated to
+        _get_cooldown_impl, which only iterated COOLDOWN_CONFIG_KEYS — so the
+        midbar / scoring-threshold / dispute fields were NEVER returned to the
+        frontend. The panel therefore fell back to hardcoded defaults on every
+        refresh, making any save look like it "didn't stick". This returns ALL
+        Threshold.tsx fields, reading each from config_provider (PG source of
+        truth) and falling back to the matching frontend default when unset.
+        """
+        config: dict[str, Any] = {}
+        if config_provider is not None:
+            for key, default in THRESHOLD_CONFIG_DEFAULTS.items():
+                try:
+                    val = await config_provider.get(key)
+                    config[key] = val if val is not None else default
+                except Exception:
+                    config[key] = default
+        else:
+            # Config provider unavailable — return hard-coded defaults so the
+            # panel still renders something sensible.
+            config = dict(THRESHOLD_CONFIG_DEFAULTS)
+        return {
+            "code": 0,
+            "data": {
+                "symbol": symbol or "*",
+                "config": config,
+            },
+            "message": "ok",
+        }
+
+    async def _put_cooldown_impl(body: CooldownBatchUpdate) -> dict:
+        """Handler: PUT cooldown configuration (batch)."""
+        if config_provider is None:
+            return {
+                "code": "SERVICE_NOT_READY",
+                "data": None,
+                "message": "Config provider not available",
+            }
+
+        results: list[dict] = []
+        success_count = 0
+        fail_count = 0
+
+        for item in body.updates:
+            try:
+                ok = await config_provider.set(item.config_key, item.value)
+                if ok:
+                    success_count += 1
+                    results.append({"config_key": item.config_key, "status": "ok"})
+                else:
+                    fail_count += 1
+                    results.append({"config_key": item.config_key, "status": "failed"})
+            except Exception as exc:
+                fail_count += 1
+                results.append({
+                    "config_key": item.config_key,
+                    "status": "error",
+                    "error": str(exc),
+                })
+
+        logger.info(
+            "Cooldown config batch update: %d/%d succeeded",
+            success_count, len(body.updates),
+        )
+
+        return {
+            "code": 0,
+            "data": {
+                "results": results,
+                "success": success_count,
+                "failed": fail_count,
+                "total": len(body.updates),
+            },
+            "message": f"Batch update: {success_count}/{len(body.updates)} succeeded",
+        }
+
+    async def _get_cooldown_status_impl(symbol: str) -> dict:
+        """Handler: GET current cooldown status for a symbol.
+
+        Queries hcm_signal.signals for the latest signal's created_at,
+        then calculates remaining cooldown time based on the current regime.
+        """
+        if db_pool is None or not db_pool.is_initialized:
+            return {"code": "SYS_DB_001", "data": None, "message": "Database not available"}
+
+        try:
+            # ── 1. Get latest signal for this symbol ──
+            signal_row = await db_pool.fetchrow(
+                """SELECT signal_id, symbol, created_at
+                   FROM hcm_signal.signals
+                   WHERE symbol = $1
+                   ORDER BY created_at DESC
+                   LIMIT 1""",
+                symbol,
+            )
+
+            last_signal_at: Optional[str] = None
+            seconds_since_last_signal: Optional[int] = None
+            remaining_cooldown: int = 0
+            is_cooling: bool = False
+
+            if signal_row and signal_row["created_at"]:
+                created: datetime = signal_row["created_at"]
+                # Ensure timezone-aware
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                delta = (now - created).total_seconds()
+                seconds_since_last_signal = max(0, int(delta))
+                last_signal_at = created.isoformat()
+
+            # ── 2. Determine current regime (via config_provider) ──
+            regime = "NEUTRAL"
+            if config_provider is not None:
+                regime_raw = await config_provider.get("signal_tower.current_regime")
+                if regime_raw:
+                    regime = regime_raw.upper()
+
+            # ── 3. Read cooldown config to determine remaining time ──
+            cooldown_config = await _read_cooldown_from_db(symbol)
+
+            # Map regime to cooldown key
+            regime_to_key: dict[str, str] = {
+                "PRETREND": "pretrend_cooldown_seconds",
+                "TREND": "trend_cooldown_seconds",
+                "FADE": "fade_cooldown_seconds",
+                "RANGE_BOUNDARY": "range_boundary_cooldown_seconds",
+                "NEUTRAL": "neutral_cooldown_seconds",
+            }
+            cooldown_key = regime_to_key.get(regime, "neutral_cooldown_seconds")
+            cooldown_seconds = int(cooldown_config.get(cooldown_key, 300))
+
+            if seconds_since_last_signal is not None:
+                remaining_cooldown = max(0, cooldown_seconds - seconds_since_last_signal)
+                is_cooling = remaining_cooldown > 0
+
+            return {
+                "code": 0,
+                "data": {
+                    "symbol": symbol,
+                    "last_signal_at": last_signal_at,
+                    "seconds_since_last_signal": seconds_since_last_signal,
+                    "remaining_cooldown_seconds": remaining_cooldown,
+                    "current_regime": regime,
+                    "is_cooling_down": is_cooling,
+                },
+                "message": "ok",
+            }
+
+        except Exception as exc:
+            logger.error("Cooldown status query failed for symbol=%s: %s", symbol, exc)
+            return {"code": "RISK_001", "data": None, "message": str(exc)}
+
+    async def _get_mode_impl(symbol: str) -> dict:
+        """Handler: GET signal tower mode for a symbol (via config_provider)."""
+        if config_provider is None:
+            return {"code": "SERVICE_NOT_READY", "data": None, "message": "Config provider not available"}
+
+        try:
+            mode = (await config_provider.get("signal_tower.mode")) or "ai_dynamic"
+
+            manual_score_raw = await config_provider.get("signal_tower.manual_regime_score")
+            manual_score = 50
+            if manual_score_raw is not None:
+                try:
+                    manual_score = int(manual_score_raw)
+                except (ValueError, TypeError):
+                    manual_score = 50
+
+            regime_raw = await config_provider.get("signal_tower.current_regime")
+            current_regime = regime_raw.upper() if regime_raw else None
+
+            conf_raw = await config_provider.get("signal_tower.regime_confidence")
+            regime_confidence = None
+            if conf_raw is not None:
+                try:
+                    regime_confidence = float(conf_raw)
+                except (ValueError, TypeError):
+                    regime_confidence = None
+
+            ai_raw = await config_provider.get("signal_tower.ai_score")
+            ai_score = None
+            if ai_raw is not None:
+                try:
+                    ai_score = int(ai_raw)
+                except (ValueError, TypeError):
+                    ai_score = None
+
+            last_updated = await config_provider.get("signal_tower.last_updated")
+
+            return {
+                "code": 0,
+                "data": {
+                    "symbol": symbol,
+                    "mode": mode,
+                    "ai_dynamic": mode == "ai_dynamic",
+                    "manual_score": manual_score,
+                    "current_regime": current_regime,
+                    "regime_confidence": regime_confidence,
+                    "ai_score": ai_score,
+                    "last_updated": last_updated,
+                    "indicators": {},
+                },
+                "message": "ok",
+            }
+
+        except Exception as exc:
+            logger.error("Signal tower mode query failed for symbol=%s: %s", symbol, exc)
+            return {"code": "RISK_001", "data": None, "message": str(exc)}
+
+    async def _put_mode_impl(body: SignalTowerModeUpdate) -> dict:
+        """Handler: PUT signal tower mode."""
+        if config_provider is None:
+            return {
+                "code": "SERVICE_NOT_READY",
+                "data": None,
+                "message": "Config provider not available",
+            }
+
+        errors: list[str] = []
+
+        try:
+            await config_provider.set("signal_tower.mode", body.mode)
+        except Exception as exc:
+            errors.append(f"mode: {exc}")
+
+        try:
+            await config_provider.set(
+                "signal_tower.manual_regime_score", str(body.manual_regime_score),
+            )
+        except Exception as exc:
+            errors.append(f"manual_regime_score: {exc}")
+
+        # Update last_updated timestamp
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            await config_provider.set("signal_tower.last_updated", now_iso)
+        except Exception:
+            pass
+
+        logger.info(
+            "Signal tower mode updated: mode=%s, manual_score=%d",
+            body.mode, body.manual_regime_score,
+        )
+
+        return {
+            "code": 0,
+            "data": {
+                "mode": body.mode,
+                "ai_dynamic": body.mode == "ai_dynamic",
+                "manual_regime_score": body.manual_regime_score,
+                "errors": errors if errors else None,
+            },
+            "message": "Mode updated" if not errors else f"Mode updated with {len(errors)} error(s)",
+        }
+
+    async def _get_symbol_config_impl(symbol: Optional[str] = None) -> dict:
+        """Handler: GET symbol-level tower config (list).
+
+        If symbol is provided, returns only that symbol's config.
+        Otherwise, returns all symbols with tower config.
+        """
+        if config_provider is None:
+            return {"code": "SERVICE_NOT_READY", "data": None, "message": "Config provider not available"}
+
+        try:
+            # Discover symbols: query for symbol.%.tower.enable to find all configured symbols
+            if symbol:
+                # Build single-symbol config from its fields (unified config_provider path)
+                fields = SYMBOL_TOWER_FIELDS
+                config: dict[str, Any] = {"symbol": symbol}
+                for field_name, default_val in fields.items():
+                    try:
+                        val = await config_provider.get(f"symbol.{symbol}.tower.{field_name}")
+                        if val is not None:
+                            config[field_name] = _coerce_value(val, default_val, type(default_val))
+                        else:
+                            config[field_name] = default_val
+                    except Exception:
+                        config[field_name] = default_val
+                return {
+                    "code": 0,
+                    "data": {"items": [config], "total": 1},
+                    "message": "ok",
+                }
+
+            # Discover all symbols with tower config (unified config_provider path)
+            rows = await config_provider.get_keys_by_prefix("symbol.")
+
+            symbol_map: dict[str, dict[str, Any]] = {}
+            for key, val in rows.items():
+                # Only process symbol-level tower configs
+                if ".tower." not in key:
+                    continue
+                # Parse: "symbol.XAUUSD.tower.enable" → symbol="XAUUSD", field="enable"
+                parts = key.split(".", 3)
+                if len(parts) < 4:
+                    continue
+                sym = parts[1]
+                field = parts[3]
+
+                if sym not in symbol_map:
+                    symbol_map[sym] = {"symbol": sym}
+                    # Initialize all fields with defaults
+                    for fname, fdefault in SYMBOL_TOWER_FIELDS.items():
+                        symbol_map[sym][fname] = fdefault
+
+                symbol_map[sym][field] = _coerce_value(
+                    val,
+                    SYMBOL_TOWER_FIELDS.get(field, ""),
+                    type(SYMBOL_TOWER_FIELDS.get(field, "")),
+                )
+
+            items = sorted(symbol_map.values(), key=lambda x: x["symbol"])
+
+            return {
+                "code": 0,
+                "data": {"items": items, "total": len(items)},
+                "message": "ok",
+            }
+
+        except Exception as exc:
+            logger.error("Symbol tower config query failed: %s", exc)
+            return {"code": "RISK_001", "data": None, "message": str(exc)}
+
+    async def _put_symbol_config_impl(body: SymbolTowerConfigBatchUpdate) -> dict:
+        """Handler: PUT batch update symbol-level tower configs."""
+        if config_provider is None:
+            return {
+                "code": "SERVICE_NOT_READY",
+                "data": None,
+                "message": "Config provider not available",
+            }
+
+        results: list[dict] = []
+        success_count = 0
+        fail_count = 0
+
+        field_map = {
+            "enable": "enable",
+            "lot_size": "lot_size",
+            "max_positions": "max_positions",
+            "stop_loss_pips": "stop_loss_pips",
+            "take_profit_pips": "take_profit_pips",
+            "signal_weight": "signal_weight",
+            "trading_hours": "trading_hours",
+            "news_filter": "news_filter",
+        }
+
+        for item in body.symbols:
+            sym = item.symbol
+            updates_for_symbol: list[str] = []
+
+            for field_attr, config_suffix in field_map.items():
+                val = getattr(item, field_attr, None)
+                if val is not None:
+                    config_key = f"symbol.{sym}.tower.{config_suffix}"
+                    try:
+                        # Convert to string for config_provider
+                        str_val = str(val).lower() if isinstance(val, bool) else str(val)
+                        ok = await config_provider.set(config_key, str_val)
+                        if ok:
+                            updates_for_symbol.append(config_suffix)
+                        else:
+                            fail_count += 1
+                            results.append({
+                                "symbol": sym,
+                                "field": config_suffix,
+                                "status": "failed",
+                            })
+                    except Exception as exc:
+                        fail_count += 1
+                        results.append({
+                            "symbol": sym,
+                            "field": config_suffix,
+                            "status": "error",
+                            "error": str(exc),
+                        })
+
+            if updates_for_symbol:
+                success_count += len(updates_for_symbol)
+                results.append({
+                    "symbol": sym,
+                    "updated": updates_for_symbol,
+                    "status": "ok",
+                })
+
+        logger.info(
+            "Symbol tower config batch update: %d fields succeeded, %d failed",
+            success_count, fail_count,
+        )
+
+        return {
+            "code": 0,
+            "data": {
+                "results": results,
+                "success": success_count,
+                "failed": fail_count,
+                "total": success_count + fail_count,
+            },
+            "message": f"Batch update: {success_count} succeeded, {fail_count} failed",
+        }
+
+    async def _get_prompt_impl() -> dict:
+        """Handler: GET prompt configuration (via config_provider).
+
+        Reads all prompt config fields from signal_tower.prompt.* keys.
+        Falls back to defaults when config_provider is unavailable.
+        """
+        config: dict[str, Any] = dict(PROMPT_CONFIG_FIELDS)
+
+        if config_provider is not None:
+            for base_key in PROMPT_CONFIG_KEYS:
+                full_key = f"signal_tower.prompt.{base_key}"
+                try:
+                    val = await config_provider.get(full_key)
+                    if val is not None:
+                        default = PROMPT_CONFIG_FIELDS[base_key]
+                        config[base_key] = _coerce_value(val, default, type(default))
+                except Exception as exc:
+                    logger.warning("Prompt config read failed for %s: %s", full_key, exc)
+
+        return {
+            "code": 0,
+            "data": config,
+            "message": "ok",
+        }
+
+    async def _put_prompt_impl(body: PromptConfigUpdate) -> dict:
+        """Handler: PUT prompt configuration.
+
+        Saves each non-None field to signal_tower.prompt.* config keys.
+        """
+        if config_provider is None:
+            return {
+                "code": "SERVICE_NOT_READY",
+                "data": None,
+                "message": "Config provider not available",
+            }
+
+        results: list[dict] = []
+        success_count = 0
+        fail_count = 0
+
+        field_names = list(PROMPT_CONFIG_FIELDS.keys())
+        for field_name in field_names:
+            val = getattr(body, field_name, None)
+            if val is None:
+                continue
+            config_key = f"signal_tower.prompt.{field_name}"
+            try:
+                # Convert to string for config_provider
+                str_val = str(val).lower() if isinstance(val, bool) else str(val)
+                ok = await config_provider.set(config_key, str_val)
+                if ok:
+                    success_count += 1
+                    results.append({"field": field_name, "status": "ok"})
+                else:
+                    fail_count += 1
+                    results.append({"field": field_name, "status": "failed"})
+            except Exception as exc:
+                fail_count += 1
+                results.append({
+                    "field": field_name,
+                    "status": "error",
+                    "error": str(exc),
+                })
+
+        logger.info(
+            "Prompt config update: %d/%d fields succeeded",
+            success_count, success_count + fail_count,
+        )
+
+        return {
+            "code": 0,
+            "data": {
+                "results": results,
+                "success": success_count,
+                "failed": fail_count,
+            },
+            "message": f"Prompt config updated: {success_count} succeeded, {fail_count} failed",
+        }
+
+    async def _get_watchdog_impl() -> dict:
+        """Handler: GET watchdog status.
+
+        Returns WatchdogInfo with service heartbeats from DB when available,
+        falling back to default status when DB is unavailable.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat()
+        services: list[dict] = []
+        restarts: int = 0
+        uptime_seconds: int = 0
+        status: str = "running"
+        alerts: list[dict] = []
+
+        if config_provider is not None:
+            try:
+                # Read watchdog service heartbeats from config (unified path)
+                service_rows = await config_provider.get_keys_by_prefix("watchdog.service.")
+                service_map: dict[str, dict] = {}
+                for key, val in service_rows.items():
+                    # Parse: "watchdog.service.collector" → "collector"
+                    # or "watchdog.service.collector.status" → service="collector", attr="status"
+                    parts = key.split(".")
+                    if len(parts) < 3:
+                        continue
+                    svc_name = parts[2]
+                    attr = parts[3] if len(parts) >= 4 else "status"
+                    if svc_name not in service_map:
+                        service_map[svc_name] = {
+                            "name": svc_name,
+                            "status": "unknown",
+                            "last_heartbeat": None,
+                        }
+                    service_map[svc_name][attr] = val
+
+                services = list(service_map.values())
+
+                # Read watchdog global status
+                watchdog_status = await config_provider.get("watchdog.status")
+                if watchdog_status:
+                    status = watchdog_status
+
+                # Read uptime
+                started_raw = await config_provider.get("watchdog.started_at")
+                if started_raw:
+                    try:
+                        started = datetime.fromisoformat(started_raw)
+                        if started.tzinfo is None:
+                            started = started.replace(tzinfo=timezone.utc)
+                        uptime_seconds = max(
+                            0,
+                            int((datetime.now(timezone.utc) - started).total_seconds()),
+                        )
+                    except (ValueError, TypeError):
+                        pass
+
+                # Read restarts count
+                restarts_raw = await config_provider.get("watchdog.restarts")
+                if restarts_raw:
+                    try:
+                        restarts = int(restarts_raw)
+                    except (ValueError, TypeError):
+                        pass
+
+                # Read recent alerts (sorted by config_key DESC, latest first)
+                alert_items = sorted(
+                    (await config_provider.get_keys_by_prefix("watchdog.alert.")).items(),
+                    key=lambda kv: kv[0], reverse=True,
+                )[:20]
+                for _akey, araw in alert_items:
+                    try:
+                        alert = json.loads(araw)
+                        alerts.append(alert)
+                    except Exception:
+                        pass
+
+            except Exception as exc:
+                logger.warning("Watchdog status read failed: %s", exc)
+
+        # Fallback defaults
+        if not services:
+            services = [dict(s) for s in WATCHDOG_DEFAULT_SERVICES]
+
+        if not alerts:
+            alerts = [{
+                "level": "info",
+                "message": "System started",
+                "time": now_iso,
+            }]
+
+        return {
+            "code": 0,
+            "data": {
+                "status": status,
+                "uptime_seconds": uptime_seconds,
+                "last_check": now_iso,
+                "watched_services": services,
+                "restarts": restarts,
+                "alerts": alerts,
+            },
+            "message": "ok",
+        }
+
+    async def _post_watchdog_action_impl(action: str) -> dict:
+        """Handler: POST watchdog action (pause/resume/restart).
+
+        Updates watchdog.status config key and returns the new state.
+        """
+        valid_actions = {"pause", "resume", "restart"}
+        if action not in valid_actions:
+            return {
+                "code": "INVALID_ACTION",
+                "data": None,
+                "message": f"Invalid action '{action}'. Valid actions: {', '.join(sorted(valid_actions))}",
+            }
+
+        new_status: str = "running"
+        if action == "pause":
+            new_status = "paused"
+        elif action == "resume":
+            new_status = "running"
+        elif action == "restart":
+            new_status = "running"
+            # Reset uptime
+            if config_provider is not None:
+                try:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    await config_provider.set("watchdog.started_at", now_iso)
+                except Exception:
+                    pass
+
+        # Persist status
+        if config_provider is not None:
+            try:
+                await config_provider.set("watchdog.status", new_status)
+            except Exception as exc:
+                logger.error("Failed to persist watchdog status: %s", exc)
+                return {
+                    "code": "CONFIG_WRITE_FAILED",
+                    "data": {"action": action, "status": new_status},
+                    "message": f"Action accepted but status persistence failed: {exc}",
+                }
+
+        logger.info("Watchdog action '%s' executed, new status: %s", action, new_status)
+
+        return {
+            "code": 0,
+            "data": {
+                "action": action,
+                "status": new_status,
+                "message": f"Watchdog {action} completed successfully",
+            },
+            "message": "ok",
+        }
+
+    # ═════════════════════════════════════════════
+    # API v1 routes
+    # ═════════════════════════════════════════════
+
+    # ── Cooldown Config ─────────────────────────
+
+    @router.get("/api/v1/signal-tower/cooldown")
+    async def get_cooldown(
+        request: Request,
+        symbol: Optional[str] = Query(None, description="Filter by symbol for per-symbol overrides"),
+        user=Depends(auth_handler.require_auth),
+    ):
+        """Get cooldown configuration.
+
+        Returns the 8 cooldown fields (pretrend_cooldown_seconds, etc.)
+        with global defaults and optional per-symbol overrides.
+        """
+        return await _get_cooldown_impl(symbol)
+
+    @router.put("/api/v1/signal-tower/cooldown")
+    async def put_cooldown(
+        body: CooldownBatchUpdate,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """Batch update cooldown configuration.
+
+        Accepts a list of {config_key, value} pairs for the 8 cooldown fields.
+        """
+        return await _put_cooldown_impl(body)
+
+    # ── Cooldown Status ─────────────────────────
+
+    @router.get("/api/v1/signal-tower/cooldown/status")
+    async def get_cooldown_status(
+        request: Request,
+        symbol: str = Query(..., description="Trading symbol (required)"),
+        user=Depends(auth_handler.require_auth),
+    ):
+        """Get current cooldown status for a symbol.
+
+        Queries the latest signal from hcm_signal.signals and calculates
+        remaining cooldown time based on the current market regime.
+        """
+        return await _get_cooldown_status_impl(symbol)
+
+    # ── Mode ────────────────────────────────────
+
+    @router.get("/api/v1/signal-tower/mode")
+    async def get_mode(
+        request: Request,
+        symbol: str = Query(..., description="Trading symbol (required)"),
+        user=Depends(auth_handler.require_auth),
+    ):
+        """Get current signal tower mode (AI dynamic / manual).
+
+        Returns mode, ai_dynamic flag, manual_regime_score, current regime,
+        and optional AI indicators.
+        """
+        return await _get_mode_impl(symbol)
+
+    @router.put("/api/v1/signal-tower/mode")
+    async def put_mode(
+        body: SignalTowerModeUpdate,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """Switch signal tower mode.
+
+        Set mode to 'ai_dynamic' (AI-driven regime detection) or 'manual'
+        (fixed regime_score set by user).
+        """
+        return await _put_mode_impl(body)
+
+    # ── Symbol Config ───────────────────────────
+
+    @router.get("/api/v1/signal-tower/symbol-config")
+    async def get_symbol_config(
+        request: Request,
+        symbol: Optional[str] = Query(None, description="Filter by symbol (optional)"),
+        user=Depends(auth_handler.require_auth),
+    ):
+        """Get symbol-level signal tower configuration.
+
+        Returns tower config for all symbols (or a specific symbol if provided).
+        Each entry includes enable, lot_size, max_positions, stop_loss_pips,
+        take_profit_pips, signal_weight, trading_hours, and news_filter.
+        """
+        return await _get_symbol_config_impl(symbol)
+
+    @router.put("/api/v1/signal-tower/symbol-config")
+    async def put_symbol_config(
+        body: SymbolTowerConfigBatchUpdate,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """Batch update symbol-level signal tower configuration.
+
+        Accepts a list of symbol configs; each may specify any subset of the
+        8 tower fields (enable, lot_size, max_positions, etc.).
+        """
+        return await _put_symbol_config_impl(body)
+
+    # ── Prompt Config ───────────────────────────
+
+    @router.get("/api/v1/signal-tower/prompt")
+    async def get_prompt(
+        request: Request,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """Get prompt configuration.
+
+        Returns all 9 prompt config fields (system_prompt, regime_prompt_template,
+        signal_prompt_template, risk_prompt_template, max_context_length,
+        include_market_data, include_news, include_position_info, prompt_version).
+        """
+        return await _get_prompt_impl()
+
+    @router.put("/api/v1/signal-tower/prompt")
+    async def put_prompt(
+        body: PromptConfigUpdate,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """Update prompt configuration.
+
+        Accepts any subset of the 9 prompt config fields. Only non-None fields
+        are persisted; omitted fields keep their current values.
+        """
+        return await _put_prompt_impl(body)
+
+    # ── Watchdog ────────────────────────────────
+
+    @router.get("/api/v1/signal-tower/watchdog")
+    async def get_watchdog(
+        request: Request,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """Get watchdog status and monitored services.
+
+        Returns uptime, service heartbeats, restart count, and recent alerts.
+        """
+        return await _get_watchdog_impl()
+
+    @router.post("/api/v1/signal-tower/watchdog/{action}")
+    async def post_watchdog_action(
+        action: str,
+        request: Request,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """Execute a watchdog action: pause, resume, or restart.
+
+        - pause: Pauses watchdog monitoring
+        - resume: Resumes watchdog monitoring
+        - restart: Restarts watchdog (resets uptime counter)
+        """
+        return await _post_watchdog_action_impl(action)
+
+    # ═════════════════════════════════════════════
+    # Legacy backward-compatible routes
+    # ═════════════════════════════════════════════
+
+    @router.get("/api/signal-tower/threshold")
+    async def legacy_get_threshold(
+        request: Request,
+        symbol: Optional[str] = Query(None, description="Filter by symbol"),
+        user=Depends(auth_handler.require_auth),
+    ):
+        """[Legacy] Get full Threshold panel config (cooldown + scoring + midbar + dispute)."""
+        return await _get_threshold_impl(symbol)
+
+    @router.put("/api/signal-tower/threshold")
+    async def legacy_put_threshold(
+        body: CooldownBatchUpdate,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """[Legacy] Update cooldown/threshold config — alias for /api/v1/signal-tower/cooldown."""
+        return await _put_cooldown_impl(body)
+
+    @router.get("/api/signal-tower/mode")
+    async def legacy_get_mode(
+        request: Request,
+        symbol: str = Query(..., description="Trading symbol (required)"),
+        user=Depends(auth_handler.require_auth),
+    ):
+        """[Legacy] Get signal tower mode — alias for /api/v1/signal-tower/mode."""
+        return await _get_mode_impl(symbol)
+
+    @router.put("/api/signal-tower/mode")
+    async def legacy_put_mode(
+        body: SignalTowerModeUpdate,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """[Legacy] Switch signal tower mode — alias for /api/v1/signal-tower/mode."""
+        return await _put_mode_impl(body)
+
+    @router.get("/api/signal-tower/symbol-config")
+    async def legacy_get_symbol_config(
+        request: Request,
+        symbol: Optional[str] = Query(None, description="Filter by symbol"),
+        user=Depends(auth_handler.require_auth),
+    ):
+        """[Legacy] Get symbol tower config — alias for /api/v1/signal-tower/symbol-config."""
+        return await _get_symbol_config_impl(symbol)
+
+    @router.put("/api/signal-tower/symbol-config")
+    async def legacy_put_symbol_config(
+        body: SymbolTowerConfigBatchUpdate,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """[Legacy] Update symbol tower config — alias for /api/v1/signal-tower/symbol-config."""
+        return await _put_symbol_config_impl(body)
+
+    @router.get("/api/signal-tower/prompt")
+    async def legacy_get_prompt(
+        request: Request,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """[Legacy] Get prompt config — alias for /api/v1/signal-tower/prompt."""
+        return await _get_prompt_impl()
+
+    @router.put("/api/signal-tower/prompt")
+    async def legacy_put_prompt(
+        body: PromptConfigUpdate,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """[Legacy] Update prompt config — alias for /api/v1/signal-tower/prompt."""
+        return await _put_prompt_impl(body)
+
+    @router.get("/api/signal-tower/watchdog")
+    async def legacy_get_watchdog(
+        request: Request,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """[Legacy] Get watchdog status — alias for /api/v1/signal-tower/watchdog."""
+        return await _get_watchdog_impl()
+
+    @router.post("/api/signal-tower/watchdog/{action}")
+    async def legacy_post_watchdog_action(
+        action: str,
+        request: Request,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """[Legacy] Execute watchdog action — alias for /api/v1/signal-tower/watchdog/{action}."""
+        return await _post_watchdog_action_impl(action)
+
+    return router

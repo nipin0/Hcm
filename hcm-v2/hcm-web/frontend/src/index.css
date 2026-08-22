@@ -1,0 +1,95 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --color-bg-primary: #0a0a0f;
+    --color-bg-secondary: #111118;
+    --color-bg-tertiary: #1a1a24;
+    --color-border: #2a2a3a;
+    --color-accent: #3b82f6;
+    --color-accent-hover: #2563eb;
+    --color-success: #22c55e;
+    --color-warning: #eab308;
+    --color-danger: #ef4444;
+    --color-text-primary: #f1f5f9;
+    --color-text-secondary: #94a3b8;
+    --color-text-muted: #64748b;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #2a2a3a transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background-color: #2a2a3a;
+    border-radius: 3px;
+  }
+
+  body {
+    font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg
+           font-medium transition-colors duration-200 disabled:opacity-50
+           disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-gray-700 hover:bg-gray-600 text-gray-200 px-4 py-2 rounded-lg
+           font-medium transition-colors duration-200;
+  }
+
+  .btn-danger {
+    @apply bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg
+           font-medium transition-colors duration-200;
+  }
+
+  .input-field {
+    @apply bg-gray-800 border border-gray-600 rounded-lg px-3 py-2
+           text-gray-100 placeholder-gray-500 focus:border-blue-500
+           focus:ring-1 focus:ring-blue-500 outline-none transition-colors
+           duration-200 w-full;
+  }
+
+  .card {
+    @apply bg-gray-900 border border-gray-700 rounded-xl p-6;
+  }
+
+  .card-header {
+    @apply text-lg font-semibold text-gray-100 mb-4 pb-3 border-b border-gray-700;
+  }
+
+  .label {
+    @apply block text-sm font-medium text-gray-400 mb-1;
+  }
+
+  .ag-theme-alpine-dark {
+    --ag-background-color: #111118;
+    --ag-header-background-color: #1a1a24;
+    --ag-odd-row-background-color: #14141c;
+    --ag-header-foreground-color: #94a3b8;
+    --ag-foreground-color: #f1f5f9;
+    --ag-border-color: #2a2a3a;
+    --ag-row-hover-color: #1e1e2e;
+    --ag-selected-row-background-color: #1e3a5f;
+  }
+}

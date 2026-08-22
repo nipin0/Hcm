@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>运行时参数 · 数据看板</title>
+<style>
+  :root{
+    --bg:#0b0e14; --panel:#11151f; --panel2:#161b27; --border:#1e2633;
+    --txt:#e2e8f0; --muted:#8b97a8; --green:#22c55e; --white:#cbd5e1;
+    --red:#ef4444; --blue:#3b82f6; --amber:#eab308;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:13px;line-height:1.5;}
+  header{padding:16px 24px;border-bottom:1px solid var(--border);
+    display:flex;align-items:center;gap:16px;flex-wrap:wrap;background:var(--panel);}
+  header h1{font-size:17px;margin:0;font-weight:600;}
+  .summary{display:flex;gap:10px;flex-wrap:wrap;margin-left:auto;align-items:center;}
+  .pill{display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;
+    background:var(--panel2);border:1px solid var(--border);font-variant-numeric:tabular-nums;}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex-shrink:0;}
+  .dot.green{background:var(--green);} .dot.white{background:var(--white);} .dot.red{background:var(--red);}
+  button{background:var(--blue);color:#fff;border:none;padding:6px 14px;border-radius:6px;
+    cursor:pointer;font-size:12px;}
+  button.ghost{background:transparent;border:1px solid var(--border);color:var(--muted);}
+  main{padding:20px 24px;max-width:1400px;margin:0 auto;}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:16px;}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden;}
+  .card-h{padding:10px 14px;border-bottom:1px solid var(--border);background:var(--panel2);
+    display:flex;align-items:center;gap:8px;}
+  .card-h .title{font-weight:600;}
+  .card-h .cnt{margin-left:auto;color:var(--muted);font-size:11px;}
+  .grp-sum{display:flex;gap:6px;align-items:center;}
+  .row{display:flex;align-items:flex-start;gap:8px;padding:7px 14px;border-bottom:1px solid #141a24;}
+  .row:last-child{border-bottom:none;}
+  .row .body{flex:1;min-width:0;}
+  .row .k{font-weight:500;}
+  .row .desc{color:var(--muted);font-size:11px;margin-top:1px;word-break:break-word;}
+  .row .vals{margin-top:2px;font-variant-numeric:tabular-nums;}
+  .row .v{font-weight:600;}
+  .row .pg{color:var(--red);font-size:11px;}
+  .row.conflict{background:rgba(239,68,68,.06);}
+  .badge{font-size:10px;padding:1px 6px;border-radius:4px;border:1px solid var(--border);
+    color:var(--muted);margin-left:6px;}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:11px;margin:4px 0 18px;}
+  .legend .item{display:flex;align-items:center;gap:6px;}
+  #err{color:var(--red);padding:20px;}
+  .muted{color:var(--muted);}
+  code{background:#0d1117;padding:1px 5px;border-radius:4px;font-size:11px;}
+</style>
+</head>
+<body>
+<header>
+  <h1>运行时参数面板</h1>
+  <span class="muted" id="updated">—</span>
+  <div class="summary">
+    <span class="pill"><span class="dot green"></span><span id="c-green">0</span> 实时在用</span>
+    <span class="pill"><span class="dot white"></span><span id="c-white">0</span> 未启用</span>
+    <span class="pill"><span class="dot red"></span><span id="c-red">0</span> 异常</span>
+    <button class="ghost" id="refresh">刷新</button>
+  </div>
+</header>
+<main>
+  <div class="legend">
+    <div class="item"><span class="dot green"></span> 绿 = 实时在用（代码引用且生效）</div>
+    <div class="item"><span class="dot white"></span> 白 = 未启用（开关关闭 / 未接入）</div>
+    <div class="item"><span class="dot red"></span> 红 = 异常（PG≠Redis 冲突 / 孤儿键 / 仅目录）</div>
+  </div>
+  <div id="content"><div class="muted">加载中…</div></div>
+</main>
+
+<script>
+const STATUS_CLASS = {green:'green', white:'white', red:'red'};
+let timer = null;
+
+function esc(s){return (s==null?'':String(s)).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+
+function render(data){
+  const groups = data.groups||[];
+  const counts = data.counts||{green:0,white:0,red:0};
+  document.getElementById('c-green').textContent = counts.green;
+  document.getElementById('c-white').textContent = counts.white;
+  document.getElementById('c-red').textContent = counts.red;
+  document.getElementById('updated').textContent = '更新于 ' + new Date().toLocaleTimeString();
+
+  if(!groups.length){document.getElementById('content').innerHTML='<div class="muted">无参数</div>';return;}
+
+  const grid = document.createElement('div'); grid.className='grid';
+  for(const g of groups){
+    const card = document.createElement('div'); card.className='card';
+    const h = document.createElement('div'); h.className='card-h';
+    const reds = g.params.filter(p=>p.status==='red').length;
+    h.innerHTML = `<span class="title">${esc(g.title)}</span>`+
+      `<span class="grp-sum">${reds?`<span class="badge" style="color:var(--red);border-color:var(--red)">${reds} 异常</span>`:''}`+
+      `<span class="cnt">${g.params.length} 项</span></span>`;
+    card.appendChild(h);
+    for(const p of g.params){
+      const row = document.createElement('div');
+      row.className = 'row' + (p.conflict?' conflict':'');
+      const pgHtml = (p.conflict && p.pg_value!=null)
+        ? `<span class="pg"> PG目录: ${esc(p.pg_value)}</span>` : '';
+      const sens = p.is_sensitive ? `<span class="badge">密</span>` : '';
+      const only = !p.in_redis ? `<span class="badge" style="color:var(--red)">仅PG</span>`
+                  : (!p.in_pg ? `<span class="badge" style="color:var(--red)">仅Redis</span>` : '');
+      row.innerHTML =
+        `<span class="dot ${STATUS_CLASS[p.status]||'white'}"></span>`+
+        `<div class="body">`+
+          `<div class="k">${esc(p.label)}${sens}${only}</div>`+
+          (p.description?`<div class="desc">${esc(p.description)}</div>`:'')+
+          `<div class="vals"><span class="v">${esc(p.value)}</span>${pgHtml}</div>`+
+          `<div class="desc" style="margin-top:2px"><code>${esc(p.key)}</code></div>`+
+        `</div>`;
+      card.appendChild(row);
+    }
+    grid.appendChild(card);
+  }
+  const c = document.getElementById('content'); c.innerHTML=''; c.appendChild(grid);
+}
+
+async function load(){
+  try{
+    const r = await fetch('/api/v1/config/runtime-status', {cache:'no-store'});
+    const j = await r.json();
+    if(j.code!==0 || !j.data){throw new Error(j.message||'bad response');}
+    render(j.data);
+  }catch(e){
+    document.getElementById('content').innerHTML = '<div id="err">加载失败: '+esc(e.message)+'</div>';
+  }
+}
+
+document.getElementById('refresh').onclick = load;
+load();
+</script>
+</body>
+</html>

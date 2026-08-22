@@ -1,0 +1,247 @@
+import React, { useEffect, useState } from 'react';
+import { Box, Typography, Tooltip } from '@mui/material';
+import ConfigForm, { ConfigField } from '../../components/ConfigForm';
+import client from '../../api/client';
+import { useSymbol } from '../../contexts/SymbolContext';
+
+// ── 颜色分组（左侧色条） ──
+const GROUP_COLORS: Record<string, string> = {
+  cooldown: '#3b82f6',   // 蓝 — 冷却时间
+  threshold: '#f59e0b',  // 橙 — 评分阈值
+  midbar: '#22c55e',     // 绿 — 早鸟推理
+  dispute: '#a855f7',    // 紫 — AI 争议
+};
+
+const buildFields = (): ConfigField[] => [
+  // ── ① 冷却时间组（5 个） ──
+  { key: '_g1', label: '⏱ 冷却时间（按体制）— 越大越保守', type: 'section',
+    description: '各体制下新信号最小间隔。信号产生后等待这段时间再开新仓。' },
+  { key: 'pretrend_cooldown_seconds', label: 'PRE_TREND 冷却(秒)', type: 'number', defaultValue: 180, min: 0, max: 7200, group: 'cooldown',
+    description: '市场处于 PRE_TREND（预趋势）状态时，发出新信号前的最小间隔。越大越保守，避免假突破。建议 120-300。' },
+  { key: 'trend_cooldown_seconds', label: 'TREND 冷却(秒)', type: 'number', defaultValue: 120, min: 0, max: 7200, group: 'cooldown',
+    description: '市场处于 TREND（已确认趋势）状态时，新信号间隔。趋势确认后信号较可靠，可设较短。建议 60-180。' },
+  { key: 'fade_cooldown_seconds', label: 'FADE 冷却(秒)', type: 'number', defaultValue: 300, min: 0, max: 7200, group: 'cooldown',
+    description: '市场处于 FADE（趋势反转）状态时，新信号间隔。反转信号需谨慎，建议 300-600 避免震荡频繁下单。' },
+  { key: 'range_boundary_cooldown_seconds', label: 'RANGE 冷却(秒)', type: 'number', defaultValue: 0, min: 0, max: 7200, group: 'cooldown',
+    description: '市场处于 RANGE（震荡区间边界）状态时，新信号间隔。0=不限制。' },
+  { key: 'neutral_cooldown_seconds', label: 'NEUTRAL 冷却(秒)', type: 'number', defaultValue: 300, min: 0, max: 7200, group: 'cooldown',
+    description: '市场处于 NEUTRAL（中性无趋势）状态时，新信号间隔。中性市场是差信号源，建议 300-600。' },
+
+  // ── ② 评分阈值组（10 个）— 体制特定阈值公式 ──
+  { key: '_g2', label: '📊 评分阈值（按体制）— 基础 + 偏移 + 钳制', type: 'section',
+    description: 'scoring 引擎阈值公式：max/min(floor/ceiling, 基础 + 偏移)。' },
+  { key: 'score_threshold', label: '基础评分阈值', type: 'number', defaultValue: 0.10, min: 0, max: 1, step: 0.01, group: 'threshold',
+    description: '所有体制评分的基础分。0.10=激进（信号多），0.50=均衡，0.80=保守（信号少）。各体制的最终阈值 = 基础 + 各自偏移（并被 floor/ceiling 钳制）。' },
+  { key: 'scoring.pretrend_threshold_floor', label: 'PRE_TREND 判定下限', type: 'number', defaultValue: 0.45, min: 0.2, max: 0.6, step: 0.02, group: 'threshold',
+    description: 'PRE_TREND 阈值下限。计算公式：max(floor, 基础 + 偏移)。即使偏移让阈值很低，也不会低于此值。' },
+  { key: 'scoring.pretrend_threshold_offset', label: 'PRE_TREND 偏移', type: 'number', defaultValue: -0.08, min: -0.3, max: 0, step: 0.01, group: 'threshold',
+    description: 'PRE_TREND 阈值 = 基础 + 此值。负数降低门槛让 PRE_TREND 触发更容易。' },
+  { key: 'scoring.fade_threshold_ceiling', label: 'FADE 判定上限', type: 'number', defaultValue: 0.65, min: 0.6, max: 0.95, step: 0.02, group: 'threshold',
+    description: 'FADE 阈值上限。计算公式：min(ceiling, 基础 + 偏移)。' },
+  { key: 'scoring.fade_threshold_offset', label: 'FADE 偏移', type: 'number', defaultValue: 0.08, min: 0, max: 0.3, step: 0.01, group: 'threshold',
+    description: 'FADE 阈值 = 基础 + 此值。正数提高门槛让 FADE 触发更挑剔。' },
+  { key: 'scoring.range_threshold_floor', label: 'RANGE 判定下限', type: 'number', defaultValue: 0.45, min: 0.2, max: 0.6, step: 0.02, group: 'threshold',
+    description: 'RANGE 阈值下限。计算公式：max(floor, 基础 + 偏移)。' },
+  { key: 'scoring.range_threshold_offset', label: 'RANGE 偏移', type: 'number', defaultValue: -0.10, min: -0.3, max: 0, step: 0.01, group: 'threshold',
+    description: 'RANGE 阈值 = 基础 + 此值。负数降低门槛让 RANGE 判定更宽松。' },
+  { key: 'scoring.neutral_threshold_offset', label: 'NEUTRAL 判定偏移', type: 'number', defaultValue: 0.05, min: 0, max: 0.3, step: 0.02, group: 'threshold',
+    description: 'NEUTRAL 阈值 = 基础 + 此值。越大越难进入 NEUTRAL（更难卡在无方向）。0.15 时 NEUTRAL 阈值=0.25 较合理。' },
+  { key: 'scoring.neutral_threshold_ceiling', label: 'NEUTRAL 上限', type: 'number', defaultValue: 0.80, min: 0.6, max: 0.95, step: 0.01, group: 'threshold',
+    description: 'NEUTRAL 阈值上限。计算公式：min(ceiling, 基础 + 偏移)。' },
+  { key: 'scoring.trend_strong_adx_threshold', label: '强趋势 ADX 阈值', type: 'number', defaultValue: 25, min: 15, max: 50, step: 1, group: 'threshold',
+    description: 'ADX 高于此值判定为强趋势，TREND 阈值进一步下调（基础 + 强趋势偏移）。降到 22 更易进入强趋势。' },
+  { key: 'scoring.trend_strong_threshold_offset', label: '强趋势偏移', type: 'number', defaultValue: -0.05, min: -0.2, max: 0, step: 0.01, group: 'threshold',
+    description: '强趋势时 TREND 阈值 = 基础 + 此值。负数进一步降低门槛。' },
+  { key: 'scoring.min_adx_for_trade', label: 'ADX 交易地板（全局）', type: 'number', defaultValue: 22, min: 10, max: 40, step: 1, group: 'threshold',
+    description: '交易硬闸门：ADX 低于此值直接 NO_TRADE，永不发方向单（RANGE 体制例外，跳过此地板）。区别于"强趋势 ADX 阈值"（仅用于强趋势判定/显示）。注意：此值才是真正卡交易的门槛，不是上面那个 23。' },
+  { key: 'scoring.M5.min_adx_for_trade', label: 'ADX 交易地板（M5 覆盖）', type: 'number', defaultValue: 22, min: 10, max: 40, step: 1, group: 'threshold',
+    description: 'M5 周期的 ADX 交易地板，覆盖上面的全局值。XAUUSD 实际交易走此键（引擎按周期读取）。留与全局一致即可；如需 XAUUSD 单独设门槛在此改。' },
+
+  // ── ③ 早鸟推理组（M5 子周期推理） ──
+  { key: '_g3', label: '🐦 早鸟推理（M5 子周期）— 把信号提前 2-3 分钟', type: 'section',
+    description: 'M5 K线内每分钟跑一次子周期推理；2 分钟就有方向，4 分钟确认。注：桥必须采集子周期 K线。' },
+  { key: 'midbar.M5.enabled', label: 'M5 早鸟推理', type: 'switch', defaultValue: true, group: 'midbar',
+    description: '开启后，信号塔在 M5 K线内每分钟跑一次子周期推理，2 分钟就能出方向、4 分钟确认。关闭则恢复 5 分钟一推理的旧模式。' },
+  { key: 'midbar.M5.sub_period', label: '子周期', type: 'text', defaultValue: 'M1', group: 'midbar',
+    description: '子周期 K线时长。默认 M1（1分钟）。可设 M2/M3 等。注：桥必须采集该子周期 K线。' },
+  { key: 'midbar.M5.inference_bars', label: '推理 Bar 序号', type: 'text', defaultValue: '[2,3,4,5]', group: 'midbar',
+    description: 'M5 K线内哪些子周期 bar 触发推理。默认 [2,3,4,5] 即每分钟一次，连续4次。' },
+  { key: 'midbar.M5.min_confirm_bars', label: '最低确认次数', type: 'number', defaultValue: 2, min: 1, max: 5, group: 'midbar',
+    description: '子周期推理方向连续一致次数达到此值才视为确认。2=稳健，3=更保守。' },
+  { key: 'midbar.M5.liquidity_bidask_max', label: '流动性门槛($)', type: 'number', defaultValue: 0.08, min: 0, max: 1, step: 0.01, group: 'midbar',
+    description: 'bid/ask 价差超过此值视为低流动性时段，跳过下单。建议 0.05-0.15 黄金。' },
+
+  // ── ④ 争议赋分组（AI 调用决策） ──
+  { key: '_g4', label: '⚖️ 争议赋分（AI 调度）— 方向明确不调，分歧才调', type: 'section',
+    description: 'AI 调用的触发条件与最低分门槛。差异小于 0.05 调 DeepSeek。' },
+  { key: 'scoring.M5.dispute_diff_threshold', label: '争议门槛 |buy-sell|', type: 'number', defaultValue: 0.05, min: 0, max: 0.5, step: 0.01, group: 'dispute',
+    description: 'buy_score 与 sell_score 差值小于此值 → 争议，调 DeepSeek 破解。大于此值 → 方向明确，跳过 AI 直接下单。' },
+  { key: 'scoring.M5.min_score_threshold', label: '最低评分门槛', type: 'number', defaultValue: 0.15, min: 0, max: 1, step: 0.01, group: 'dispute',
+    description: '评分低于此值直接 NO_TRADE，省 API 调用。0.15 表示低于 15% 不开仓。' },
+  { key: 'scoring.M5.trend_adx_threshold', label: '子周期 TREND 触发', type: 'number', defaultValue: 22, min: 15, max: 50, step: 1, group: 'dispute',
+    description: '主周期（M5）的 ADX 高于此值时启动子周期推理。M15 设 24 较合适。' },
+  { key: 'scoring.M5.trend_adx_exit_threshold', label: 'TREND 退出门槛', type: 'number', defaultValue: 18, min: 10, max: 40, step: 1, group: 'dispute',
+    description: 'ADX 跌破此值且持续 2 bar，退出 TREND 体制。必须 < TREND 触发值（22）。' },
+];
+
+const Threshold: React.FC = () => {
+  const { selectedSymbol } = useSymbol();
+  const [initialValues, setInitialValues] = React.useState<Record<string, string | number | boolean> | undefined>();
+  const [formKey, setFormKey] = useState(0);
+
+  const fetchAndSet = async (): Promise<void> => {
+    if (!selectedSymbol) return;
+    try {
+      const { data: resp } = await client.get(`/api/signal-tower/threshold?symbol=${selectedSymbol.symbol}`);
+      const d = resp.data || resp;
+      const cfg = d.config || d;
+      const parsed: Record<string, string | number | boolean> = {};
+      if (typeof cfg === 'object' && cfg !== null) {
+        // Build a map of field key → declared type so we can preserve string fields
+        const typeMap = new Map<string, string>();
+        for (const f of buildFields()) {
+          typeMap.set(f.key, f.type);
+        }
+        for (const [k, v] of Object.entries(cfg)) {
+          const declaredType = typeMap.get(k);
+          if (declaredType === 'text' || declaredType === 'select' || declaredType === 'textarea') {
+            // Keep as string — never auto-convert text fields
+            parsed[k] = String(v);
+          } else if (declaredType === 'switch') {
+            parsed[k] = String(v).toLowerCase() === 'true';
+          } else {
+            // number type — try parse
+            const num = Number(v);
+            parsed[k] = (isNaN(num) || v === '' || v === null) ? String(v ?? '') : num;
+          }
+        }
+      }
+      setInitialValues(parsed);
+    } catch (_e) {
+      setInitialValues({});
+    }
+  };
+
+  useEffect(() => {
+    fetchAndSet();
+  }, [selectedSymbol]);
+
+  const handleSubmit = async (values: Record<string, string | number | boolean>): Promise<void> => {
+    const updates = Object.entries(values).map(([k, v]) => ({
+      config_key: k,
+      value: String(v),
+    }));
+    await client.put('/api/signal-tower/threshold', { updates });
+    await fetchAndSet();
+    setFormKey(k => k + 1);
+  };
+
+  // ── 按组分块渲染 ──
+  const fields = buildFields();
+  const groups = [
+    { id: 'cooldown', name: '⏱ 冷却时间（按体制）', desc: '各体制下新信号最小间隔' },
+    { id: 'threshold', name: '📊 评分阈值（按体制）', desc: 'scoring 引擎阈值公式：max/min(floor/ceiling, 基础 + 偏移)' },
+    { id: 'midbar', name: '🐦 早鸟推理（M5 子周期）', desc: 'M5 K线内子周期推理参数' },
+    { id: 'dispute', name: '⚖️ 争议赋分（AI 调度）', desc: 'AI 调用的触发条件与最低分门槛' },
+  ];
+
+  return (
+    <>
+      <ConfigForm
+        formKey={formKey}
+        title={`评分阈值配置 — ${selectedSymbol?.symbol || ''}`}
+        fields={fields}
+        initialValues={initialValues}
+        onSubmit={handleSubmit}
+        apiEndpoint="PUT /api/signal-tower/threshold"
+      />
+
+      {/* 实时阈值预览 */}
+      <Box sx={{ mt: 4, p: 2, border: '1px solid #1e293b', borderLeft: '3px solid #22c55e', borderRadius: 2, backgroundColor: '#0f1117' }}>
+        <Typography variant="subtitle2" sx={{ color: '#22c55e', fontWeight: 600, fontSize: '0.75rem', mb: 2 }}>
+          当前实际阈值（动态 = 基础 ± 偏移，并被 floor/ceiling 钳制）
+        </Typography>
+        <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 1.5 }}>
+          {(() => {
+            const vals = initialValues || {};
+            const getNum = (key: string, fallback: number): number => {
+              const v = vals[key];
+              if (v === undefined || v === null || v === '') return fallback;
+              const n = Number(v);
+              return isNaN(n) ? fallback : n;
+            };
+
+            const base = getNum('score_threshold', 0.10);
+            const pretrendFloor = getNum('scoring.pretrend_threshold_floor', 0.45);
+            const pretrendOffset = getNum('scoring.pretrend_threshold_offset', -0.08);
+            const fadeCeiling = getNum('scoring.fade_threshold_ceiling', 0.65);
+            const fadeOffset = getNum('scoring.fade_threshold_offset', 0.08);
+            const rangeFloor = getNum('scoring.range_threshold_floor', 0.45);
+            const rangeOffset = getNum('scoring.range_threshold_offset', -0.10);
+            const neutralCeiling = getNum('scoring.neutral_threshold_ceiling', 0.80);
+            const neutralOffset = getNum('scoring.neutral_threshold_offset', 0.05);
+            const strongAdx = getNum('scoring.trend_strong_adx_threshold', 25);
+            const strongOffset = getNum('scoring.trend_strong_threshold_offset', -0.05);
+            const adxFloor = getNum('scoring.min_adx_for_trade', 22);
+            const adxFloorM5 = getNum('scoring.M5.min_adx_for_trade', 22);
+
+            const trendStrong = +(base + strongOffset).toFixed(4);
+            const trendNormal = +base.toFixed(4);
+            const pretrend = Math.max(pretrendFloor, +(base + pretrendOffset).toFixed(4));
+            const fade = Math.min(fadeCeiling, +(base + fadeOffset).toFixed(4));
+            const range = Math.max(rangeFloor, +(base + rangeOffset).toFixed(4));
+            const neutral = Math.min(neutralCeiling, +(base + neutralOffset).toFixed(4));
+
+            const items = [
+              { label: 'ADX 交易地板(全局)', value: String(adxFloor), color: '#f59e0b' },
+              { label: 'ADX 交易地板(M5)', value: String(adxFloorM5), color: '#f59e0b' },
+              { label: 'TREND (ADX≥' + strongAdx + ')', value: trendStrong.toFixed(4), color: '#22c55e' },
+              { label: 'TREND (普通)', value: trendNormal.toFixed(4), color: '#3b82f6' },
+              { label: 'PRE_TREND', value: pretrend.toFixed(4), color: '#a855f7' },
+              { label: 'FADE', value: fade.toFixed(4), color: '#ef4444' },
+              { label: 'RANGE', value: range.toFixed(4), color: '#eab308' },
+              { label: 'NEUTRAL', value: neutral.toFixed(4), color: '#64748b' },
+            ];
+
+            return items.map((it, i) => (
+              <Box key={i} sx={{ display: 'flex', justifyContent: 'space-between', p: 0.8, borderRadius: 1, backgroundColor: '#1a1d28' }}>
+                <Typography variant="caption" sx={{ color: '#94a3b8' }}>{it.label}</Typography>
+                <Typography variant="body2" sx={{ color: it.color, fontWeight: 600, fontFamily: 'monospace' }}>{it.value}</Typography>
+              </Box>
+            ));
+          })()}
+        </Box>
+        <Typography variant="caption" sx={{ color: '#475569', mt: 1, display: 'block' }}>
+          保存此页面后，阈值 30s 内自动热加载生效
+        </Typography>
+      </Box>
+
+      {/* 字段分布图（保留原表布局，下方加注：分组依据） */}
+      <Box sx={{ mt: 3, p: 2, border: '1px solid #1e293b', borderRadius: 2, backgroundColor: '#0f1117' }}>
+        <Typography variant="subtitle2" sx={{ color: '#94a3b8', fontWeight: 600, fontSize: '0.7rem', mb: 1.5 }}>
+          📋 字段分组（按配置作用域）
+        </Typography>
+        <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 1 }}>
+          {groups.map(g => {
+            const groupFields = fields.filter(f => (f as any).group === g.id);
+            return (
+              <Tooltip key={g.id} title={g.desc} placement="top" arrow>
+                <Box sx={{ p: 1.2, borderRadius: 1, borderLeft: `3px solid ${GROUP_COLORS[g.id]}`,
+                  backgroundColor: `${GROUP_COLORS[g.id]}11`, cursor: 'help' }}>
+                  <Typography variant="caption" sx={{ color: GROUP_COLORS[g.id], fontWeight: 600, fontSize: '0.7rem', display: 'block' }}>
+                    {g.name}
+                  </Typography>
+                  <Typography variant="caption" sx={{ color: '#64748b', fontSize: '0.65rem' }}>
+                    {groupFields.length} 个参数
+                  </Typography>
+                </Box>
+              </Tooltip>
+            );
+          })}
+        </Box>
+      </Box>
+    </>
+  );
+};
+
+export default Threshold;
