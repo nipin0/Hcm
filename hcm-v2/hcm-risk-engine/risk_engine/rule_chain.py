@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -91,6 +90,9 @@ class RuleChain:
         self._min_margin: float = -1.0
         self._max_spread_pips: float = -1.0
         self._cool_minutes: int = -1
+        # [2026-08-22] 同向保本闸门：保本判定容差（价格单位）。
+        # 桥保本时 SL = entry ± 0.15×ATR 严格优于 entry，默认 0 即可（仅兜浮点/点差）。
+        self._be_tolerance: float = 0.0
         self._spread_check_enabled: bool = False
 
         # ── 分值驱动最大持仓数（2026-08-11 v2.5）──
@@ -486,135 +488,127 @@ class RuleChain:
         )
 
     async def _check_cooldown(self, signal_data: dict) -> RuleResult:
-        """同向持仓冷却 = 当前 open 持仓时间窗（基于最近一笔同向【open】持仓 open_time）。
+        """同向保本闸门（纯 BE，2026-08-22 替代旧时间窗冷却）。
 
-        【2026-08-05 修正】冷却只锚定账户【当前仍可持仓（status='open'）】的最近一笔
-        同向真实持仓的 open_time。语义：账户平仓（flat）后冷却立即失效，新同向信号
-        可立即进场；仅当账户持有一笔同向仓、且其开仓距今 < risk.cooldown_minutes
-        （风控面板「同向开仓冷却」键值）时才拦截。
+        需求（用户 2026-08-22）：取消 risk.cooldown_minutes 时间窗限制；改为
+        毫秒级巡查【最新一笔同向 open 持仓】的 SL 价：
+          - 未达保本止损价 → 禁止开新单（REJECT）；
+          - 已达保本（BUY: sl >= entry - tol / SELL: sl <= entry + tol）→ 放行；
+          依次阶梯加仓，直到 Rule 4（max_open_positions）封顶（本规则不替代限仓）。
 
-        已平仓历史单（含 quick-scalp 开仓即平）不得参与冷却判定——否则其 open_time
-        会在冷却窗口内令后续「无持仓」的新信号被误拒（孤儿数据误伤）。
+        读取路径（毫秒级）：
+          1) 快路径：Redis 保本标志 `hcm:pos:be:{account}:{dir}`（桥 trailing 抬 SL
+             时写入，TTL 15s）。仅当标志 == "1"（达保本）时直接放行；
+          2) 回退真值源：实时查 PG positions（每次信号毫秒级、不缓存），取最新一笔
+             同向 open 持仓的 entry_price/sl_price 判定。
 
-        与 Rule 4（全方向持仓数上限 max_open_positions）并存、互不替代：
-        持仓数上限负责封顶总敞口，时间窗负责抑制持仓期内的反复同向加仓。
-
-        cool_minutes<=0 作总开关直接放行；无方向（NO_TRADE/HOLD）信号不冷却；
-        DB 故障 fail-open 放行（记 CRITICAL 可观测）。
+        失败行为（用户已拍板）：DB/Redis 源不可用 → fail-open 放行（记 CRITICAL）。
+        sl_price IS NULL（未知）→ fail-open 放行（一致）。
         """
         account_id = int(signal_data.get("account_id", 0))
         symbol = signal_data.get("symbol", "")
         direction = str(signal_data.get("direction", "") or "").upper()
 
-        # 总开关：cooldown=0 直接放行
-        if self._cool_minutes <= 0:
-            return RuleResult(
-                rule_name="risk_cool_minutes",
-                passed=True,
-                actual_value=0.0,
-                threshold=0.0,
-                message="cooldown disabled (cool_minutes<=0)",
-            )
-
-        # 无方向信号（NO_TRADE/HOLD）不做同向持仓冷却
+        # 无方向信号（NO_TRADE/HOLD）不闸
         if direction not in ("BUY", "SELL"):
             return RuleResult(
                 rule_name="risk_cool_minutes",
                 passed=True,
                 actual_value=0.0,
-                threshold=float(self._cool_minutes),
-                message=f"no direction ({direction or 'NONE'}) — cooldown skipped",
+                threshold=0.0,
+                message=f"no direction ({direction or 'NONE'}) — skipped",
             )
 
-        last_open = None
+        tol = float(getattr(self, "_be_tolerance", 0.0) or 0.0)
+
+        # ── 快路径：Redis 保本标志（毫秒级；仅 "1" 视为已达保本，其余回退 DB）──
+        if self._redis is not None:
+            try:
+                flag = await self._redis.get(f"hcm:pos:be:{account_id}:{direction}")
+                if flag is not None and str(flag).strip() == "1":
+                    return RuleResult(
+                        rule_name="risk_cool_minutes",
+                        passed=True,
+                        actual_value=1.0,
+                        threshold=0.0,
+                        message="Redis BE flag=1 最新同向持仓已达保本，放行",
+                    )
+            except Exception as exc:
+                logger.warning("Redis BE flag read failed (fallback to DB): %s", exc)
+
+        # ── 回退真值源：实时查库（毫秒级，不缓存）──
+        entry = None
+        sl = None
         if self._db is not None and self._db.is_initialized and account_id > 0:
             try:
-                # 冷却锚定账户【最近一笔同向真实持仓的起始时间】。取数优先级：
-                #   1) positions 表当前仍 open 的同向真实持仓的 open_time（活持仓最准）；
-                #   2) 若已平仓（positions 被 reconcile 标 closed 属正常滞后），回退查
-                #      orders 表最近同向【已平】单的 close_time —— 平仓即重置冷却窗口起点，
-                #      保证"刚平完同方向仓 N 分钟内不重复同向开仓"，杜绝 positions 滞后
-                #      导致冷却永久失效（跟单号连开连损根因）。
-                # 注：orders.order_status 之前有硬编码 1(open) 的 bug，已修为 2(closed)，
-                #     此处回退查 orders 才可靠。
-                open_time = await self._db.fetchval(
-                    "SELECT open_time FROM hcm_trading.positions "
+                row = await self._db.fetchrow(
+                    "SELECT open_price, sl FROM hcm_trading.positions "
                     "WHERE account_id=$1 AND direction=$2 "
                     "AND direction IN ('BUY','SELL') "
-                    "AND status = 'open' "
+                    "AND status='open' "
                     "AND mt5_ticket IS NOT NULL AND mt5_ticket > 0 AND lot > 0 "
-                    "AND open_time IS NOT NULL "
+                    "AND open_price IS NOT NULL "
                     "ORDER BY open_time DESC LIMIT 1",
                     account_id, direction,
                 )
-                if open_time is not None:
-                    last_open = open_time
-                else:
-                    # 回退：最近同向已平单的平仓时间（平仓后开始计冷却）
-                    close_time = await self._db.fetchval(
-                        "SELECT close_time FROM hcm_trading.orders "
-                        "WHERE account_id=$1 AND direction=$2 "
-                        "AND direction IN ('BUY','SELL') "
-                        "AND order_status = 2 "
-                        "AND mt5_ticket IS NOT NULL AND mt5_ticket > 0 AND lot > 0 "
-                        "AND close_time IS NOT NULL "
-                        "ORDER BY close_time DESC LIMIT 1",
-                        account_id, direction,
-                    )
-                    last_open = close_time
+                if row is not None:
+                    entry = float(row["open_price"])
+                    sl = row["sl"]
             except Exception as exc:
-                # DB 故障 fail-open，但必须可观测（四道库依赖闸门失效留 CRITICAL）
+                # DB 故障 fail-open（已拍板），但必须可观测
                 logger.critical(
-                    "DB FAILED in _check_cooldown(last same-dir open_time, "
-                    "account=%s, dir=%s): %s — fail-open, risk gate DEGRADED",
-                    account_id, direction, exc)
+                    "DB FAILED in _check_cooldown(BE gate, account=%s, dir=%s): %s "
+                    "— fail-open, risk gate DEGRADED",
+                    account_id, direction, exc,
+                )
                 return RuleResult(
                     rule_name="risk_cool_minutes",
                     passed=True,
                     actual_value=0.0,
-                    threshold=float(self._cool_minutes),
+                    threshold=0.0,
                     message="cooldown DB error — fail-open",
                 )
 
-        # 无任何同向持仓历史 → 放行
-        if last_open is None:
+        # 无同向 open 持仓（flat）→ 放行
+        if entry is None:
             return RuleResult(
                 rule_name="risk_cool_minutes",
                 passed=True,
                 actual_value=0.0,
-                threshold=float(self._cool_minutes),
-                message="no same-direction position history — cooldown passed",
+                threshold=0.0,
+                message="no same-direction open position — passed",
             )
 
-        # 计算距最近同向开仓时间的间隔（分钟）
-        now = datetime.now(timezone.utc)
-        if last_open.tzinfo is None:
-            # PG 无时区时间戳 → 视作 UTC
-            last_open = last_open.replace(tzinfo=timezone.utc)
-        elapsed_min = (now - last_open).total_seconds() / 60.0
-        # 间隔 >= 冷却键值（风控面板 risk.cooldown_minutes）才放行
-        passed = elapsed_min >= float(self._cool_minutes)
+        # sl 未知 → fail-open（已拍板；备选更安全：视为未达保本拦截）
+        if sl is None:
+            return RuleResult(
+                rule_name="risk_cool_minutes",
+                passed=True,
+                actual_value=0.0,
+                threshold=0.0,
+                message="sl_price unknown — fail-open",
+            )
 
-        if not passed:
-            logger.info(
-                "Cooldown HIT (same-direction interval): signal_id=%s %s %s "
-                "elapsed=%.1fmin < cooldown=%dmin",
-                signal_data.get("signal_id"), symbol, direction,
-                elapsed_min, self._cool_minutes,
+        at_be = (sl >= entry - tol) if direction == "BUY" else (sl <= entry + tol)
+        if at_be:
+            return RuleResult(
+                rule_name="risk_cool_minutes",
+                passed=True,
+                actual_value=round(float(sl), 2),
+                threshold=round(float(entry), 2),
+                message=f"最新同向持仓SL={sl:.2f} 已达保本(entry={entry:.2f})，放行",
             )
         return RuleResult(
             rule_name="risk_cool_minutes",
-            passed=passed,
-            actual_value=round(elapsed_min, 2),
-            threshold=float(self._cool_minutes),
-            message=(f"距最近同向开仓 {elapsed_min:.1f}min >= 冷却 {self._cool_minutes}min，放行"
-                     if passed else
-                     f"距最近同向开仓 {elapsed_min:.1f}min < 冷却 {self._cool_minutes}min，拦截"),
+            passed=False,
+            actual_value=round(float(sl), 2),
+            threshold=round(float(entry), 2),
+            message=f"最新同向持仓SL={sl:.2f} 未达保本(entry={entry:.2f})，禁止开新单",
         )
 
 
     async def mark_cooldown(self, signal_data: dict) -> None:
-        """【已废弃·2026-08-03】冷却已改为同方向实时持仓数闸门（见 _check_cooldown），
+        """【已废弃·2026-08-03】同向闸门已改为「同向保本闸门」（见 _check_cooldown），
         不再使用 Redis 时间窗键。此方法保留仅为兼容 stream_consumer 的调用点，
         不再写入任何冷却键。
         """
@@ -775,6 +769,8 @@ class RuleChain:
             new_margin = await self._config.get_float("risk.margin_call_level")
             new_spread = await self._config.get_float("risk_spread_max_multiplier", 999.0)
             new_cool = await self._config.get_int("risk.cooldown_minutes", 5)
+            # [2026-08-22] 同向保本闸门容差（价格单位，默认 0）
+            new_be_tol = await self._config.get_float("risk.cool_be_tolerance", 0.0)
             try:
                 spread_mult = await self._config.get_float("risk_spread_max_multiplier", 0)
                 new_spread_enabled = spread_mult > 0
@@ -798,6 +794,7 @@ class RuleChain:
             self._min_margin = new_margin
             self._max_spread_pips = new_spread
             self._cool_minutes = new_cool
+            self._be_tolerance = new_be_tol
             self._spread_check_enabled = new_spread_enabled
             self._score_driven_positions_enabled = new_score_pos_enabled
             self._score_tier_low_positions = new_score_tier_low
@@ -809,11 +806,12 @@ class RuleChain:
             logger.info(
                 "RuleChain config loaded: confidence=%.2f, single_lot=%.2f, "
                 "total_exposure=%.2f, max_pos=%d, daily_loss=%.2f, min_margin=%.2f, "
-                "max_spread=%.1f, cool_min=%d, spread_check=%s, "
+                "max_spread=%.1f, cool_min=%d, be_tol=%.2f, spread_check=%s, "
                 "score_pos_enabled=%s tier_low=%.2f tier_mid=%.2f pos_low=%d pos_mid=%d pos_high=%d",
                 self._min_confidence, self._max_lot_single, self._max_total_lot,
                 self._max_open_positions, self._max_daily_loss, self._min_margin,
-                self._max_spread_pips, self._cool_minutes, self._spread_check_enabled,
+                self._max_spread_pips, self._cool_minutes, self._be_tolerance,
+                self._spread_check_enabled,
                 self._score_driven_positions_enabled, self._score_tier_low_positions,
                 self._score_tier_mid_positions, self._max_positions_low,
                 self._max_positions_mid, self._max_positions_high,

@@ -99,7 +99,7 @@ _REASON_CONTAINS: tuple[tuple[str, str], ...] = (
     ("risk_max_open_positions", "同向最大订单（同方向持仓数已达上限）"),
     ("max_open_positions", "同向最大订单（同方向持仓数已达上限）"),
     ("same_dir_bypass_limit", "同向最大订单（同方向实时持仓数达上限）"),
-    ("risk_cool_minutes", "同向冷却（同方向上一笔持仓在冷却分钟内）"),
+    ("risk_cool_minutes", "同向保本闸门（最新同向持仓SL达保本才放行）"),
     ("risk_daily_loss", "当日亏损熔断（已达单日最大亏损）"),
     ("risk_min_confidence", "置信度不足（低于风控最小置信度）"),
     ("risk_spread", "点差过大（超出风控点差上限）"),

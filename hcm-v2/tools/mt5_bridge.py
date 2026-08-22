@@ -4007,6 +4007,13 @@ async def main(dry_run=False):
                     # 且 _update_total_trailing_stop 会在跟单号自身总盈亏回撤时"全部平仓"，
                     # 二者皆导致「主号仍持仓、跟单号已平仓」的错位平仓。
                     log.debug("Trailing skipped: IS_FOLLOWER bridge, SL/TP driven by master mirror")
+                    # [2026-08-22] 跟单号复刻主号：跟单桥不独立抬 SL，但独立写保本标志
+                    #（SL 由主号镜像驱动，读本地 positions_get 即知当前 SL 是否达保本），
+                    # 使风控「同向保本闸门」在跟单号上也走毫秒级 Redis 快路径，行为与主号一致。
+                    try:
+                        _write_be_flags(mt5, redis_conn)
+                    except Exception as e:
+                        log.error(f"follower BE flag write failed: {e}")
                 else:
                     # 加固A2：断连时内部 MT5 调用可能抛异常，局部捕获避免冒泡到主循环
                     try:
@@ -4272,6 +4279,11 @@ def _update_trailing_stops(mt5, redis_conn):
             CLOSE_CONFIG_DEFAULTS["close.tp_relay_enabled"],
         )
 
+        # Redis 保本标志（2026-08-22）：供风控「同向保本闸门」毫秒级读取。
+        # 每方向仅保留【最新一笔】持仓（open_time 最大）的保本状态；达保本→set "1"(TTL15s)，
+        # 未达/无持仓→delete，让标志过期回退 DB 真值源（防"已平仓仍被旧标志拦截"）。
+        _be_latest: dict[str, tuple] = {}
+
         for pos in positions:
             if pos.sl == 0 and pos.price_open is None:
                 continue  # need price_open to calculate
@@ -4283,6 +4295,14 @@ def _update_trailing_stops(mt5, redis_conn):
             entry = pos.price_open  # entry price
             new_sl = pos.sl or 0.0
             pos_type = "BUY" if pos.type == 0 else "SELL" if pos.type == 1 else ""
+
+            # ── BE 标志记录（先用当前 SL 估算；下方修改成功后用 new_sl 覆盖）──
+            _dir = "BUY" if pos.type == 0 else "SELL"
+            _eff_sl = pos.sl or 0.0
+            _at_be = (_eff_sl >= entry) if _dir == "BUY" else (_eff_sl <= entry)
+            _prev_t = (_be_latest.get(_dir) or (0,))[0]
+            if _dir and pos.time is not None and pos.time >= _prev_t:
+                _be_latest[_dir] = (pos.time, _at_be)
 
             # ── 灵敏保本门槛 (2026-07-23): 盈利达 TP 距30% 或 0.3×ATR 即保本 ──
             # 原 be_trigger=0.8×ATR 在 ATR 偏高(≈10)时会高于单子最大盈利(到 TP 即平),
@@ -4371,6 +4391,9 @@ def _update_trailing_stops(mt5, redis_conn):
                 r = _mt5_global.order_send(request)
                 if r and r.retcode == 10009:
                     log.info(f"Trail #{pos.ticket} {pos_type}: SL {pos.sl}→{new_sl} TP→{new_tp}")
+                    # 以最新下发 SL 覆盖 BE 标志（该笔为最新持仓时生效）
+                    _at_be2 = (new_sl >= entry) if _dir == "BUY" else (new_sl <= entry)
+                    _be_latest[_dir] = (pos.time, _at_be2)
                 else:
                     retcode = r.retcode if r else "N/A"
                     err_info = ""
@@ -4385,8 +4408,67 @@ def _update_trailing_stops(mt5, redis_conn):
                         f"Trail FAIL #{pos.ticket} {pos_type}: "
                         f"SL {pos.sl}→{new_sl} TP→{new_tp}, retcode={retcode}, {err_info}"
                     )
+        # 写 Redis 保本标志（毫秒级供风控读取）：达保本 set "1"(TTL 15s)，未达/无持仓 delete
+        if ACCOUNT_ID_MODE:
+            try:
+                for _d in ("BUY", "SELL"):
+                    _t, _be = _be_latest.get(_d, (0, False))
+                    _key = f"hcm:pos:be:{ACCOUNT_ID_MODE}:{_d}"
+                    if _be:
+                        redis_conn.set(_key, "1", ex=15)
+                    else:
+                        redis_conn.delete(_key)
+            except Exception as _be_exc:
+                log.error(f"BE flag write failed: {_be_exc}")
     except Exception as e:
         log.error(f"_update_trailing_stops error: {e}")
+
+
+def _write_be_flags(mt5, redis_conn) -> None:
+    """写 Redis 保本标志（主桥/跟单桥共用，2026-08-22）。
+
+    供风控「同向保本闸门」毫秒级读取 `hcm:pos:be:{ACCOUNT_ID_MODE}:{BUY|SELL}`：
+      每方向仅保留【最新一笔】持仓（open_time 最大）的保本状态；
+      达保本（BUY: sl>=entry / SELL: sl<=entry）→ set "1"(TTL 15s)；
+      未达 / 无持仓 → delete（标志缺失 → 风控回退查 PG 真值源，防"已平仓仍被旧标志拦截"）。
+    注：与 _update_trailing_stops 内的内联标志写入语义一致（该处用循环内 new_sl 即时值，
+        本函数重读 MT5 当前 SL；二者等价，因 order_send 成功后同会话 positions_get 即返回新 SL）。
+    """
+    if not ACCOUNT_ID_MODE:
+        return
+    try:
+        _positions = mt5.positions_get()
+    except Exception:
+        return  # 读取失败不盲删，让旧标志 TTL 过期回退 DB
+    if not _positions:
+        # 无持仓（flat）→ 清空两方向标志
+        for _d in ("BUY", "SELL"):
+            try:
+                redis_conn.delete(f"hcm:pos:be:{ACCOUNT_ID_MODE}:{_d}")
+            except Exception:
+                pass
+        return
+    _latest: dict[str, tuple] = {}
+    for _pos in _positions:
+        _dir = "BUY" if _pos.type == 0 else "SELL"
+        _entry = getattr(_pos, "price_open", None)
+        _sl = getattr(_pos, "sl", None)
+        _t = getattr(_pos, "time", 0) or 0
+        if _entry is None or _sl is None:
+            continue
+        _be = (_sl >= _entry) if _dir == "BUY" else (_sl <= _entry)
+        if _t >= (_latest.get(_dir) or (0,))[0]:
+            _latest[_dir] = (_t, _be)
+    for _d in ("BUY", "SELL"):
+        _t, _be = _latest.get(_d, (0, False))
+        _key = f"hcm:pos:be:{ACCOUNT_ID_MODE}:{_d}"
+        try:
+            if _be:
+                redis_conn.set(_key, "1", ex=15)
+            else:
+                redis_conn.delete(_key)
+        except Exception:
+            pass
 
 
 def _update_total_trailing_stop(mt5, redis_conn):
