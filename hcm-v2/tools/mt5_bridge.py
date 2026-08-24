@@ -1258,28 +1258,10 @@ def place_mt5_order(mt5, signal_data, symbol, timeframe_str, redis_conn=None):
     # ── 入场价偏移闸门（核心修复）：信号基于 T0 的 entry_price，若行情已漂离则拒绝 ──
     # 这是"错过入场点=直接止损"的真正防线，替代原来不靠谱的墙钟秒数闸门。
     entry_price = float(signal_data.get("entry_price", 0.0) or 0.0)
-    # ── B-2 跟单锚点：跟单号改用「主号真实成交价」作滑点基准（闸门倍数 0.3 不变）──
-    # 主号 T0 entry_price 在链路延迟(T0→T_now)下天然漂移 1-3 美元，跟单号若以之作基准，
-    # 价差=漂移量而非真实跨经纪商点差。改以主号真实成交价(hcm:master:fill:{sid})为锚，
-    # 价差收敛到跨经纪商点差级。超龄(>follower_fill_max_age_ms)则回退 T0 entry_price(不强行锚定过期价)。
-    # 闸门倍数维持 0.3(与主号一致)，用户要求不放大跟单滑点容忍度——靠基准更准收敛而非放宽。
-    if IS_FOLLOWER and entry_price > 0 and redis_conn:
-        try:
-            _fill_raw = redis_conn.get(f"hcm:master:fill:{sig_id}")
-            if _fill_raw:
-                _fill_j = json.loads(_fill_raw if isinstance(_fill_raw, str) else _fill_raw.decode())
-                _fill_ts = int(_fill_j.get("ts", 0))
-                _fill_price = float(_fill_j.get("price", 0.0) or 0.0)
-                _max_age = _get_follower_fill_max_age_ms(redis_conn)
-                if _fill_price > 0 and (int(time.time() * 1000) - _fill_ts) <= _max_age:
-                    log.info("Follower entry anchor: sid=%s use master fill=%.3f (vs T0 entry=%.3f)",
-                             sig_id, _fill_price, entry_price)
-                    entry_price = _fill_price
-                else:
-                    log.debug("Follower entry anchor: sid=%s master fill stale/zero — keep T0 entry=%.3f",
-                              sig_id, entry_price)
-        except Exception as _e:
-            log.debug("Follower entry anchor read failed sid=%s: %s", sig_id, _e)
+    # 【阶段1 去跟单化 2026-08-24】移除 B-2 跟单 master-fill 锚点：
+    # 跟单号不再用主号真实成交价(hcm:master:fill:{sid})作滑点基准——主号成交价在链路延迟下
+    # 已漂移，且此依赖让跟单号滑点判断受主号执行影响。现在所有账号（含跟单号）一律用
+    # 信号 T0 entry_price + 自身实时 tick（与主号完全同口径），滑点闸门公平一致。
     if entry_price > 0:
         exec_price = tick.ask if direction == "BUY" else tick.bid
         slip_pts = abs(exec_price - entry_price)
@@ -1648,6 +1630,26 @@ async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
                     return False
         except Exception as _exc:
             log.warning("reverse guard check failed sid=%s: %s (fail-open)", sid, _exc)
+    # ── 阶段2 账号维度持仓数上限（2026-08-24 去跟单化）──
+    # 每账号开仓前检查自己的实时持仓数（mt5.positions_get()），超过全局 risk_max_open_positions
+    # 上限即拒绝（仅 BUY/SELL 开仓；平仓/改仓不受限）。risk-engine 的持仓风控只评估信号
+    # account_id(=主号)，跟单号独立下单后其持仓不计入 → 此检查补上账号维度持仓数兜底，
+    # 防止任一账号（含跟单号）无限开仓。复用全局配置，与现有风控阈值一致。
+    if _dir in ("BUY", "SELL"):
+        try:
+            _cap_val = _get_close_config(redis_conn, "risk_max_open_positions", 3.0)
+            _max_pos = int(_cap_val)
+            if _max_pos > 0:
+                _pos_all = mt5.positions_get() or []
+                _open_cnt = len(_pos_all)
+                if _open_cnt >= _max_pos:
+                    log.warning(
+                        "ACCOUNT POSITION CAP: block %s signal %s sym=%s — open_positions=%d >= %d",
+                        _dir, sid, msg_symbol, _open_cnt, _max_pos)
+                    _audit_signal_stage(redis_conn, sid, "position_cap_blocked")
+                    return False
+        except Exception as _cap_err:
+            log.warning("account position cap check failed sid=%s: %s (fail-open)", sid, _cap_err)
     if not dry_run:
         result = place_mt5_order(mt5, msg_data, msg_symbol, timeframe_str, redis_conn)
         if result['code'] == 0:
@@ -2366,99 +2368,14 @@ async def reconcile_follower_positions(mt5, redis_conn, pool) -> None:
             if not _fsid:
                 _fsid = str(_fp.ticket)
             _follower_ids[_fsid] = _fp
-        # 主号有、跟单缺 → 仅补「新单」，历史漏单一律不补
-        # 2026-08-21 优化（用户：错过不再补单）：已删除 pending 强制补开逻辑。
-        # 原 bridge:follower:pending:* 强制补开会在信号流抖动后主号已跑远时仍按现价硬补，
-        # 价格差异过大→跟单号即刻触发主号 SL 止损。现所有补开统一过时效+滑点闸门，
-        # 错过的单（无论信号流丢失还是桥重启）永久放弃，不追。
+        # 【阶段1 去跟单化 2026-08-24】移除「补缺失」逻辑（主号有、跟单缺→补开）：
+        # 跟单号改为独立下单后，信号链路已保证跟单号与主号同时收到同一信号并各自开仓，
+        # reconcile 再按主号持仓补开会与独立开仓冲突（重复开仓 / 追高）。跟单号错过即
+        # 放弃（行情已走远，补了止损），不再兜底补开。
         #
-        # 用户明确要求（2026-08-10）：已漏掉的不用补，行情已错过，补了会导致止损。
-        # 老单主号早已在更优价位入场（且可能已带浮盈/移动止损），此刻按现价补进去
-        # 等于在错误价位追单，主号 SL 对跟单号而言可能已是「即刻触发」→ 补即止损。
-        # 故补开须同时通过两道闸门，任一不过即永久放弃该单（登记 skip 标记不再刷日志）：
-        #   闸门①·时效：主号开仓距今 > RECONCILE_BACKFILL_MAX_AGE_SEC 视为历史单。
-        #   闸门②·滑点：现价偏离主号开仓价 > RECONCILE_BACKFILL_MAX_SLIP_ATR × ATR
-        #             视为行情已走远（即便时效内，急速行情也不追）。
-        for _sid, _md in _master_ids.items():
-            if FOLLOW_CIRCUIT_BROKEN:
-                continue  # 熔断期间不补开任何跟单仓
-            if _sid in _follower_ids:
-                continue
-            _skip_key = f"bridge:backfill_skip:{ACCOUNT_ID_MODE}:{_sid}"
-            try:
-                if redis_conn.get(_skip_key):
-                    continue
-            except Exception:
-                pass
-
-            # 闸门①·时效
-            _m_open_ts = float(_md.get("open_time") or 0)
-            if _m_open_ts <= 0:
-                # 快照无开仓时间（主号桥为旧版本）→ 保守放弃，不盲目追单
-                log.warning(
-                    "Reconcile: SKIP backfill signal_id=%s — master open_time unavailable "
-                    "(refuse blind chase)", _sid)
-                try:
-                    redis_conn.set(_skip_key, "no_open_time", ex=2592000)
-                except Exception:
-                    pass
-                continue
-            _age = now_ts - _m_open_ts
-            # 2026-08-21 优化（用户要求：错过不再补单）：取消 pending 强制补开。
-            # 旧逻辑：信号流 SKIP 但主号已建仓即绕过时效闸门硬补 → 行情已走远时按现价
-            # 追单，价格差异过大→跟单号即刻触发主号 SL 止损。现统一过时效+滑点闸门，
-            # 任何错过（无论信号流抖动还是桥重启）都不再硬补，只对「刚开且行情未走远」
-            # 的真新单兜底补开（仍受下方闸②滑点约束）。
-            if _age > RECONCILE_BACKFILL_MAX_AGE_SEC:
-                log.warning(
-                    "Reconcile: SKIP stale backfill signal_id=%s sym=%s dir=%s "
-                    "age=%.0fs > %ds — market moved on, chasing would stop out",
-                    _sid, _md.get("symbol"), _md.get("direction"),
-                    _age, RECONCILE_BACKFILL_MAX_AGE_SEC)
-                try:
-                    redis_conn.set(_skip_key, "stale", ex=2592000)
-                except Exception:
-                    pass
-                continue
-
-            # 闸门②·滑点（现价 vs 主号开仓价，以 ATR 为尺）
-            _m_open_px = float(_md.get("open_price") or 0.0)
-            if _m_open_px > 0:
-                _real2 = real_symbol(_md.get("symbol") or SYMBOL)
-                _tick2 = None
-                try:
-                    _tick2 = mt5.symbol_info_tick(_real2)
-                except Exception:
-                    _tick2 = None
-                if _tick2:
-                    _now_px = (_tick2.ask if _md.get("direction") == "BUY"
-                               else _tick2.bid)
-                    _atr2 = _get_atr_from_redis(redis_conn,
-                                                _md.get("symbol") or SYMBOL)
-                    _max_slip = (_atr2 * RECONCILE_BACKFILL_MAX_SLIP_ATR
-                                 if _atr2 > 0 else 0.0)
-                    _slip = abs(float(_now_px) - _m_open_px)
-                    if _max_slip > 0 and _slip > _max_slip:
-                        log.warning(
-                            "Reconcile: SKIP slipped backfill signal_id=%s sym=%s dir=%s "
-                            "master_open=%.2f now=%.2f slip=%.2f > %.2f (%.1f×ATR) "
-                            "— entry gone, chasing would stop out",
-                            _sid, _md.get("symbol"), _md.get("direction"),
-                            _m_open_px, float(_now_px), _slip, _max_slip,
-                            RECONCILE_BACKFILL_MAX_SLIP_ATR)
-                        try:
-                            redis_conn.set(_skip_key, "slipped", ex=2592000)
-                        except Exception:
-                            pass
-                        continue
-
-            _m_acct = next(iter(FOLLOW_MASTERS), None)
-            log.warning(
-                "Reconcile: follower MISSING master signal_id=%s sym=%s dir=%s vol=%.2f "
-                "age=%.0fs → open (fresh)",
-                _sid, _md.get("symbol"), _md.get("direction"),
-                float(_md.get("volume") or 0), _age)
-            await _open_follower_position(mt5, redis_conn, pool, _md, _m_acct, _sid)
+        # 原逻辑保留在 git 历史：RECONCILE_BACKFILL_MAX_AGE_SEC / RECONCILE_BACKFILL_MAX_SLIP_ATR
+        # / _open_follower_position 补开路径已随去跟单化移除。仅保留下方「清孤儿」与
+        # 「按品种 excess 清理」作为孤儿/重复单的风控兜底。
         # 跟单有、主号无 → 清孤儿
         for _sid, _fp in _follower_ids.items():
             if _sid in _master_ids:
@@ -3557,83 +3474,22 @@ async def main(dry_run=False):
                             elif sig_account != ACCOUNT_ID_MODE:
                                 # 自动信号（co_source / live_override 等，模式无关）：
                                 #   · 主号桥：仅执行 account_id==本桥 的信号（自动信号 account_id 恒为主号）。
-                                #   · 跟单桥：复制所有来自 FOLLOW_MASTERS 主号的信号——不再比 sig_account==本桥
-                                #     （跟单号收到的是主号 account_id，旧逻辑会整批跳过 → 跟单不下单）。
-                                #     copy-trading 为 STUB（返回假 ticket），故跟单必须且只能由跟单桥自己复制执行。
+                                #   · 跟单桥【阶段1 去跟单化 2026-08-24】：对来自 FOLLOW_MASTERS 主号的信号
+                                #     直接独立执行（不复制主号成交、不等主号建仓）。信号已广播，跟单号
+                                #     与主号同时收到同一份 risk_passed，走同一链路独立下单。
                                 if IS_FOLLOWER:
                                     if sig_account not in FOLLOW_MASTERS:
                                         for _dmid, _dmsg in entries_sorted:
                                             redis_conn.xack("signal:risk_passed", BRIDGE_GROUP, _dmid)
                                         continue
-                                    # A-护栏：主号真实持仓交叉校验——复制前确认主号确为本信号建仓。
-                                    # 主号快照 hcm:master:positions:{master} 为主要判据；时序竞态（信号流快于
-                                    # 快照刷新/映射写入）导致首轮匹配失败时，降级查 PG hcm_trading.positions
-                                    # 二次确认。两者皆无→主号真未建仓→标记 pending 后丢弃（不盲追、不误开）。
-                                    _sid = latest_data.get("signal_id")
-                                    _m_snap_key = f"hcm:master:positions:{sig_account}"
-                                    _master_has_sid = False
-                                    try:
-                                        _m_snap = redis_conn.hgetall(_m_snap_key)
-                                        for _mt, _mv in _m_snap.items():
-                                            try:
-                                                _mt = _mt.decode() if isinstance(_mt, bytes) else _mt
-                                                _msid = redis_conn.get(f"hcm:signal_for_ticket:{_mt}")
-                                                _msid = _msid.decode() if isinstance(_msid, bytes) else _msid
-                                                if _msid and str(_msid) == str(_sid):
-                                                    _master_has_sid = True
-                                                    break
-                                                if str(_mt) == str(_sid):
-                                                    _master_has_sid = True
-                                                    break
-                                            except Exception:
-                                                continue
-                                    except Exception:
-                                        _m_snap = {}
-                                    if _master_has_sid:
-                                        # 快照匹配成功→直接通过（含新鲜度已由主号每轮刷新保证）
-                                        pass
-                                    else:
-                                        # 降级：PG 二次确认主号是否真为此信号开仓（时序竞态兜底）
-                                        _pg_has = False
-                                        try:
-                                            _pg_row = await pool.fetchrow(
-                                                "SELECT 1 FROM hcm_trading.positions "
-                                                "WHERE signal_id=$1 AND account_id=$2 AND status='open' AND mt5_ticket>0 "
-                                                "LIMIT 1",
-                                                int(_sid) if str(_sid).isdigit() else _sid, sig_account,
-                                            )
-                                            _pg_has = _pg_row is not None
-                                        except Exception as _pgerr:
-                                            log.warning("Follower PG confirm failed for signal %s: %s", _sid, _pgerr)
-                                        if _pg_has:
-                                            # 主号确已开仓，仅因快照时序未就绪→放行复制（不依赖快照）
-                                            _master_has_sid = True
-                                            log.info(
-                                                "Follower replication PG-confirmed master open for signal %s "
-                                                "(snapshot not yet ready, proceeding)",
-                                                _sid)
-                                        else:
-                                            # 主号持仓时序未就绪（快照/PG 写入延迟）→ 标记 pending 供
-                                            # reconcile 兜底，且【不 xack 本条】留待下轮重试（fail-open：
-                                            # 绝不因时序竞态永久丢弃合法跟单信号，下轮主号持仓就绪后即复制）。
-                                            try:
-                                                redis_conn.set(
-                                                    f"bridge:follower:pending:{sig_account}:{_sid}",
-                                                    "1", ex=120)
-                                            except Exception:
-                                                pass
-                                            log.info(
-                                                "Follower replication DEFER signal %s (mode=%s) from master %s — "
-                                                "no master position yet (snapshot+PG empty, will retry next loop)",
-                                                _sid, sig_mode, sig_account)
-                                            # 仅 xack 本批次非最新消息；latest 这条留待下轮重试
-                                            for _dmid, _dmsg in entries_sorted:
-                                                if _dmid == latest_id:
-                                                    continue
-                                                redis_conn.xack("signal:risk_passed", BRIDGE_GROUP, _dmid)
-                                            continue
+                                    # 【阶段1 去跟单化 2026-08-24】跟单号改为「独立下单」，不再复制主号成交：
+                                    # 移除 A-护栏（主号真实持仓交叉校验 hcm:master:positions / PG 二次确认 /
+                                    # pending DEFER）——这些让跟单号被迫"等主号先建仓"再复制，是
+                                    # "跟单号跟不上主号"的结构性延迟源。信号本身已广播，跟单号与主号
+                                    # 同时收到同一份 risk_passed，直接独立执行（手数按账号倍率缩放）。
+                                    # 共享信号级风控（主号被拒则全部不开），滑点/仓位由各账号自身闸门兜底。
                                     log.info(
-                                        "Follower bridge: replicating auto signal %s (mode=%s) from master account_id=%s",
+                                        "Follower bridge: independent execution of auto signal %s (mode=%s) from master account_id=%s",
                                         int(latest_data.get("signal_id", 0)), sig_mode, sig_account,
                                     )
                                 else:
@@ -3824,57 +3680,11 @@ async def main(dry_run=False):
                                                   sid, msg_data.get("symbol", ""), _e2e, _e2e_raw)
                                 except Exception:
                                     pass
-                            # 2026-08-17 修复：跟单复制开仓前「主号真实持仓对账」守卫（根治比主号多一单）。
-                            # 根因：主号同刻双发/快速平开时，两地信号都进 signal:risk_passed 流 → 跟单桥把
-                            # 两笔都复制开仓；主号侧因 latest-wins 去重或开仓后快速平仓只保留其一，导致
-                            # 跟单号多出主号已丢弃的 signal_id 孤儿单（实证 1516636）。PG hcm_trading.positions
-                            # 是真实成交记录（不滞后于实际开仓），主号无该 signal_id 的 open 持仓 → 跟单跳过复制。
-                            # 查询失败 → fail-open 放行（不误杀合法跟单），交 reconcile 兜底对账。
-                            if IS_FOLLOWER and FOLLOW_MASTERS and direction in ("BUY", "SELL"):
-                                # B-3 优化：优先读 Redis 主号持仓快照(hcm:master:positions:{aid})，
-                                # 命中即跳过 PG 查询，降链接延迟(每信号省 1 次 PG round-trip)。
-                                # 快照缺失/解析失败 → fallback 到 PG 查询(原逻辑)。查询失败 → fail-open 放行。
-                                _master_has = True
-                                try:
-                                    _redis_hit = False
-                                    for _ma in FOLLOW_MASTERS:
-                                        try:
-                                            _snap_raw = redis_conn.get(f"hcm:master:positions:{_ma}")
-                                        except Exception:
-                                            _snap_raw = None
-                                        if not _snap_raw:
-                                            continue
-                                        try:
-                                            _snap = json.loads(_snap_raw if isinstance(_snap_raw, str) else _snap_raw.decode())
-                                        except Exception:
-                                            _snap = None
-                                        if isinstance(_snap, dict) and str(sid) in _snap:
-                                            _redis_hit = True
-                                            break
-                                    if not _redis_hit:
-                                        async with pool.acquire() as _mconn:
-                                            _mrow = await _mconn.fetchrow(
-                                                "SELECT 1 FROM hcm_trading.positions "
-                                                "WHERE signal_id=$1 AND account_id=ANY($2::int[]) "
-                                                "AND status='open' LIMIT 1",
-                                                sid, list(FOLLOW_MASTERS),
-                                            )
-                                        _master_has = bool(_mrow)
-                                except Exception as _me:
-                                    log.warning(
-                                        "Follower master-pos check failed (signal %s): %s — "
-                                        "fail-open allow replicate", sid, _me
-                                    )
-                                    _master_has = True
-                                if not _master_has:
-                                    log.info(
-                                        "Follower SKIP replicate %s signal %s: master has NO open "
-                                        "position for this signal_id (avoid orphan; master dropped/deduped)",
-                                        direction, sid,
-                                    )
-                                    redis_conn.set(f"bridge:processed:{ACCOUNT_ID_MODE}:{sid}", "done", ex=2592000)
-                                    redis_conn.xack("signal:risk_passed", BRIDGE_GROUP, msg_id)
-                                    continue
+                            # 【阶段1 去跟单化 2026-08-24】移除「主号真实持仓对账」守卫（跟单复制开仓前
+                            # 检查主号是否已有该信号 open 持仓，无则 SKIP）。此为复制跟单语义残留——
+                            # 跟单号必须等主号持仓出现才复制，与独立下单冲突（实证：跟单号收到信号但
+                            # 因"master has NO open position"被 SKIP、主号却开仓）。跟单号已独立下单，
+                            # 不应再以主号持仓为前提。孤儿/重复单由 reconcile「清孤儿」兜底。
                             # Dedup — Redis fast path
                             if redis_conn.get(f"bridge:processed:{ACCOUNT_ID_MODE}:{sid}"):
                                 redis_conn.xack("signal:risk_passed", BRIDGE_GROUP, msg_id)

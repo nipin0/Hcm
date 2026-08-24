@@ -77,9 +77,17 @@ MIN_SAMPLES_FOR_SWITCH = int(os.environ.get("RETRAIN_MIN_SAMPLES", "200"))
 DS_MIN_NONZERO_RATIO = float(os.environ.get("DS_MIN_NONZERO_RATIO", "0.30"))
 
 # ── P3-B/C 触发阈值（环境变量可覆盖）────────────────────────────────────
-PSI_TRIGGER = float(os.environ.get("PSI_TRIGGER", "0.25"))          # 特征分布漂移阈值
+PSI_TRIGGER = float(os.environ.get("PSI_TRIGGER", "0.25"))          # 特征分布漂移阈值（普遍漂移）
+PSI_HARD_TRIGGER = float(os.environ.get("PSI_HARD_TRIGGER", "0.50"))  # 单特征重度漂移阈值（≥1 个即触发）
 CALIB_COLLAPSE_PCT = float(os.environ.get("CALIB_COLLAPSE_PCT", "0.90"))  # 置信坍缩占比阈值
 DRY_RUN = False  # 置 True 时 switch_model 只记录不切换（验证/灰度用）
+# 【2026-08-24 修复】高波动/非平稳环境特征：分布天然不平稳（如 event_proximity_min
+# 是"距下一重大事件分钟数"，事件日历变化导致其分布随时间剧变），PSI 恒虚高，
+# 既不应作为重训触发依据，也避免干扰 psi_max（制造"重度漂移"假象）。报表仍展示，
+# 仅重训触发时豁免。可从环境变量 PSI_EXEMPT_FEATURES 追加（逗号分隔）。
+PSI_EXEMPT_FEATURES = set(
+    (os.environ.get("PSI_EXEMPT_FEATURES", "event_proximity_min") or "").split(",")
+)
 
 PY = sys.executable
 DS_API_DEFAULT = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1/chat/completions")
@@ -156,7 +164,11 @@ def next_model_version() -> int:
 def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
     log(f"[run] {' '.join(cmd)}")
     try:
-        p = subprocess.run(cmd, cwd=TOOLS_DIR, capture_output=True, text=True, timeout=timeout)
+        # 【2026-08-24 修复】Windows 下 subprocess text=True 默认用 locale 编码(GBK)解码
+        # 子进程 UTF-8 中文输出 → 乱码 → parse_auc/ds_nonzero_ratio 正则匹配失败
+        # （日志实证 ds_nonzero_ratio=None、裁判信息不足）。强制 UTF-8 解码。
+        p = subprocess.run(cmd, cwd=TOOLS_DIR, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, "", f"timeout after {timeout}s"
@@ -190,12 +202,18 @@ def count_samples(stdout: str) -> int:
 
 def ds_nonzero_ratio(stdout: str) -> float | None:
     import re
-    m = re.search(r"DeepSeek 特征非零占比 (\d+\.\d+)%", stdout)
-    if m:
-        return float(m.group(1)) / 100.0
-    m2 = re.search(r"ds_diag\] WARNING: DeepSeek 特征非零占比仅 (\d+\.\d+)%", stdout)
-    if m2:
-        return float(m2.group(1)) / 100.0
+    # 【2026-08-24 修复】train 的 ds_diag 改纯 ASCII 输出（避免 Windows 编码乱码）；
+    # 兼容新旧两种格式：
+    #   新(ASCII): [ds_diag] WARNING: DeepSeek nonzero ratio only 13.9% ...
+    #   新(ASCII): [ds_diag] DeepSeek nonzero ratio 35.0% (>=30%), usable ...
+    #   旧(中文): [ds_diag] DeepSeek 特征非零占比 13.9% ...
+    for pat in (
+        r"DeepSeek nonzero ratio (?:only |)(\d+\.\d+)%",
+        r"DeepSeek 特征非零占比(?:仅|)(\d+\.\d+)%",
+    ):
+        m = re.search(pat, stdout)
+        if m:
+            return float(m.group(1)) / 100.0
     return None
 
 
@@ -442,7 +460,26 @@ def _compute_trigger(baseline, feat_cols, ai, feats, passed):
     edges.append(100)
     counts, _ = np.histogram(arr, bins=edges)
     collapse = (counts.max() / max(1, int(counts.sum()))) > CALIB_COLLAPSE_PCT
-    triggered = (psi["max"] > PSI_TRIGGER and psi["mean"] > PSI_TRIGGER) or collapse
+    # 【2026-08-24 修复】触发逻辑根治：
+    #   (1) 豁免高波动/非平稳环境特征（如 event_proximity_min，PSI 恒虚高），
+    #       排除其干扰后重算 max/mean——否则该特征 psi=0.7 制造"重度漂移"假象。
+    #   (2) 原条件 max>0.25 AND mean>0.25 只认"普遍漂移"，单一特征重度漂移
+    #       会被其它 32 个正常特征的均值稀释而漏掉（日志实证 psi_max=0.701 未触发）。
+    #       现补充单特征重度漂移判定：排除豁免后任一特征 psi>PSI_HARD_TRIGGER → 触发。
+    per_feat = psi.get("per_feature", {})
+    eval_feats = {k: v for k, v in per_feat.items() if k not in PSI_EXEMPT_FEATURES}
+    if eval_feats:
+        _max = max(eval_feats.values())
+        _mean = sum(eval_feats.values()) / len(eval_feats)
+        _n_hard = sum(1 for v in eval_feats.values() if v > PSI_HARD_TRIGGER)
+    else:
+        _max, _mean, _n_hard = 0.0, 0.0, 0
+    triggered = collapse or (
+        _max > PSI_TRIGGER and _mean > PSI_TRIGGER) or (_n_hard >= 1)
+    # 观测一致性：psi.max/mean/drifted 用排除豁免特征后的统计，避免日志/报表
+    # 仍显示豁免特征（如 event_proximity_min）制造的重度漂移假象。
+    psi = dict(psi, max=_max, mean=_mean,
+               drifted=[k for k in psi.get("drifted", []) if k not in PSI_EXEMPT_FEATURES])
     return psi, collapse, triggered
 
 
@@ -663,9 +700,13 @@ def retrain_once(use_deepseek: bool = True) -> dict:
         log(f"[ABORT] train failed: {err[-800:]}")
         return {"ok": False, "stage": "train", "error": err[-800:]}
 
-    auc = parse_auc(out)
-    samples = count_samples(out)
-    ds_ratio = ds_nonzero_ratio(out)
+    # 【2026-08-24 修复】train 的 ds_diag(DeepSeek 特征吸收率)打印到 stderr，而
+    # auc/samples 在 stdout——此前只用 stdout 解析 → ds_nonzero_ratio 恒 None →
+    # DeepSeek 裁判拿不到"模型 ds 吸收率"信息而保守回滚。合并两流再解析。
+    _all_out = out + "\n" + err
+    auc = parse_auc(_all_out)
+    samples = count_samples(_all_out)
+    ds_ratio = ds_nonzero_ratio(_all_out)
     log(f"[train] done: auc={auc} samples={samples} ds_nonzero_ratio={ds_ratio}")
 
     payload = {

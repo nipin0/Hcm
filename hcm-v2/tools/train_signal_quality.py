@@ -223,12 +223,15 @@ def main():
     _ds_cols = [c for c in ("ds_fake_prob", "ds_sl_coeff", "ds_continuity") if c in X.columns]
     if _ds_cols:
         _nz = (X[_ds_cols].abs().sum(axis=1) > 0).mean()
+        # 【2026-08-24 修复】改纯 ASCII 输出：Windows 下子进程 stdout 是 GBK/cp936，
+        # auto_retrain 用 UTF-8 解码中文会乱码/替换符 → ds_nonzero_ratio regex 匹配
+        # 失败 → DeepSeek 裁判拿不到 ds 吸收率。纯 ASCII 不受编码影响、跨平台稳定。
         if _nz < 0.3:
-            print(f"[ds_diag] WARNING: DeepSeek 特征非零占比仅 {_nz:.1%} "
-                  f"(历史缺 DeepSeek 票)。重训需积累 ai:ds:out 后再做，"
-                  f"当前模型实质未吸收 ds 语义。", file=sys.stderr)
+            print(f"[ds_diag] WARNING: DeepSeek nonzero ratio only {_nz:.1%} "
+                  f"(history lacks DeepSeek tickets). Retrain after accumulating "
+                  f"ai:ds:out; model has NOT absorbed ds semantics.", file=sys.stderr)
         else:
-            print(f"[ds_diag] DeepSeek 特征非零占比 {_nz:.1%}，可用于训练。",
+            print(f"[ds_diag] DeepSeek nonzero ratio {_nz:.1%} (>=30%), usable for training.",
                   file=sys.stderr)
 
     n = len(y)

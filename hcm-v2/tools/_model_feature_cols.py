@@ -42,4 +42,12 @@ MODEL_FEATURE_COLS = [
     "event_proximity_min",
     "macro_risk_score",
     "sentiment_risk_score",
+    # 【DeepSeek 特征 2026-08-24 纳入契约】ds_* 三列由 quality_features 产出、
+    # 推理侧 build_features 从 Redis ai:ds:out:{sym} 读取；此前只在 _model_feature_cols
+    # 缺失导致 reindex 丢弃、模型从未吸收 ds 语义（ds_diag 永不触发、裁判拿不到
+    # ds_nonzero_ratio）。现纳入 34-36 维，训练 reindex 保留、ds_diag 生效。
+    # 缺省 0.0 语义：与推理侧无 ds 票时恒 0 一致，保证训练-推理同分布。
+    "ds_fake_prob",
+    "ds_sl_coeff",
+    "ds_continuity",
 ]

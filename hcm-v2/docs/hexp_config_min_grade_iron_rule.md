@@ -152,3 +152,29 @@ if (form) (form as HTMLFormElement).requestSubmit();
 ### 可复用改动
 - 本次暴露 signal-tower 容器已 bind mount `hexp_engine.py`（改源码重启即生效），但**配置真相在 PG+Redis**，代码改了不等于配置对——验证时务必 `HGET` 运行时值。
 - `docker logs --since` + `grep "EXTREME CHASE" / "BLOCK hexp_extreme_guard"` 是判断"极值单是否被正确拦截"的最快手段。
+
+---
+
+## 八、延伸事故：调参只写 Redis 被 PG 回填复原（2026-08-24）
+
+### 现象
+用户按第七节调优 `hexp.extreme.k_extreme=2.2`、`hexp.extreme.mm_retreat_min=0.03`、`hexp.momentum_drain_mm=0.04`，但一段时间后 `redis-cli HGET hcm:config:v2` 显示它们**回到 2.0 / 0.02 / 0.06**（PG `updated_at` 停在 08-21，用户调优值从未落 PG）。复盘订单 245098349（BUY 动量转负后止损）时发现。
+
+### 根因（与第七节同源：配置真相层不一致，但本次是"写路径"问题）
+`shared/config_provider.py` 的 `ConfigProviderV3` 是三层配置（L1 本地缓存 → L2 Redis `hcm:config:v2` → L3 PG `hcm_config.metadata`）。关键机制：
+- `get()` 未命中 L1/L2 → 走 L3 `_load_from_pg()`，用 PG 的 `COALESCE(current_value, default_value)` 取值，**并回填写回 Redis**（447-472 行）。
+- **用户/手工调参若只 `HSET hcm:config:v2`（只改 Redis 缓存、不改 PG Source of Truth），则一旦该键回填/失效/重建，`_load_from_pg` 用 PG 旧值覆盖 Redis → 调优值丢失** = "调参被复原"。
+
+> 注：这次订单 245098349 的止损**并非参数被复原造成**（`mm=-0.0329` 绝对值 < `momentum_flip_mm=0.04`、`er=0.289>0.20` 未枯竭、`pos=0.6862` 未达极值区，三个护栏在任何参数下都不拦），它是阈值内正常放行的单子。但"调参被复原"是**独立的系统性缺陷**，本次一并修复。
+
+### 修复（已落地并双写验证）
+把调优值**双写 PG（Source of Truth）+ Redis（缓存）**：
+1. `UPDATE hcm_config.metadata SET current_value='2.2', updated_at=now() WHERE config_key='hexp.extreme.k_extreme'`（同法更新 `mm_retreat_min=0.03`、`momentum_drain_mm=0.04`、`momentum_flip_mm=0.04`、`reversal_sl_atr_mult=0.5`）。
+2. `HSET hcm:config:v2 <key> <value>` + bump `hcm:config:version` 时间戳，触发热加载。
+3. 验证 PG == Redis 一致，signal-tower 30s reload 完成。
+
+### 新增铁律（补充）
+> **铁律 6（改参数必须 PG+Redis 双写，严禁只改 Redis 缓存）**：
+> - 配置真相源是 PG `hcm_config.metadata`（`current_value`），Redis `hcm:config:v2` 只是 L2 缓存。**任何调参（手工 SQL/脚本/面板）都必须写 PG（Source of Truth）**，Redis 是回填缓存，会在键缺失时用 PG 值覆盖——**只改 Redis 的值迟早被复原成 PG 旧值**。
+> - 正确姿势：写 PG（`UPDATE metadata SET current_value=...`）+ 写 Redis（`HSET hcm:config:v2`）+ bump `hcm:config:version` 时间戳 +（可）`PUBLISH hcm:config:invalidate <key>`。或直接走前端面板（其 PUT 经 `ConfigProviderV3.set/set_batch` 自动双写）。
+> - 排查"参数不生效/被复原"时，**同时核对 PG `current_value` 与 Redis 运行时值**（`HGET`），两者不一致 = Redis 将被 PG 回填覆盖，先修 PG。

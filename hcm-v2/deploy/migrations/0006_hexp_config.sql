@@ -14,7 +14,7 @@ BEGIN;
 INSERT INTO hcm_config.metadata
   (config_key, category, subcategory, default_value, value_type, label, description, ui_control, ui_order, scope) VALUES
   ('hexp.enabled',         'hexp', 'core', 'true',          'bool',   '和乘幂总开关', '关闭后和乘幂不再生产信号（无需切回其他模型）', 'switch', 10, 'global'),
-  ('hexp.periods',         'hexp', 'core', 'M5,H1,H4,D1',   'string', '多周期组合', '逗号分隔；按分钟升序，最小=主执行周期(M5)，其余=方向层', 'text', 11, 'global'),
+  ('hexp.periods',         'hexp', 'core', 'M5,M30,H1,H4,D1',   'string', '多周期组合', '逗号分隔；按分钟升序，最小=主执行周期(M5)，其余=方向层（含 M30）', 'text', 11, 'global'),
   ('hexp.period_minutes',  'hexp', 'core', 'M1=1,M5=5,M15=15,M30=30,H1=60,H2=120,H4=240,D1=1440', 'string', '周期→分钟映射', '用于排序主/方向层与共振权重归一', 'text', 12, 'global'),
   ('hexp.primary_period',  'hexp', 'core', 'M5',            'string', '主执行周期', '量化交易主周期（入场/止损/震荡策略主执行）', 'text', 13, 'global'),
   ('hexp.direction_min_score', 'hexp', 'core', '0.20',      'number', '方向裁定门槛', '|buy-sell|<0.01 且 max<此值 → NO_TRADE', 'number', 14, 'global')
