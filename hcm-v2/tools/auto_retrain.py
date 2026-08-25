@@ -233,7 +233,12 @@ def deepseek_judge(api_base: str, api_key: str, payload: dict, timeout: int = 60
             "你是量化模型训练的质量裁判。以下是 LightGBM 信号质量模型的一次重训结果摘要，"
             "请判断【是否采用新模型替换线上模型】。\n"
             "采用标准：测试 AUC 较基线有实质提升、样本量充足、DeepSeek 特征吸收充分、"
-            "无退化迹象。若 AUC<0.55 或样本<200 或校准器退化，应回滚。\n"
+            "无退化迹象。\n"
+            "【硬性回滚条件】满足任一即必须 rollback：\n"
+            "  (1) AUC<0.55 或样本<200 或校准器退化；\n"
+            "  (2) ds_nonzero_ratio(DeepSeek特征非零占比)<0.30 —— 此时模型未真正吸收 DeepSeek"
+            "语义，即使AUC达标也是\"假精准\"，必须回滚（不要因AUC达标就判adopt）。\n"
+            "只有 AUC≥0.55、样本≥200、校准器未退化、且 ds_nonzero_ratio≥0.30 同时满足才 adopt。\n"
             "只返回一个 JSON：{\"decision\": \"adopt\" 或 \"rollback\", \"reason\": \"中文简述\"}\n\n"
             f"摘要：{json.dumps(payload, ensure_ascii=False)}"
         )

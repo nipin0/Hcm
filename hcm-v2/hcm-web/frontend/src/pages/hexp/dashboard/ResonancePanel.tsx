@@ -22,9 +22,11 @@ const ResonancePanel: React.FC<Props> = ({ snap, cfg, klineStatus, feedAgeSec })
   const longTh = VERDICT_REF_LONG;
   const shortTh = VERDICT_REF_SHORT;
   const verdict = snap?.verdict ?? 0;
+  // 【2026-08-24】兜底周期含 M30，与引擎 hexp.periods 默认(M5,M30,H1,H4,D1)一致；
+  // 正常运行时由 snap.used_periods 驱动（引擎已含 M30），快照缺失时才用此兜底。
   const periods = snap?.used_periods?.length
     ? snap.used_periods
-    : ['M5', 'H1', 'H4', 'D1'];
+    : ['M5', 'M30', 'H1', 'H4', 'D1'];
   const primary = snap?.primary_period ?? 'M5';
 
   /** verdict 归一到 0~100 的滑杆位置（-1 → 0%，+1 → 100%） */

@@ -45,7 +45,7 @@ faulthandler.enable()  # 原生 DLL 静默死时 dump 到 stderr→launch 日志
 FEAT_BASELINE = None
 
 
-def _inference_defense(ai_score, feats, baseline):
+def _inference_defense(ai_score, feats, baseline, force_keep=False):
     """推理防御：单样本级漂移/离群代理 + 业务二次钳位 [20,85]。
 
     返回 (ai_score, drift, outlier_ratio, level)。
@@ -54,6 +54,8 @@ def _inference_defense(ai_score, feats, baseline):
     - 重度(drift>0.25 或 outlier>0.10) → ai_score=None（放弃输出，降级 HEXP-only）。
     - 轻度(drift>0.10) → ×0.6；离群 → ×0.7；最终钳 [20,85]。
     注：此 drift 为单样本代理，非全分布 PSI；真·滑动窗口 PSI 在监控层(P3)补全。
+    - force_keep=True（raw_fallback 路径）时：即使判 high 也不置 None，改为强惩罚 ×0.6，
+      保证 AI 评分在原始概率直出路径下「始终有值、可观测」，不因单特征漂移整体消失。
     """
     drift, outlier_ratio, level = 0.0, 0.0, "none"
     if baseline is None or not feats:
@@ -64,7 +66,23 @@ def _inference_defense(ai_score, feats, baseline):
     if not feats_list:
         return ai_score, drift, outlier_ratio, level
     _zs = []
+    # 【2026-08-24 修复·漂移拦截豁免】event_proximity_min（距下一重大事件分钟数）
+    # 分布天然随事件日历剧变，已被 PSI 计算豁免；此处漂移拦截(z 偏离)也必须豁免，
+    # 否则事件日历缺失时该特征出现极大值(如 12163)→ 26σ 偏离 → level=high →
+    # ai_score 被强制 None（下游降级纯 HEXP）→ AI 评分整体消失。
+    # 【2026-08-24 拆炸弹·概念漂移特征豁免】close_mom_atr=(close[-1]-close[-6])/ATR 与
+    # trend_aligned(收盘站上EMA20) 是已确诊的「训练分布 vs 生产行情」概念漂移元凶：
+    # 训练样本盘整/低波动(close_mom_atr 均值 0.0017、std 0.075)，而黄金单边行情时该值
+    # 冲到 2.34 → z=31σ → psi_like>0.25 → 整个 ai_score 被置 None（27h 纯 HEXP 降级，
+    # degrade_streak=19513）。这俩是特征分布不匹配(非真实异常)，单特征漂移不应杀掉整个
+    # AI 评分。故与 event_proximity_min 同机制豁免 z 偏离，保留其余特征漂移防御。
+    _DRIFT_EXEMPT = set(
+        (os.environ.get("PSI_EXEMPT_FEATURES",
+                        "event_proximity_min,close_mom_atr,trend_aligned") or "").split(",")
+    )
     for c in feats_list:
+        if c in _DRIFT_EXEMPT:
+            continue
         v = feats.get(c)
         if v is None:
             continue
@@ -77,12 +95,16 @@ def _inference_defense(ai_score, feats, baseline):
     _zs_arr = np.asarray(_zs, dtype=float)
     psi_like = float(np.mean(np.maximum(0.0, _zs_arr - 3.0)))  # 普遍偏移（类 PSI 代理）
     max_dev = float(np.max(_zs_arr))                            # 单点最大偏离（离群）
-    if psi_like > 0.25 or max_dev > 5.0:
+    # 【2026-08-24 修复·漂移拦截过度敏感】原 max_dev>5.0 即判 high → 单特征偶发 5σ
+    # 偏离（如 close_mom_atr 极端 K 线）即杀掉整个 ai_score（None）→ AI 评分频繁消失。
+    # 改为：仅当普遍存在偏移(psi_like>0.25)才 high 拦截；单点离群(max_dev>5)只判 low
+    # （×0.7 惩罚），不再整体丢弃 AI 分。
+    if psi_like > 0.25:
         level = "high"
     elif psi_like > 0.10 or max_dev > 3.0:
         level = "low"
     if ai_score is not None:
-        if level == "high":
+        if level == "high" and not force_keep:
             ai_score = None
         else:
             if psi_like > 0.10:
@@ -657,6 +679,12 @@ def main():
         _score_zscore = False
         _score_smooth = 0.0
         _min_valid = 0.0
+        # 【D1·2026-08-24 训练-推理 ds_* 口径统一】DeepSeek 票匹配窗口(秒)。
+        # 与训练侧 quality_features._nearest_ds 的 ±window 对齐（默认 1800s=±30min）：
+        # 推理侧读 Redis ai:ds:out 时，若票时间距今超过该窗口则视为"无票"→ ds_* 置 0，
+        # 与训练侧"±30min 内匹配不到就 0 占位"严格一致，消除 ds_* 训练-推理分布错位
+        # （PSI 恒虚高 7~8 的根因）。0 或负值=不做时间窗过滤（维持旧行为：恒读最新票）。
+        _ds_window_sec = 1800
         # 【方案 X·2026-08-17 状态分层重锚】按预测状态维护在线分位缓冲。
         # 小样本下全局质量概率被 label 共用抹平(delta=0.0000)，但同状态内相对排序有效；
         # 改用「状态内相对分位×100」输出 ai_score，让 TREND/PULLBACK/REVERSAL/RANGE 各自分化。
@@ -673,7 +701,7 @@ def main():
             nonlocal _cfg_reloaded_at, _period_match, _align_m5, enabled, _ai_mode
             nonlocal _model_path, _calib_path, model, iso, _feature_audit, _health_ttl
             nonlocal state_model, state_classes, _raw_fallback
-            nonlocal _score_zscore, _score_smooth, _min_valid
+            nonlocal _score_zscore, _score_smooth, _min_valid, _ds_window_sec
             now = time.time()
             if not force and (now - _cfg_reloaded_at) < _cfg_reload_sec:
                 return False
@@ -690,6 +718,10 @@ def main():
             _score_zscore = _bool(cfg, "ai.lm.score_zscore", False)
             _score_smooth = _cfg_float(cfg, "ai.lm.score_smooth", 0.0)
             _min_valid = _cfg_float(cfg, "ai.lm.min_valid", 0.0)
+            # 【D1·2026-08-24】DS 票匹配窗口(秒)，与训练侧 quality_features 对齐。
+            _ds_window_sec = _cfg_float(cfg, "ai.lm.ds_match_window_sec", _ds_window_sec)
+            if _ds_window_sec < 0:
+                _ds_window_sec = 1800
             # 平滑系数钳制到 [0,1)，0=关闭平滑(用当前轮值)；接近 1=强平滑(慢跟随)。
             if not (0.0 <= _score_smooth < 1.0):
                 _score_smooth = 0.0
@@ -791,6 +823,12 @@ def main():
                         _envf = _cached_slow("env", 60.0, lambda: _env_features(conn))
                         # 【DeepSeek 训练特征增强 2026-08-17】读 DeepSeek 异步票作为特征输入。
                         # 同步读 ai:ds:out:{symbol}（与主循环 r 同句柄）；缺失/损坏→None→三特征 0.0。
+                        # 【D1·2026-08-24 训练-推理 ds_* 口径统一】读票后做时间窗过滤：
+                        # 票的 ts 距今超过 _ds_window_sec（默认 1800s=±30min，与训练侧
+                        # quality_features._nearest_ds 对齐）时视为"无票"→ _ds_out=None →
+                        # build_features 里 ds_* 置 0，消除"训练侧 85% 为 0 vs 推理侧恒有值"
+                        # 的分布错位（ds_* PSI 恒虚高 7~8 的根因）。_ds_window_sec<=0 则
+                        # 不做过滤（维持旧行为：恒读最新票）。
                         _ds_out = None
                         try:
                             _ds_raw = r.get(f"ai:ds:out:{args.symbol.upper()}")
@@ -798,6 +836,14 @@ def main():
                                 _ds_out = json.loads(_ds_raw)
                                 if not isinstance(_ds_out, dict):
                                     _ds_out = None
+                                elif _ds_window_sec > 0:
+                                    _ds_ts = _ds_out.get("ts")
+                                    try:
+                                        _ds_age = time.time() - float(_ds_ts)
+                                        if _ds_age > _ds_window_sec:
+                                            _ds_out = None  # 过期票视为无票，ds_* 置 0
+                                    except (TypeError, ValueError):
+                                        _ds_out = None
                         except Exception:
                             _ds_out = None
                         feats = build_features(snap, kl, _h1f, _envf, align_m5=_align_m5,
@@ -863,8 +909,11 @@ def main():
                                     _smooth_state[_key] = ai_score
 
                     # 【P1·推理防御】PSI 漂移/离群检测 + 业务二次钳位
+                    # 【2026-08-24 拆炸弹】raw_fallback 路径(ai_score=_raw*100 原始概率直出)
+                    # 传 force_keep=True：high 不置 None，改为强惩罚 ×0.6，保证评分持续有值可观测。
+                    # 状态重锚路径(方案X)仍保留 force_keep=False，重度漂移仍可降级 HEXP-only。
                     ai_score, _psi_drift, _max_z, _drift_level = _inference_defense(
-                        ai_score, feats, FEAT_BASELINE)
+                        ai_score, feats, FEAT_BASELINE, force_keep=_raw_fallback)
 
                     hp = float(snap.get("hp_score") or 0.0)
                     total = (0.6 * hp + 0.4 * ai_score) if ai_score is not None else float(snap.get("scorecard_total") or hp)

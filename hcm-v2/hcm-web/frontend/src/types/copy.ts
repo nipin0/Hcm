@@ -31,6 +31,8 @@ export interface CopyRelationship {
   max_lot: number;
   max_positions: number;
   max_daily_loss: number;
+  max_daily_profit: number;
+  circuit_break_enabled: boolean;
   max_consecutive_losses: number;
   direction_mode: DirectionMode;
   copy_sl: boolean;
@@ -55,6 +57,8 @@ export interface CopyRelationshipCreate {
   max_lot?: number;
   max_positions?: number;
   max_daily_loss?: number;
+  max_daily_profit?: number;
+  circuit_break_enabled?: boolean;
   max_consecutive_losses?: number;
   direction_mode?: DirectionMode;
   copy_sl?: boolean;
@@ -75,6 +79,8 @@ export interface CopyRelationshipUpdate {
   max_lot?: number;
   max_positions?: number;
   max_daily_loss?: number;
+  max_daily_profit?: number;
+  circuit_break_enabled?: boolean;
   max_consecutive_losses?: number;
   direction_mode?: DirectionMode;
   copy_sl?: boolean;

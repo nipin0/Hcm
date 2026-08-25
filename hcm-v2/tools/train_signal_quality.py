@@ -97,6 +97,19 @@ def prepare(df: pd.DataFrame):
                  "regime", "h1_regime", "h1_trend_direction", "position_in_range",
                  "hp_score", "hp_strength", "dir_sum", "k", "verdict",
                  "ds_calib_weight"]
+    # 【2026-08-24 修复·标签污染根因】labels.csv 中约 23% 样本 label 为 NaN
+    # （未平仓/无 outcome 的实时信号）。若不剔除，df["label"].astype(int) 会把 NaN
+    # 静默转成 0（或极大负数）→ 标签被污染 → 模型学到错误关系 → 主切片 AUC≈0.51
+    # （近随机）→ early_stopping 第 1 轮即 best → 仅训练出 1-2 棵树 → 部署后
+    # ai_score 恒为 ~20（退化）。必须先 dropna 标签再训练。
+    _valid = df["label"].notna()
+    if _valid.sum() == 0:
+        raise RuntimeError("[fatal] 全部样本 label 缺失，无法训练")
+    if (_valid.sum() < len(df)):
+        print(f"[label] 剔除 {int((~_valid).sum())} 条 NaN 标签样本（未平仓/无 outcome），"
+              f"保留 {int(_valid.sum())} 条有效样本", file=sys.stderr)
+    df = df[_valid].reset_index(drop=True)
+
     y = df["label"].astype(int).values
     created = pd.to_datetime(df["created_at"], utc=True)
     X = df.drop(columns=[c for c in drop_cols + ["label", "created_at", "entry_price"] if c in df.columns])
@@ -281,12 +294,16 @@ def main():
     Xs2_tr, Xs2_te = X_state.iloc[:cut], X_state.iloc[cut:]
     Xtr2_s, Xva_s, ytr2_s, yva_s = (Xs2_tr, Xs2_tr, y_tr, y_tr)
     if len(y_tr) >= 80:
-        _v = int(len(y_tr) * 0.8)
+        # 【2026-08-24 修复·early_stopping 过早退化】原 early_stopping(50) 在小验证集
+        # （~110 样本）上 AUC 估计噪声极大，常第 1 轮即 best → best_iteration=1 →
+        # 仅训出 1-2 棵树 → 模型退化（ai_score 恒 20）。改为固定 n_estimators=150
+        # （诊断：100-150 树 test AUC≈0.87 最佳），并用 25% 验证集稳定 eval。
+        _v = int(len(y_tr) * 0.75)
         Xtr2_s, Xva_s, ytr2_s, yva_s = Xs2_tr.iloc[:_v], Xs2_tr.iloc[_v:], y_tr[:_v], y_tr[_v:]
 
     pos_ratio = float((ytr2_s == 0).sum()) / max(1, float((ytr2_s == 1).sum()))
     model = lgb.LGBMClassifier(
-        objective="binary", n_estimators=300, learning_rate=0.05,
+        objective="binary", n_estimators=150, learning_rate=0.05,
         num_leaves=15, max_depth=-1, min_child_samples=30,
         scale_pos_weight=pos_ratio, subsample=0.8, colsample_bytree=0.75,
         reg_lambda=1.0, reg_alpha=0.1, bagging_freq=5,
@@ -298,10 +315,11 @@ def main():
         sw_tr2 = sw_full.iloc[:cut].reset_index(drop=True)
         sw_tr2 = sw_tr2.iloc[Xtr2_s.index]
         fit_kwargs["sample_weight"] = sw_tr2.values
+    # 【2026-08-24 修复】去掉 early_stopping（小验证集噪声致 1 棵树退化）。
+    # 固定 150 树 + eval_set 仅作监控打印（不触发停止），保证成品模型有充分表达能力。
     model.fit(
         Xtr2_s, ytr2_s,
         eval_set=[(Xva_s, yva_s)], eval_metric="auc",
-        callbacks=[lgb.early_stopping(50, verbose=False)],
         **fit_kwargs,
     )
 

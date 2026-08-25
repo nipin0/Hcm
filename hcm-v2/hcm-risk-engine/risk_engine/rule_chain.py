@@ -521,6 +521,66 @@ class RuleChain:
 
         tol = float(getattr(self, "_be_tolerance", 0.0) or 0.0)
 
+        # ── 2026-08-25 极值分层裁决：hexp 极值+保本追单候选（extreme_pending=True）──
+        # hexp 检测到"极值区+动量回撤但该 symbol 已有同向保本持仓"时不再硬封，而是标记
+        # extreme_pending 放行到此做最终裁决：本账户同向确实已保本 → 放行 + 轻仓追单(×0.5)；
+        # 本账户未保本（symbol 级标志可能来自其他账户/残留）→ 拒绝，防接刀。
+        # 【2026-08-25 加固】extreme_pending 分支必须与正常路径共用同一 BE 真值源：
+        #   Redis 标志非"1"/缺失/Redis 异常时，回退查 PG positions（_account_be_from_db，
+        #   与 575+ 同口径），不再直接拒单——修复"账户已保本但 BE 标志过期(TTL15s)/Redis
+        #   抖动 → 极值追单被误拒（出信号不下单）"。仅当 PG 也确认未保本/无持仓/sl 未知/
+        #   DB 不可达（无法确认保本）才拒绝（防接刀，从严 fail-closed）。
+        _extreme_pending = bool(signal_data.get("extreme_pending", False))
+        if _extreme_pending and direction in ("BUY", "SELL"):
+            _account_be = False
+            _be_source = "redis"
+            if self._redis is not None:
+                try:
+                    _af = await self._redis.get(f"hcm:pos:be:{account_id}:{direction}")
+                    _account_be = (_af is not None and str(_af).strip() == "1")
+                except Exception:
+                    _account_be = False
+            if not _account_be:
+                # Redis 未确认 → 回退 PG 真值源（与正常路径一致），避免误拒合法极值追单
+                _be_source = "pg"
+                _db_be, _db_err = await self._account_be_from_db(account_id, direction, tol)
+                if _db_err:
+                    # DB 不可达：无法确认保本 → 从严拒绝（fail-closed，防接刀），记 CRITICAL
+                    logger.critical(
+                        "extreme_pending BE check DB FAILED (account=%s, dir=%s) — "
+                        "reject (fail-closed, 防极值接刀)", account_id, direction,
+                    )
+                    return RuleResult(
+                        rule_name="risk_cool_minutes",
+                        passed=False,
+                        actual_value=0.0,
+                        threshold=0.0,
+                        message="extreme_pending + BE 真值源(DB)不可达 → 拒绝(防极值接刀)",
+                    )
+                _account_be = bool(_db_be)
+            if _account_be:
+                # 账户同向已保本（Redis 或 PG 确认）→ 放行 + 轻仓（极值追单，suggested_lot_ratio×0.5）
+                try:
+                    _cur = float(signal_data.get("suggested_lot_ratio", 1.0) or 1.0)
+                    signal_data["suggested_lot_ratio"] = round(_cur * 0.5, 4)
+                except Exception:
+                    signal_data["suggested_lot_ratio"] = 0.5
+                return RuleResult(
+                    rule_name="risk_cool_minutes",
+                    passed=True,
+                    actual_value=1.0,
+                    threshold=0.0,
+                    message=f"extreme_pending + 账户同向已保本({_be_source}) → 放行(轻仓×0.5 追单)",
+                )
+            else:
+                return RuleResult(
+                    rule_name="risk_cool_minutes",
+                    passed=False,
+                    actual_value=0.0,
+                    threshold=0.0,
+                    message="extreme_pending + 账户未保本(Redis/PG 均确认) → 拒绝(防极值接刀)",
+                )
+
         # ── 快路径：Redis 保本标志（毫秒级；仅 "1" 视为已达保本，其余回退 DB）──
         if self._redis is not None:
             try:
@@ -605,6 +665,46 @@ class RuleChain:
             threshold=round(float(entry), 2),
             message=f"最新同向持仓SL={sl:.2f} 未达保本(entry={entry:.2f})，禁止开新单",
         )
+
+
+    async def _account_be_from_db(self, account_id: int, direction: str, tol: float):
+        """查 PG positions 判定账户最新同向持仓是否已达保本（extreme_pending 回退真值源）。
+
+        Returns:
+            (at_be, err):
+              at_be=True   → 有同向持仓且 SL 已达保本；
+              at_be=False  → 有同向持仓但 SL 未达保本；
+              at_be=None   → 无同向持仓 / sl 未知（无法确认保本）；
+              err=True     → DB 查询异常（调用方应从严处理）。
+        与 _check_cooldown 正常路径的 PG 查询同口径（同 SQL、同 tol 判定）。
+        """
+        if self._db is None or not self._db.is_initialized or account_id <= 0:
+            return (None, False)
+        try:
+            row = await self._db.fetchrow(
+                "SELECT open_price, sl FROM hcm_trading.positions "
+                "WHERE account_id=$1 AND direction=$2 "
+                "AND direction IN ('BUY','SELL') "
+                "AND status='open' "
+                "AND mt5_ticket IS NOT NULL AND mt5_ticket > 0 AND lot > 0 "
+                "AND open_price IS NOT NULL "
+                "ORDER BY open_time DESC LIMIT 1",
+                account_id, direction,
+            )
+            if row is None:
+                return (None, False)
+            entry = float(row["open_price"])
+            sl = row["sl"]
+            if sl is None:
+                return (None, False)
+            at_be = (sl >= entry - tol) if direction == "BUY" else (sl <= entry + tol)
+            return (at_be, False)
+        except Exception as exc:
+            logger.critical(
+                "DB FAILED in _account_be_from_db(BE gate, account=%s, dir=%s): %s",
+                account_id, direction, exc,
+            )
+            return (None, True)
 
 
     async def mark_cooldown(self, signal_data: dict) -> None:

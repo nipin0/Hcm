@@ -562,6 +562,7 @@ export function snapshotAgeSec(ts: number | null | undefined): number | null {
 export const KLINE_INTERVAL_SEC: Record<string, number> = {
   M1: 60,
   M5: 300,
+  M30: 1800,
   H1: 3600,
   H4: 14400,
   D1: 86400,

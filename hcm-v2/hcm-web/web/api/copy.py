@@ -42,6 +42,8 @@ _COPY_REL_DEFAULTS: dict = {
     "max_lot": 5.0,
     "max_positions": 10,
     "max_daily_loss": 0.0,
+    "max_daily_profit": 0.0,
+    "circuit_break_enabled": True,
     "max_consecutive_losses": 3,
     "retry_max": 3,
 }
@@ -59,6 +61,8 @@ class CopyRelationshipCreate(BaseModel):
     max_lot: float = 5.0
     max_positions: int = 10
     max_daily_loss: float = 0.0
+    max_daily_profit: float = 0.0               # 每日盈利熔断上限（账户本金%），0=不限制盈利方向
+    circuit_break_enabled: bool = True          # 每日盈亏熔断开关（per-account）
     max_consecutive_losses: int = 3
     direction_mode: str = "FORWARD"             # FORWARD / REVERSE / BOTH
     copy_sl: bool = True
@@ -95,6 +99,8 @@ class CopyRelationshipUpdate(BaseModel):
     max_lot: Optional[float] = None
     max_positions: Optional[int] = None
     max_daily_loss: Optional[float] = None
+    max_daily_profit: Optional[float] = None
+    circuit_break_enabled: Optional[bool] = None
     max_consecutive_losses: Optional[int] = None
     direction_mode: Optional[str] = None
     copy_sl: Optional[bool] = None
@@ -279,7 +285,8 @@ def create_copy_router(
             rows = await db_pool.fetch(
                 f"""SELECT relationship_id, master_account_id, copy_account_id,
                            status, lot_mode, lot_multiplier, min_lot, max_lot,
-                           max_positions, max_daily_loss, max_consecutive_losses,
+                           max_positions, max_daily_loss, max_daily_profit,
+                           circuit_break_enabled, max_consecutive_losses,
                            direction_mode, copy_sl, copy_tp, sync_mode,
                            created_at, updated_at
                     FROM hcm_copy.relationships
@@ -359,31 +366,35 @@ def create_copy_router(
                 """INSERT INTO hcm_copy.relationships
                       (master_account_id, copy_account_id, status,
                        lot_mode, lot_multiplier, min_lot, max_lot,
-                       max_positions, max_daily_loss, max_consecutive_losses,
+                       max_positions, max_daily_loss, max_daily_profit,
+                       circuit_break_enabled, max_consecutive_losses,
                        direction_mode, copy_sl, copy_tp, sync_mode,
                        retry_on_failure, retry_max)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
                    RETURNING relationship_id, master_account_id, copy_account_id,
                              status, lot_mode, lot_multiplier, min_lot, max_lot,
-                             max_positions, max_daily_loss, max_consecutive_losses,
+                             max_positions, max_daily_loss, max_daily_profit,
+                             circuit_break_enabled, max_consecutive_losses,
                              direction_mode, copy_sl, copy_tp, sync_mode,
                              created_at, updated_at""",
-                body.master_account_id,      # $1
-                body.copy_account_id,        # $2  → copy_account_id in DB
-                body.status,                 # $3
-                body.lot_mode,               # $4
-                body.lot_multiplier,         # $5
-                body.min_lot,                # $6
-                body.max_lot,                # $7
-                body.max_positions,          # $8
-                body.max_daily_loss,         # $9
-                body.max_consecutive_losses, # $10
-                body.direction_mode,         # $11
-                body.copy_sl,                # $12
-                body.copy_tp,                # $13
-                body.sync_mode,              # $14
-                body.retry_on_failure,       # $15
-                body.retry_max,              # $16
+                body.master_account_id,          # $1
+                body.copy_account_id,            # $2  → copy_account_id in DB
+                body.status,                     # $3
+                body.lot_mode,                   # $4
+                body.lot_multiplier,             # $5
+                body.min_lot,                    # $6
+                body.max_lot,                    # $7
+                body.max_positions,              # $8
+                body.max_daily_loss,             # $9
+                body.max_daily_profit,           # $10
+                body.circuit_break_enabled,      # $11
+                body.max_consecutive_losses,     # $12
+                body.direction_mode,             # $13
+                body.copy_sl,                    # $14
+                body.copy_tp,                    # $15
+                body.sync_mode,                  # $16
+                body.retry_on_failure,           # $17
+                body.retry_max,                  # $18
             )
 
             item = _row_to_relationship(dict(row))
@@ -504,7 +515,8 @@ def create_copy_router(
                     WHERE relationship_id = ${idx}
                     RETURNING relationship_id, master_account_id, copy_account_id,
                               status, lot_mode, lot_multiplier, min_lot, max_lot,
-                              max_positions, max_daily_loss, max_consecutive_losses,
+                              max_positions, max_daily_loss, max_daily_profit,
+                              circuit_break_enabled, max_consecutive_losses,
                               direction_mode, copy_sl, copy_tp, sync_mode,
                               created_at, updated_at""",
                 *params,
@@ -1030,7 +1042,8 @@ def create_copy_router(
                     row = await db_pool.fetchrow(
                         """SELECT relationship_id, master_account_id, copy_account_id,
                                   status, lot_mode, lot_multiplier, min_lot, max_lot,
-                                  max_positions, max_daily_loss, max_consecutive_losses,
+                                  max_positions, max_daily_loss, max_daily_profit,
+                                  circuit_break_enabled, max_consecutive_losses,
                                   direction_mode, copy_sl, copy_tp, sync_mode,
                                   created_at, updated_at
                            FROM hcm_copy.relationships WHERE relationship_id = $1""",
@@ -1055,11 +1068,12 @@ def create_copy_router(
                         WHERE relationship_id = ${idx}
                         RETURNING relationship_id, master_account_id, copy_account_id,
                                   status, lot_mode, lot_multiplier, min_lot, max_lot,
-                                  max_positions, max_daily_loss, max_consecutive_losses,
+                                  max_positions, max_daily_loss, max_daily_profit,
+                                  circuit_break_enabled, max_consecutive_losses,
                                   direction_mode, copy_sl, copy_tp, sync_mode,
                                   created_at, updated_at""",
                     *params,
-                )
+                    )
             else:
                 # ── Create new ──────────────────
                 row = await db_pool.fetchrow(
@@ -1071,7 +1085,8 @@ def create_copy_router(
                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                        RETURNING relationship_id, master_account_id, copy_account_id,
                                  status, lot_mode, lot_multiplier, min_lot, max_lot,
-                                 max_positions, max_daily_loss, max_consecutive_losses,
+                                 max_positions, max_daily_loss, max_daily_profit,
+                                 circuit_break_enabled, max_consecutive_losses,
                                  direction_mode, copy_sl, copy_tp, sync_mode,
                                  created_at, updated_at""",
                     master_id,

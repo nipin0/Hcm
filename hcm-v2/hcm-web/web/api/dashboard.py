@@ -920,9 +920,11 @@ def create_dashboard_router(
         PG archival `hcm_market.klines` (bars written on close).
 
         Returns data[{tf}] = { open_time, close, tick_count, tick_volume } for
-        M5/H1/H4/D1. Zero writes — safe to call from any read-only context.
+        M5/M30/H1/H4/D1. Zero writes — safe to call from any read-only context.
         """
-        periods = ["M5", "H1", "H4", "D1"]
+        # 【2026-08-24】加入 M30，与引擎 hexp.periods(含 M30) 的 K 线入库状态保持一致；
+        # 此前 M30 不在列表 → 前端 klines/latest 拿不到 M30 → 共振矩阵 M30 卡片无 K 线行。
+        periods = ["M5", "M30", "H1", "H4", "D1"]
 
         def _to_epoch(v: Any) -> Optional[float]:
             """把 open_time 统一归一化为 unix 秒。

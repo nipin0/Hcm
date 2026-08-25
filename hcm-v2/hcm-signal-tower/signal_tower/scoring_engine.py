@@ -191,6 +191,12 @@ class ScoreResult:
     upper_wick_ratio: float = 0.0
     lower_wick_ratio: float = 0.0
 
+    # ── 2026-08-25: 极值分层裁决标记 ──
+    # extreme_pending: 极值区 + 动量回撤，但该 symbol 已有同向保本持仓（风险已锁）。
+    #   此时 hexp 不硬封方向，标记此字段并交由风控保本闸门做最终裁决（放行+轻仓/拦截）。
+    #   无保本持仓时极值护栏照常硬封（hexp_extreme_guard），此字段保持 False。
+    extreme_pending: bool = False
+
 
 class ScoringEngine:
     """Weighted technical indicator scoring engine.

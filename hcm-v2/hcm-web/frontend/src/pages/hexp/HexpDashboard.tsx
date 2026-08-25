@@ -159,7 +159,9 @@ const HexpDashboard: React.FC = () => {
   // 兜底：若该端点尚未部署（hcm-web 未重启），回退到现有 `GET /api/v1/dashboard/realtime`
   //   按周期取 PG `hcm_market.klines` 的最新棒（归档视角，可能滞后）。
   // 两者均零写操作，不影响入库/引擎。
-  const KLINE_PERIODS = ['M5', 'H1', 'H4', 'D1'];
+  // 【2026-08-24】加入 M30，与引擎 hexp.periods(含 M30) 的 K 线入库状态保持一致；
+  // 此前 M30 不在列表 → klineStatus 无 M30 → 共振矩阵 M30 卡片无 K 线行。
+  const KLINE_PERIODS = ['M5', 'M30', 'H1', 'H4', 'D1'];
 
   /** 把任意 open_time（ISO 串或 unix 秒/毫秒）解析为 unix 秒 */
   const parseOpenTime = (v: unknown): number | null => {

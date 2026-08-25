@@ -24,3 +24,9 @@ hcm-v2/hcm-web/frontend/_scratch/
 
 # ===== logs =====
 *.log
+
+# ===== runtime / generated (do not version) =====
+hcm-v2/tools/bridge_launcher.lock
+*.bak
+hcm-v2/tools/_artifacts/snapshots/
+hcm-v2/tools/_artifacts/_scratch_*

@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 HEXP_KEYS: dict[str, Any] = {
     # 总开关与周期
     "hexp.enabled": True,
-    "hexp.periods": "M5,H1,H4,D1",
+    "hexp.periods": "M5,M30,H1,H4,D1",
     "hexp.period_minutes": "M1=1,M5=5,M15=15,M30=30,H1=60,H2=120,H4=240,D1=1440",
     "hexp.primary_period": "M5",
     # 配置热重载节流秒数（BUG-16）：调度器未接线时 produce() 惰性自愈刷新的上限

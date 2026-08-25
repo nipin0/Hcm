@@ -107,6 +107,9 @@ class SignalData:
     # (0 = fill immediately at market). P1a zone-trigger hint.
     entry_trigger_wait: int = 0
     co_exec_fb: int = 0  # 盲点兜底单：方向 H1 兜底、进场点位交 M5(zone)
+    # 2026-08-25 极值分层裁决：hexp 极值区+动量回撤但该 symbol 已有同向保本持仓时置 True，
+    # 不硬封方向，交由风控保本闸门最终裁决（放行+轻仓 / 拦截）。True 表示"极值追单候选"。
+    extreme_pending: bool = False
     produced_at: str = ""  # T0: 信号生产决策时刻 (UTC ISO)，供桥侧计算端到端延迟
     # 2026-08-10 修复：scheduler._run_shadow_hexp 构造 SignalData 时传入 created_at
     # （datetime），此前 SignalData 无此字段 → TypeError: __init__() got an unexpected
@@ -297,6 +300,8 @@ class SignalPublisher:
             "zone_type": signal.zone_type,
             "zone_strength": signal.zone_strength,
             "zone_tp_level": signal.zone_tp_level,
+            # 2026-08-25 极值分层裁决标记：hexp 极值+保本追单候选，风控保本闸门消费
+            "extreme_pending": getattr(signal, "extreme_pending", False),
             # ── P1a/P1c collaboration fields (consumed by mt5_bridge) ──
             "ai_sl_mult": signal.ai_sl_mult,
             "ai_tp_mult": signal.ai_tp_mult,

@@ -88,6 +88,8 @@ const RelationshipDialog: React.FC<RelationshipDialogProps> = ({
   const [copyTp, setCopyTp] = useState<boolean>(true);
   const [retryOnFailure, setRetryOnFailure] = useState<boolean>(true);
   const [maxDailyLoss, setMaxDailyLoss] = useState<number | ''>(0.0);
+  const [maxDailyProfit, setMaxDailyProfit] = useState<number | ''>(0.0);
+  const [circuitBreakEnabled, setCircuitBreakEnabled] = useState<boolean>(true);
   const [maxConsecutiveLosses, setMaxConsecutiveLosses] = useState<number>(3);
   const [retryMax, setRetryMax] = useState<number>(3);
   const [maxSlippagePips, setMaxSlippagePips] = useState<number | ''>('');
@@ -129,6 +131,8 @@ const RelationshipDialog: React.FC<RelationshipDialogProps> = ({
       setCopyTp(relationship.copy_tp);
       setRetryOnFailure(relationship.retry_on_failure);
       setMaxDailyLoss(relationship.max_daily_loss);
+      setMaxDailyProfit(relationship.max_daily_profit ?? 0.0);
+      setCircuitBreakEnabled(relationship.circuit_break_enabled ?? true);
       setMaxConsecutiveLosses(relationship.max_consecutive_losses);
       setRetryMax(relationship.retry_max);
       setMaxSlippagePips(relationship.max_slippage_pips ?? '');
@@ -146,6 +150,8 @@ const RelationshipDialog: React.FC<RelationshipDialogProps> = ({
       setCopyTp(true);
       setRetryOnFailure(true);
       setMaxDailyLoss(0.0);
+      setMaxDailyProfit(0.0);
+      setCircuitBreakEnabled(true);
       setMaxConsecutiveLosses(3);
       setRetryMax(3);
       setMaxSlippagePips('');
@@ -172,6 +178,8 @@ const RelationshipDialog: React.FC<RelationshipDialogProps> = ({
       copy_tp: copyTp,
       retry_on_failure: retryOnFailure,
       max_daily_loss: num(maxDailyLoss, 0.0),
+      max_daily_profit: num(maxDailyProfit, 0.0),
+      circuit_break_enabled: circuitBreakEnabled,
       max_consecutive_losses: num(maxConsecutiveLosses, 3),
       retry_max: num(retryMax, 3),
     };
@@ -383,8 +391,22 @@ const RelationshipDialog: React.FC<RelationshipDialogProps> = ({
             />
           </Box>
 
-          {/* Row 6: Max Daily Loss / Max Consecutive Losses */}
-          {numField('日内最大亏损', maxDailyLoss, setMaxDailyLoss, 1, 0)}
+          {/* Row 6: Max Daily Loss / Max Daily Profit（每日盈亏熔断） */}
+          {numField('日内最大亏损(熔断%)', maxDailyLoss, setMaxDailyLoss, 1, 0)}
+          {numField('日内最大盈利(熔断%)', maxDailyProfit, setMaxDailyProfit, 1, 0)}
+          <FormControlLabel
+            control={
+              <Switch
+                checked={circuitBreakEnabled}
+                onChange={(e) => setCircuitBreakEnabled(e.target.checked)}
+                sx={{
+                  '& .MuiSwitch-switchBase.Mui-checked': { color: ACCENT },
+                  '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': { backgroundColor: ACCENT },
+                }}
+              />
+            }
+            label={<Typography variant="body2" sx={{ color: TEXT_SECONDARY }}>每日盈亏熔断开关</Typography>}
+          />
           <TextField
             label="最大连续亏损次数"
             type="number"

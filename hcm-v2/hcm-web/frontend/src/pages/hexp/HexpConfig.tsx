@@ -35,8 +35,8 @@ const FIELDS: Record<string, ConfigField[]> = {
   core: [
     { key: 'hexp.enabled', label: '和乘幂总开关', type: 'switch', defaultValue: true,
       description: '关闭后和乘幂不再生产信号（无需切回其他模型）。', suggested: 'true（开）' },
-    { key: 'hexp.periods', label: '多周期组合', type: 'text', defaultValue: 'M5,H1,H4,D1',
-      description: '逗号分隔任意周期组合；按分钟升序，最小=主执行周期，其余=方向层。', suggested: 'M5,H1,H4,D1' },
+    { key: 'hexp.periods', label: '多周期组合', type: 'text', defaultValue: 'M5,M30,H1,H4,D1',
+      description: '逗号分隔任意周期组合；按分钟升序，最小=主执行周期，其余=方向层（含 M30）。', suggested: 'M5,M30,H1,H4,D1' },
     { key: 'hexp.period_minutes', label: '周期→分钟映射', type: 'text', defaultValue: 'M1=1,M5=5,M15=15,M30=30,H1=60,H2=120,H4=240,D1=1440',
       description: '周期字母→分钟数映射，用于排序主/方向层与共振权重归一。', suggested: 'M1=1,M5=5,M15=15,M30=30,H1=60,H2=120,H4=240,D1=1440' },
     { key: 'hexp.primary_period', label: '主执行周期', type: 'select', options: [

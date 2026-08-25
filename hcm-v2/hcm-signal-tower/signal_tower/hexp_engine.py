@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 _DEFAULTS: dict[str, Any] = {
     # 总开关与周期
     "hexp.enabled": True,
-    "hexp.periods": "M5,H1,H4,D1",
+    "hexp.periods": "M5,M30,H1,H4,D1",
     "hexp.period_minutes": "M1=1,M5=5,M15=15,M30=30,H1=60,H2=120,H4=240,D1=1440",
     "hexp.primary_period": "M5",
     # 配置热重载节流（秒）：produce() 惰性自愈刷新的最大陈旧时长（BUG-16）。
@@ -1166,34 +1166,60 @@ class HexpEngine:
             # 顶部长上影 / 底部长下影
             _long_wick = (_dir_sign > 0 and _upper_wick >= _wick_min) or \
                          (_dir_sign < 0 and _lower_wick >= _wick_min)
+            # 【2026-08-25 极值分层裁决】读 symbol 级保本标志 hcm:pos:be:sym:{symbol}:{dir}：
+            # 该 symbol 已有同向保本持仓（风险已锁）→ 不硬封方向，标记 extreme_pending
+            # 交由风控保本闸门最终裁决（放行+轻仓/拦截）；无保本 → 照常硬封（防接刀）。
+            _sym_be_ok = False
+            if direction in ("BUY", "SELL") and self._redis is not None:
+                try:
+                    _be_flag = await self._redis.get(f"hcm:pos:be:sym:{symbol}:{direction}")
+                    _sym_be_ok = (_be_flag is not None and str(_be_flag).strip() == "1")
+                except Exception:
+                    _sym_be_ok = False
             if _rev_enabled and _mm_retreat_enabled and \
                     _mm_aligned < _mm_retreat_min and _momentum_reversed and _long_wick:
-                _extreme_block = (f"hexp_extreme_reversal(top={_pos_pct:.2f} wick_u={_upper_wick:.2f} "
-                                   f"wick_l={_lower_wick:.2f} mm={_mm_aligned:.2f} dir={direction})")
-                logger.info("hexp %s %s | BLOCK %s dir=%s (extreme + momentum reversed + long wick)",
-                            symbol, primary, _extreme_block, direction)
-                direction = "NO_TRADE"
-                # 关键修复(2026-08-13)：step10 在 step9 之后执行，仅改局部 direction 不会
-                # 回写 sr.direction/threshold_passed → 闸门此前只打日志不真封单。
-                # 必须同步回写输出契约，BLOCK 才真正生效。
-                passed = False
-                sr.threshold_passed = False
-                sr.direction = "NO_TRADE"
-                sr.extreme_reversal_blocked = True
-                if not sr.fallback_reason:
-                    sr.fallback_reason = _extreme_block
+                if _sym_be_ok:
+                    # 已有同向保本持仓：不硬封，标记交风控（轻仓追单）
+                    sr.extreme_pending = True
+                    logger.info(
+                        "hexp %s %s | EXTREME PENDING(保本追单) dir=%s pos=%.2f mm=%.2f "
+                        "(sym be=1 → risk BE-gate 裁决)",
+                        symbol, primary, direction, _pos_pct, _mm_aligned)
+                else:
+                    _extreme_block = (f"hexp_extreme_reversal(top={_pos_pct:.2f} wick_u={_upper_wick:.2f} "
+                                       f"wick_l={_lower_wick:.2f} mm={_mm_aligned:.2f} dir={direction})")
+                    logger.info("hexp %s %s | BLOCK %s dir=%s (extreme + momentum reversed + long wick)",
+                                symbol, primary, _extreme_block, direction)
+                    direction = "NO_TRADE"
+                    # 关键修复(2026-08-13)：step10 在 step9 之后执行，仅改局部 direction 不会
+                    # 回写 sr.direction/threshold_passed → 闸门此前只打日志不真封单。
+                    # 必须同步回写输出契约，BLOCK 才真正生效。
+                    passed = False
+                    sr.threshold_passed = False
+                    sr.direction = "NO_TRADE"
+                    sr.extreme_reversal_blocked = True
+                    if not sr.fallback_reason:
+                        sr.fallback_reason = _extreme_block
             elif _mm_retreat_enabled and _mm_aligned < _mm_retreat_min:
-                # 旧语义兜底：极值区仅动量回撤（无长影线条件）仍拦原趋势延续单
-                _extreme_block = (f"hexp_extreme_guard(retreat mm={_mm_aligned:.2f} "
-                                   f"pos={_pos_pct:.2f})")
-                logger.info("hexp %s %s | BLOCK %s dir=%s (extreme + mm retreat)",
-                            symbol, primary, _extreme_block, direction)
-                direction = "NO_TRADE"
-                passed = False
-                sr.threshold_passed = False
-                sr.direction = "NO_TRADE"
-                if not sr.fallback_reason:
-                    sr.fallback_reason = _extreme_block
+                if _sym_be_ok:
+                    # 已有同向保本持仓：不硬封，标记交风控（轻仓追单）
+                    sr.extreme_pending = True
+                    logger.info(
+                        "hexp %s %s | EXTREME PENDING(保本追单) dir=%s pos=%.2f mm=%.2f "
+                        "(sym be=1 → risk BE-gate 裁决)",
+                        symbol, primary, direction, _pos_pct, _mm_aligned)
+                else:
+                    # 旧语义兜底：极值区仅动量回撤（无长影线条件）仍拦原趋势延续单
+                    _extreme_block = (f"hexp_extreme_guard(retreat mm={_mm_aligned:.2f} "
+                                       f"pos={_pos_pct:.2f})")
+                    logger.info("hexp %s %s | BLOCK %s dir=%s (extreme + mm retreat)",
+                                symbol, primary, _extreme_block, direction)
+                    direction = "NO_TRADE"
+                    passed = False
+                    sr.threshold_passed = False
+                    sr.direction = "NO_TRADE"
+                    if not sr.fallback_reason:
+                        sr.fallback_reason = _extreme_block
             else:
                 sr.extreme_chase = True
                 logger.info(
@@ -1428,6 +1454,41 @@ class HexpEngine:
             "rsi": round(float(pf.get("_rsi_raw", 50.0)), 2),
             "mm": round(float(f_mm), 4),
         }
+        # ── 趋势抢跑候选观测（2026-08-24，顺势轻仓试探影子）──
+        # 目标：识别"趋势启动初期"的顺势进场候选（与 reverse_candidate 同范式，只观测不下单）。
+        # 触发条件（三条件齐）：
+        #   ① phase=="ignite"（系统已产出的"点火"相位 = 启动信号）
+        #   ② 微动量同向确认（BUY 要 mm>0 / SELL 要 mm<0）——启动方向明确，非假启动
+        #   ③ 位置中低位（BUY 要 pos<0.7 / SELL 要 pos>0.3）——避开极值区，非高位追单
+        # 与 reverse_candidate（极值高位动量反向做反向单）方向相反：本候选是【顺势】抢跑。
+        # 产出 sr.trend_start_candidate，由 scheduler 落库到 signals.indicator_values._hexp，
+        # 供 _reconcile_hexp_shadow 用未来 K 线评估"若轻仓顺势试探能否抓对趋势"（胜率/盈亏比），
+        # 验证达标后再启用真试探。零实盘影响（不发布 signal:stream）。
+        # 开关 hexp.trend_start_observe_enabled（默认 True）；阈值可热调。
+        _trend_start = None
+        _ts_observe = bool(cfg.get("hexp.trend_start_observe_enabled", True))
+        if _ts_observe and _phase == "ignite" and direction in ("BUY", "SELL"):
+            _ts_mm_ok = (direction == "BUY" and f_mm > 0) or (direction == "SELL" and f_mm < 0)
+            _ts_hi = float(cfg.get("hexp.trend_start_pos_high", 0.7))
+            _ts_lo = float(cfg.get("hexp.trend_start_pos_low", 0.3))
+            _ts_pos_ok = (direction == "BUY" and _pos_pct < _ts_hi) or \
+                         (direction == "SELL" and _pos_pct > _ts_lo)
+            if _ts_mm_ok and _ts_pos_ok:
+                _trend_start = {
+                    "dir": direction, "phase": _phase,
+                    "squeeze": round(_squeeze, 2), "ignite": round(_ignite, 2),
+                    "pos": round(_pos_pct, 4), "mm": round(f_mm, 4),
+                    "er": round(float(pf.get("_er_raw", 0.0)), 4),
+                    "adx": round(float(pf.get("_adx_raw", 0.0)), 2),
+                    "close": round(close_v, 3), "atr": round(atr, 4),
+                    "verdict": round(verdict, 4), "grade": grade,
+                }
+                logger.info(
+                    "hexp %s %s | TREND START CANDIDATE dir=%s phase=%s squeeze=%.1f "
+                    "ignite=%.1f pos=%.2f mm=%.3f er=%.3f — OBSERVE ONLY, no order",
+                    symbol, primary, direction, _phase, _squeeze, _ignite,
+                    _pos_pct, f_mm, float(pf.get("_er_raw", 0.0)))
+        sr.trend_start_candidate = _trend_start
         sr.used_periods = list(periods)
         sr.primary_period = primary
         sr.transition = transition

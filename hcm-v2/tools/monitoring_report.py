@@ -153,6 +153,20 @@ def main():
     # 1) PSI 滑动窗口（vs 训练基准 deciles）
     psi = compute_psi_batch(fdf, baseline, feat_cols)
 
+    # 【2026-08-24 修复·报表假象】高波动/非平稳环境特征（如 event_proximity_min，
+    # "距下一重大事件分钟数"，事件日历变化致其分布天然剧变）PSI 恒虚高，已在
+    # auto_retrain._compute_trigger 中豁免（不参与重训触发）。报表须与触发/告警口径一致：
+    # 展示的 psi.max/mean/drifted 用"排除豁免特征后"的统计，避免运维看到 max=0.60
+    # 误判"重度漂移"。per_feature 仍全量展示（含豁免特征）供深度诊断。
+    PSI_EXEMPT_FEATURES = set(
+        (os.environ.get("PSI_EXEMPT_FEATURES", "event_proximity_min") or "").split(",")
+    )
+    _pf = psi.get("per_feature", {})
+    _eval = {k: v for k, v in _pf.items() if k not in PSI_EXEMPT_FEATURES}
+    psi_eval_max = round(max(_eval.values()), 4) if _eval else 0.0
+    psi_eval_mean = round(sum(_eval.values()) / len(_eval), 4) if _eval else 0.0
+    psi_eval_drifted = [k for k in psi.get("drifted", []) if k not in PSI_EXEMPT_FEATURES]
+
     # 2) 校准分桶
     cal = calibration_buckets(ai_scores, passed_list)
 
@@ -167,9 +181,15 @@ def main():
         "window_hours": args.window_hours,
         "n_samples": len(rows),
         "psi": {
-            "max": round(psi["max"], 4),
-            "mean": round(psi["mean"], 4),
-            "drifted_features": psi["drifted"],
+            # 展示口径 = 排除豁免特征后（与触发/告警一致，防假象误导）
+            "max": psi_eval_max,
+            "mean": psi_eval_mean,
+            "drifted_features": psi_eval_drifted,
+            # 诊断口径 = 全量（含豁免特征，供深度排查）
+            "max_raw": round(psi["max"], 4),
+            "mean_raw": round(psi["mean"], 4),
+            "drifted_features_raw": psi["drifted"],
+            "exempt_features": sorted(PSI_EXEMPT_FEATURES),
             "per_feature": {k: round(v, 4) for k, v in psi["per_feature"].items()},
         },
         "calibration_buckets": cal,

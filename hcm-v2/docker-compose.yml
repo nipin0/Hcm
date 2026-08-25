@@ -117,6 +117,11 @@ services:
       - "0.0.0.0:8002:8002"
     networks:
       - hcm-network
+    # 【2026-08-24 时钟同步】signal-tower 生成信号时间戳(UTC)，若其容器时钟比宿主(桥)
+    # 快/慢数百秒，信号被桥 _is_signal_fresh 误判"未来/过期"拒绝 → 错过下单。
+    # 授予 SYS_TIME 使容器内可 date -s 校准（配合启动同步），根治时钟偏差。
+    cap_add:
+      - SYS_TIME
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
       interval: 15s

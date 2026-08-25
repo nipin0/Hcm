@@ -720,8 +720,6 @@ class Scheduler:
         try:
             if self._config is None or not await self._config.get_bool("ai.enabled", False):
                 return None
-            if (await self._config.get("ai.mode", "decoupled")) != "coupled":
-                return None
 
             cfg = await self._ai_cfg_dict()
         except Exception as _e:  # noqa: BLE001
@@ -857,6 +855,13 @@ class Scheduler:
                     )
                 except Exception:
                     pass
+
+        # 【2026-08-24 修复·方案C根因】写 ai:ds:trigger 标志的逻辑已移到 ai.mode 判断之前
+        # （见上方 783 段），确保 decoupled 模式下也持续为训练管线积累 DeepSeek 票。
+        # 运行期 AI 裁决（c_ai fusion）仅 coupled 模式执行；decoupled 模式写完 trigger 即返回
+        # None，由调用方回退纯 HEXP 信号（与 2026-08-18 解耦语义一致）。
+        if (await self._config.get("ai.mode", "decoupled")) != "coupled":
+            return None
 
         # 3) 产出 c_ai —— 【单源 LightGBM】，DeepSeek 不参与（2026-08-18 解耦）
         fusion = calibrate_lm_score(lm_score, ds_out, cfg)
@@ -2530,6 +2535,10 @@ class Scheduler:
                 # 2026-08-21 反向单观测：momentum_flip 高位动量反向时记录的反向候选
                 # (dir/pos/er/mm/close/verdict)，仅观测不下单，供 SQL 回测胜率。
                 "reverse_candidate": getattr(score_result, "reverse_candidate", None),
+                # 2026-08-24 趋势抢跑观测：phase=ignite+动量同向+pos 中低位的顺势启动候选。
+                # 写进生产 hexp 信号的 indicator_values._hexp（shadow 在 active_model=hexp 时
+                # 被跳过，故必须挂主信号才能积累评估数据）。仅观测不下单。
+                "trend_start_candidate": getattr(score_result, "trend_start_candidate", None),
             }
         signal_data = SignalData(
             signal_id=signal_id,
@@ -2555,6 +2564,8 @@ class Scheduler:
             regime=regime_result.regime.value,
             pre_score=round(score_result.pre_score, 4),
             weight_scheme=score_result.weight_scheme,
+            # 2026-08-25 极值分层裁决：hexp 极值+保本追单候选 → 透传，风控保本闸门最终裁决
+            extreme_pending=bool(getattr(score_result, "extreme_pending", False)),
             # 2026-08-13 修复：优先用 hexp 引擎落库的 Donchian 分位（sr.position_in_range），
             # 支撑「高位做多/低位做空」SQL 敏捷识别；非 hexp 路径回退 range_position。
             position_in_range=(
@@ -2700,6 +2711,8 @@ class Scheduler:
             regime=regime_result.regime.value,
             pre_score=round(score_result.pre_score, 4),
             weight_scheme=score_result.weight_scheme,
+            # 2026-08-25 极值分层裁决：hexp 极值+保本追单候选 → 透传，风控保本闸门最终裁决
+            extreme_pending=bool(getattr(score_result, "extreme_pending", False)),
             # 2026-08-13 修复：优先用 hexp 引擎落库的 Donchian 分位（sr.position_in_range），
             # 支撑「高位做多/低位做空」SQL 敏捷识别；非 hexp 路径回退 range_position。
             position_in_range=(
@@ -3111,6 +3124,10 @@ class Scheduler:
                 "co_dir": _co_dir,
                 "co_agree": _agree,
                 "co_pre_score": round(float(getattr(score_result, "pre_score", 0.0) or 0.0), 4),
+                # 2026-08-24 趋势抢跑候选观测：hexp 引擎 phase=ignite+动量同向+pos 中低位时
+                # 产出的顺势启动候选（dir/pos/mm/er/squeeze/ignite/verdict/grade），
+                # 仅观测不下单，供 _reconcile_hexp_shadow 对比"趋势启动候选 vs 普通信号"胜率。
+                "trend_start": getattr(_hexp_sr, "trend_start_candidate", None),
             },
             fallback_reason=getattr(_hexp_sr, "fallback_reason", ""),
             regime=getattr(regime_result, "regime", "UNKNOWN"),

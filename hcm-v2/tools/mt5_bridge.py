@@ -1058,17 +1058,6 @@ SESSION_DEFAULTS = {
     "us":     {"sl": 2.0, "tp": 2.6, "min_rr": 1.3, "be": 0.4, "be_buf": 0.15, "trail_start": 1.5, "trail_wide": 0.7, "tp_relay": True},
 }
 
-_SESSION_SUFFIX_MAP = {
-    "trailing_stop_distance": "sl",
-    "tp_atr_multiplier": "tp",
-    "min_rr": "min_rr",
-    "breakeven_atr_mult": "be",
-    "breakeven_buffer_atr_mult": "be_buf",
-    "trail_start_atr_mult": "trail_start",
-    "trail_wide_atr_mult": "trail_wide",
-    "tp_relay_enabled": "tp_relay",
-}
-
 
 def _session_cfg_float(redis_conn, suffix: str, default: float) -> float:
     """会话优先的浮点配置读取。先 close.<session>.<suffix>，再 close.<suffix>，再 default。"""
@@ -1118,7 +1107,7 @@ def _audit_signal_stage(redis_conn, sid, stage, **fields):
         pass
 
 
-def _is_signal_fresh(msg_data: dict, max_age: int) -> bool:
+def _is_signal_fresh(msg_data: dict, max_age: int, redis_conn=None) -> bool:
     """判断信号是否足够新鲜、允许下单（禁止过期/缺时间戳信号下单）。
 
     规则（防御纵深，任一不满足即拒绝）：
@@ -1151,8 +1140,13 @@ def _is_signal_fresh(msg_data: dict, max_age: int) -> bool:
     if age > max_age:
         log.warning("REJECT stale signal %s: age=%.0fs > %ds", sid, age, max_age)
         return False
-    if age < -5:
-        log.warning("REJECT signal %s: timestamp %.0fs in the future", sid, age)
+    # 【2026-08-24 修复】未来时间容差：原硬编码 -5s，会误拒信号塔容器时钟偏差
+    # （实测 signal-tower 容器比宿主桥快 ~146s，信号 timestamp 超前 → age<-5 → 误判
+    # "未来时间"拒绝 → 错过下单）。改为可配置 bridge.max_clock_skew_sec（默认 180），
+    # 容忍跨容器/主机正常时钟偏差，仅拒绝远超合理偏差的时钟异常（防追错行情）。
+    _clock_skew = _get_close_config(redis_conn, "bridge.max_clock_skew_sec", 180.0)
+    if age < -_clock_skew:
+        log.warning("REJECT signal %s: timestamp %.0fs in the future (>skew %ds)", sid, age, int(_clock_skew))
         return False
     return True
 
@@ -1213,6 +1207,21 @@ def place_mt5_order(mt5, signal_data, symbol, timeframe_str, redis_conn=None):
             lot = round(lot * float(_mult), 2)
             if lot <= 0:
                 lot = 0.01
+    # ── 2026-08-25 修复：消费风控下发的 suggested_lot_ratio（extreme_pending 极值追单×0.5）──
+    # 此前该字段在风控 rule_chain 设置、stream_consumer 透传，但桥从未读取 → 轻仓减半
+    # 形同虚设，极值追单按满手数开仓（与"防接刀、控仓"初衷相悖）。在此（跟单倍率之后、
+    # 最小手数钳制之前）应用，确保减半后仍满足 volume_min。
+    try:
+        _lot_ratio = float(signal_data.get("suggested_lot_ratio", 1.0) or 1.0)
+    except Exception:
+        _lot_ratio = 1.0
+    if _lot_ratio not in (0.0, 1.0):
+        _reduced = round(lot * _lot_ratio, 2)
+        if _reduced > 0:
+            log.info("suggested_lot_ratio=%.4f applied → lot %.4f → %.4f", _lot_ratio, lot, _reduced)
+            lot = _reduced
+        if lot <= 0:
+            lot = 0.01
     sl = float(signal_data.get('sl_price', 0))
     tp = float(signal_data.get('tp1', 0))
     real = real_symbol(symbol)  # 翻译为实盘名（MT5 API 边界）；ATR/日志用逻辑名 symbol
@@ -1578,6 +1587,26 @@ async def _atr_filter_blocks(pool, redis_conn, symbol: str,
         return False
 
 
+async def _mark_signal_blocked(pool, sid, reason: str) -> None:
+    """【2026-08-24 修复】桥端拦截时回写 PG fallback_reason（卡点标记）。
+
+    根治"过风控未成交但信号漏斗显示'未标记卡点'"：
+    此前桥端各闸门（cooldown/reverse_guard/position_cap/bridge_failed）拦截只写
+    Redis 审计 key，从不回写 PG 信号表 fallback_reason → 前端漏斗 map_funnel_reason
+    一律显示"未标记"，无法区分"过风控未成交"里哪些是冷却/反转护栏/持仓数/下单失败拦掉的。
+    本函数在拦截分支 return False 前回写卡点名（保持 signal_status=1，不覆盖已成交 status=3）。
+    """
+    if pool is None or not sid:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE hcm_signal.signals SET fallback_reason=$2, updated_at=now() "
+                "WHERE signal_id=$1 AND signal_status<>3", sid, reason)
+    except Exception as _e:
+        log.warning("mark signal %s blocked=%s failed (non-fatal): %s", sid, reason, _e)
+
+
 async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
                            msg_symbol: str, timeframe_str: str,
                            dry_run: bool) -> bool:
@@ -1603,6 +1632,7 @@ async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
         _cool_sym = logic_symbol(msg_symbol) or msg_symbol
         if _after_close_cooling(redis_conn, _cool_sym):
             log.info("After-close cooldown: skip %s open for %s (cooling active)", _dir, _cool_sym)
+            await _mark_signal_blocked(pool, sid, "bridge_after_close_cooldown")
             return False
     if _dir in ("BUY", "SELL") and _get_close_config_bool(
             redis_conn, "close.reverse_guard_enabled",
@@ -1627,6 +1657,7 @@ async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
                         _dir, sid, _p.ticket, _p.profit, _psl, _entry)
                     _audit_signal_stage(redis_conn, sid, "reverse_guard_blocked",
                                         ticket=_p.ticket)
+                    await _mark_signal_blocked(pool, sid, "bridge_reverse_guard")
                     return False
         except Exception as _exc:
             log.warning("reverse guard check failed sid=%s: %s (fail-open)", sid, _exc)
@@ -1647,6 +1678,7 @@ async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
                         "ACCOUNT POSITION CAP: block %s signal %s sym=%s — open_positions=%d >= %d",
                         _dir, sid, msg_symbol, _open_cnt, _max_pos)
                     _audit_signal_stage(redis_conn, sid, "position_cap_blocked")
+                    await _mark_signal_blocked(pool, sid, "bridge_position_cap")
                     return False
         except Exception as _cap_err:
             log.warning("account position cap check failed sid=%s: %s (fail-open)", sid, _cap_err)
@@ -1749,6 +1781,8 @@ async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
         else:
             _audit_signal_stage(redis_conn, sid, "bridge_failed",
                                 code=result.get("code"), msg=result.get("message"))
+            await _mark_signal_blocked(
+                pool, sid, f"bridge_failed({result.get('code')})")
             log.error("❌ MT5 order failed: %s", result.get('message', '?'))
             return False
     else:
@@ -1862,6 +1896,10 @@ async def _force_close_positions(mt5, redis_conn, symbol: str, mode: str = "all"
 # ─────────────────────────────────────────────────────────────────────────────
 
 _FOLLOW_CIRCUIT_KEY_TMPL = "bridge:follow:circuit:{account}"  # 熔断标志键（带 TTL 到次日恢复时间）
+# 【2026-08-25 按账户迁移·本金基准】每日 07:00(resume_time) 记录跟单号账户本金 balance，
+# 作熔断百分比分母的固定基准（键值=7点时本金）。每日 07:00 由主循环刷新。
+_FOLLOW_BASELINE_KEY_TMPL = "bridge:follow:baseline:{account}"
+_FOLLOW_BASELINE_LAST_DAY = None  # 当日是否已记录本金基准（date 类型）
 _DEAL_ENTRY_OUT = getattr(_mt5_global, "DEAL_ENTRY_OUT", 1)
 
 
@@ -1904,12 +1942,13 @@ def _follower_daily_pnl(mt5) -> float:
 
 
 def _follower_account_balance(mt5) -> float:
-    """取跟单号账户权益(equity)（仓位资金基数，用于百分比限额计算）。
+    """取跟单号账户本金(balance)（熔断百分比基数分母）。
 
-    改用 equity 而非 balance 作分母：balance 仅含已入金本金，不反映当前浮动盈亏；
-    对小账户（如余额仅 $28）极不友好——稍大绝对亏损即被算成数百% 误触发熔断。
-    equity = balance + 浮动盈亏，更贴近账户真实风险敞口，百分比语义更稳定。
-    equity <= 0 视为无法计算百分比，熔断检查应跳过。
+    【2026-08-25 按用户需求改】分母基准 = 账户本金(balance) 而非权益(equity)。
+    熔断公式：(浮盈 + 今日已实现) / 7点时本金(balance) × 100，百分比语义 =
+    "当日相对初始本金的盈亏比率"，基准固定不回冲（避免 equity 分母随浮盈动态
+    变化导致的百分比失真：盈利稀释/亏损放大）。实际分母优先取每日 07:00 记录的
+    baseline（Redis bridge:follow:baseline:{account}），本函数返回当前本金作回退。
     """
     try:
         info = mt5.account_info()
@@ -1919,7 +1958,7 @@ def _follower_account_balance(mt5) -> float:
     if info is None:
         return 0.0
     try:
-        return float(info.equity)
+        return float(info.balance)
     except Exception:
         return 0.0
 
@@ -1951,7 +1990,7 @@ def _follower_resume_ttl(resume_time_str: str) -> int:
     return max(ttl, 3600)  # 兜底：至少 1h，防边界计算异常
 
 
-async def _check_follower_circuit_break(mt5, redis_conn, account_id) -> None:
+async def _check_follower_circuit_break(mt5, redis_conn, pool, account_id) -> None:
     """跟单号每日盈亏熔断检查（主循环每 ~30s 调用一次，仅跟单桥）。
 
     行为：
@@ -1960,13 +1999,56 @@ async def _check_follower_circuit_break(mt5, redis_conn, account_id) -> None:
       · 标志键已过期(到 resume_time) → 清除内存标志（自动恢复跟单）。
       · 计算当日净盈亏，盈利/亏损超上限 → 全平跟单号 + 置熔断标志键(TTL=到次日 resume_time)。
     通过模块全局 FOLLOW_CIRCUIT_BROKEN 控制信号消费与 reconcile 补开的闸门。
+
+    【2026-08-25 按账户迁移】熔断阈值不再读全局 close.follow_*，改为读本跟单号
+    hcm_copy.relationships 的 max_daily_profit / max_daily_loss / circuit_break_enabled
+    （per-account 默认值：running 关系已回填全局旧值 30/50）。分母由"当前 equity"
+    改为"每日 07:00 记录的账户本金 balance 基准"（Redis bridge:follow:baseline:{account}，
+    缺失回退当前 balance）。MT5 未激活账户不接受信号且跳过熔断。
     """
     global FOLLOW_CIRCUIT_BROKEN, _FOLLOW_CIRCUIT_LAST_LOG_TS, _FOLLOW_CIRCUIT_WAS_BROKEN, _FOLLOWER_CIRCUIT_RECOVERED_AT
-    enabled = _get_close_config_bool(
-        redis_conn, "close.follow_circuit_break_enabled",
-        CLOSE_CONFIG_DEFAULTS["close.follow_circuit_break_enabled"],
-    )
-    if not enabled:
+    # ── 未激活闸门：MT5 未激活账户不接受信号 + 跳过熔断（用户需求：MT5激活态才接受信号）──
+    try:
+        if pool is not None:
+            _acc = await pool.fetchrow(
+                "SELECT is_active FROM hcm_broker.accounts WHERE account_id=$1",
+                account_id,
+            )
+            if _acc is not None and _acc["is_active"] is not True:
+                FOLLOW_CIRCUIT_BROKEN = False
+                return  # 未激活：不熔断、也不接收信号（信号接收闸门同样检查 is_active）
+    except Exception as _acc_exc:
+        log.warning("follower circuit: account active check failed: %s", _acc_exc)
+    # ── 按账户熔断阈值（读 relationships，per-account；缺/异常回退全局旧值兜底）──
+    _p_max = 0.0
+    _l_max = 0.0
+    _c_enabled = True
+    _rel = None
+    try:
+        if pool is not None:
+            _rel = await pool.fetchrow(
+                "SELECT max_daily_profit, max_daily_loss, circuit_break_enabled "
+                "FROM hcm_copy.relationships "
+                "WHERE copy_account_id=$1 AND status='running' LIMIT 1",
+                account_id,
+            )
+            if _rel is not None:
+                _p_max = float(_rel["max_daily_profit"] or 0.0)
+                _l_max = float(_rel["max_daily_loss"] or 0.0)
+                _c_enabled = bool(_rel["circuit_break_enabled"])
+    except Exception as _rel_exc:
+        log.warning("follower circuit: relationships read failed: %s", _rel_exc)
+    if _rel is None:
+        # 无 running 跟单关系或查询失败 → 回退全局旧值（兼容未迁移数据/兜底）
+        _p_max = _get_close_config(
+            redis_conn, "close.follow_daily_profit_max",
+            CLOSE_CONFIG_DEFAULTS["close.follow_daily_profit_max"],
+        )
+        _l_max = _get_close_config(
+            redis_conn, "close.follow_daily_loss_max",
+            CLOSE_CONFIG_DEFAULTS["close.follow_daily_loss_max"],
+        )
+    if not _c_enabled:
         FOLLOW_CIRCUIT_BROKEN = False
         return
     key = _FOLLOW_CIRCUIT_KEY_TMPL.format(account=account_id)
@@ -1989,14 +2071,8 @@ async def _check_follower_circuit_break(mt5, redis_conn, account_id) -> None:
         _FOLLOWER_CIRCUIT_RECOVERED_AT = time.time()
     if time.time() - _FOLLOWER_CIRCUIT_RECOVERED_AT < 3600:
         return  # 恢复宽限期内：只放行跟单，不重新评估熔断
-    profit_max = float(_get_close_config(
-        redis_conn, "close.follow_daily_profit_max",
-        CLOSE_CONFIG_DEFAULTS["close.follow_daily_profit_max"],
-    ))
-    loss_max = float(_get_close_config(
-        redis_conn, "close.follow_daily_loss_max",
-        CLOSE_CONFIG_DEFAULTS["close.follow_daily_loss_max"],
-    ))
+    profit_max = _p_max
+    loss_max = _l_max
     if profit_max <= 0 and loss_max <= 0:
         return  # 双向均未设置上限（百分比 0=不限制）→ 不熔断
     try:
@@ -2009,19 +2085,28 @@ async def _check_follower_circuit_break(mt5, redis_conn, account_id) -> None:
     except Exception as exc:
         log.warning("follower circuit: pnl calc failed: %s", exc)
         return
-    # 限额百分比基数：固定用【账户权益 equity】做分母（占 equity 百分比语义）。
-    # 旧实现用 balance（仅本金），对小账户极不友好：余额 $28 时一点绝对亏损即被算成
-    # 数百% 误触发。equity = balance + 浮动盈亏，更贴近账户真实风险敞口，百分比语义稳定。
-    base = balance if balance > 0 else 0.0
+    # 限额百分比基数分母：优先取【每日 07:00 记录的账户本金 balance 基准】(Redis
+    # bridge:follow:baseline:{account})，缺失则回退当前本金 balance（_follower_account_balance
+    # 已改为返回 balance）。【2026-08-25 按用户需求】分母=本金基准，非 equity——百分比
+    # 语义="当日相对初始本金的盈亏比率"，基准固定不回冲，避免 equity 分母动态失真。
+    base = 0.0
+    _base_label = "baseline_balance"
+    try:
+        _bs = redis_conn.get(_FOLLOW_BASELINE_KEY_TMPL.format(account=account_id))
+        if _bs:
+            base = float(_bs)
+    except Exception:
+        base = 0.0
     if base <= 0:
-        log.warning(
-            "follower circuit: equity unavailable (<=0) — skip check"
-        )
-        return
-    # 净盈亏 / 账户 equity × 100
+        base = balance if balance > 0 else 0.0
+        if base <= 0:
+            log.warning(
+                "follower circuit: baseline & balance unavailable (<=0) — skip check"
+            )
+            return
+    # 净盈亏 / 7点本金基准 × 100
     profit_pct = (net / base * 100.0) if net > 0 else 0.0
     loss_pct = (-net / base * 100.0) if net < 0 else 0.0
-    _base_label = "equity"
     # 绝对金额下限：百分比达标【且】绝对金额也超下限才熔断，避免小账户被微小绝对亏损误杀。
     profit_abs_min = float(_get_close_config(
         redis_conn, "close.follow_daily_profit_abs_min",
@@ -2092,7 +2177,7 @@ async def _check_follower_circuit_break(mt5, redis_conn, account_id) -> None:
                 "kind": _kind, "net_pnl": round(_net, 2),
                 "pct": round(_pct, 2), "limit_pct": _limit,
                 "base_kind": _base_label, "base": round(base, 2),
-                "equity": round(balance, 2),
+                "balance": round(balance, 2),
                 "at": int(time.time()), "closed": closed,
             }), ex=ttl)
         except Exception as set_exc:
@@ -2715,7 +2800,7 @@ async def _recheck_zone_pending(pool, mt5, redis_conn, dry_run: bool) -> None:
             redis_conn.delete(key)
             continue
         # 【E 组 P2-6】deferred 成交前补信号新鲜度检查（原绕过 Safety Rail 1）
-        if not _is_signal_fresh(msg_data, _zr_max_age):
+        if not _is_signal_fresh(msg_data, _zr_max_age, redis_conn):
             log.info("ZONE pending signal %s expired — dropped", sid)
             _audit_signal_stage(redis_conn, sid, "expired")
             redis_conn.delete(key)
@@ -3662,8 +3747,12 @@ async def main(dry_run=False):
                                 continue
                             # ── Safety Rail 1 (MOVED UP + STRICT): 禁止过期/缺时间戳信号下单 ──
                             # 现优先用 signal_generated_at(T0) 算 age；前置为第一道闸门。
-                            if not _is_signal_fresh(msg_data, max_signal_age):
+                            if not _is_signal_fresh(msg_data, max_signal_age, redis_conn):
                                 _audit_signal_stage(redis_conn, sid, "expired")
+                                # 【2026-08-24 修复】expired/时钟偏差拒绝也回写 PG fallback_reason，
+                                # 使"过风控未成交"在信号漏斗标记具体卡点（此前 fallback_reason 恒空
+                                # → 显示"未标记"，无法定位是过期还是时钟偏差导致错过下单）。
+                                await _mark_signal_blocked(pool, sid, "bridge_signal_expired")
                                 redis_conn.set(f"bridge:processed:{ACCOUNT_ID_MODE}:{sid}", "done", ex=2592000)
                                 redis_conn.xack("signal:risk_passed", BRIDGE_GROUP, msg_id)
                                 continue
@@ -3873,9 +3962,33 @@ async def main(dry_run=False):
             # 跟单号每日盈亏熔断检查（仅跟单桥；每 30s；超阈值全平+停跟，次日 resume_time 自动恢复）
             if IS_FOLLOWER and now - _follow_circuit_last_check > 30:
                 try:
-                    await _check_follower_circuit_break(mt5, redis_conn, ACCOUNT_ID_MODE)
+                    # 【2026-08-25 按账户迁移】传 pool：熔断阈值改读本跟单号 relationships
+                    # (max_daily_profit/max_daily_loss/circuit_break_enabled) + 账户激活闸门。
+                    await _check_follower_circuit_break(mt5, redis_conn, pool, ACCOUNT_ID_MODE)
                 except Exception as cb_exc:
                     log.error(f"follower circuit check failed: {cb_exc}")
+                # 每日 07:00 记录跟单号账户本金 balance 作熔断分母固定基准
+                # (Redis bridge:follow:baseline:{account})；当日已记录则跳过。
+                # 【2026-08-25 时区修正】resume_time(close.follow_resume_time=07:00) 是【本地时间】
+                # (记忆 40554216)，故 baseline 记录也必须用本地时间 datetime.now()（非 UTC），
+                # 否则本地 07:00(=UTC 前一日 23:00) 永远不满足 hour==7 → baseline 键一直缺失，
+                # 分母回退当前 balance 而非当日初始本金基准（语义不准）。
+                try:
+                    _local_now = datetime.now()  # 本地时区，与 resume_time 口径一致
+                    if _local_now.hour == 7 and _FOLLOW_BASELINE_LAST_DAY != _local_now.date():
+                        _bal = _follower_account_balance(mt5)
+                        if _bal > 0:
+                            redis_conn.set(
+                                _FOLLOW_BASELINE_KEY_TMPL.format(account=ACCOUNT_ID_MODE),
+                                str(round(_bal, 2)),
+                            )
+                            _FOLLOW_BASELINE_LAST_DAY = _local_now.date()
+                            log.info(
+                                "follower baseline: set balance=%.2f (07:00 local daily baseline)",
+                                _bal,
+                            )
+                except Exception as _bs_exc:
+                    log.warning("follower baseline record failed: %s", _bs_exc)
                 _follow_circuit_last_check = now
 
             # [2026-07-24 直连快速通道] 消费主号桥直接写入的 hcm:direct_close:* 平仓指令。
@@ -4230,6 +4343,14 @@ def _update_trailing_stops(mt5, redis_conn):
                         redis_conn.delete(_key)
             except Exception as _be_exc:
                 log.error(f"BE flag write failed: {_be_exc}")
+            # 【2026-08-25】主号也写 symbol 级保本标志（供 hexp 极值分层裁决）：
+            # _write_be_flags 重读 MT5 当前 SL，聚合 symbol→dir→be 写 hcm:pos:be:sym:*。
+            # 跟单桥在 _update_trailing_stops 外已单独调用（IS_FOLLOWER 分支），主号这里补。
+            if not IS_FOLLOWER:
+                try:
+                    _write_be_flags(mt5, redis_conn)
+                except Exception as _sb_exc:
+                    log.error(f"symbol BE flag write failed: {_sb_exc}")
     except Exception as e:
         log.error(f"_update_trailing_stops error: {e}")
 
@@ -4251,7 +4372,7 @@ def _write_be_flags(mt5, redis_conn) -> None:
     except Exception:
         return  # 读取失败不盲删，让旧标志 TTL 过期回退 DB
     if not _positions:
-        # 无持仓（flat）→ 清空两方向标志
+        # 无持仓（flat）→ 清空两方向标志（含 symbol 级）
         for _d in ("BUY", "SELL"):
             try:
                 redis_conn.delete(f"hcm:pos:be:{ACCOUNT_ID_MODE}:{_d}")
@@ -4259,16 +4380,30 @@ def _write_be_flags(mt5, redis_conn) -> None:
                 pass
         return
     _latest: dict[str, tuple] = {}
+    # 【2026-08-25 symbol 级保本标志】hexp 极值护栏分层裁决需判断"该 symbol 是否有保本持仓"
+    # （hexp 无 account_id，读不了账户级键）。聚合本桥各持仓的 symbol→dir→be：
+    # 任一持仓达保本即该 symbol:dir 置 1，供 hexp 决定是否豁免极值硬封。
+    _sym_be: dict[str, dict[str, bool]] = {}
+    # 【2026-08-25 加固】与风控 _check_cooldown DB 回退同源容差 risk.cool_be_tolerance，
+    # 避免同一持仓在 Redis 标志(裸 sl>=entry) 与 PG 真值源(sl>=entry-tol) 判定相反。
+    _be_tol = _get_close_config(redis_conn, "risk.cool_be_tolerance", 0.0)
     for _pos in _positions:
         _dir = "BUY" if _pos.type == 0 else "SELL"
         _entry = getattr(_pos, "price_open", None)
         _sl = getattr(_pos, "sl", None)
         _t = getattr(_pos, "time", 0) or 0
+        _sym = getattr(_pos, "symbol", "XAUUSD")
         if _entry is None or _sl is None:
             continue
-        _be = (_sl >= _entry) if _dir == "BUY" else (_sl <= _entry)
+        _be = (_sl >= _entry - _be_tol) if _dir == "BUY" else (_sl <= _entry + _be_tol)
         if _t >= (_latest.get(_dir) or (0,))[0]:
             _latest[_dir] = (_t, _be)
+        # symbol 级：任一持仓达保本即置 True
+        _sb = _sym_be.setdefault(_sym, {})
+        if _be:
+            _sb[_dir] = True
+        else:
+            _sb.setdefault(_dir, False)
     for _d in ("BUY", "SELL"):
         _t, _be = _latest.get(_d, (0, False))
         _key = f"hcm:pos:be:{ACCOUNT_ID_MODE}:{_d}"
@@ -4279,6 +4414,17 @@ def _write_be_flags(mt5, redis_conn) -> None:
                 redis_conn.delete(_key)
         except Exception:
             pass
+    # symbol 级标志写入（TTL 15s，与账户级一致；hexp 读它做极值豁免判断）
+    for _sym, _dirs in _sym_be.items():
+        for _d in ("BUY", "SELL"):
+            _skey = f"hcm:pos:be:sym:{_sym}:{_d}"
+            try:
+                if _dirs.get(_d):
+                    redis_conn.set(_skey, "1", ex=15)
+                else:
+                    redis_conn.delete(_skey)
+            except Exception:
+                pass
 
 
 def _update_total_trailing_stop(mt5, redis_conn):
