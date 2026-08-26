@@ -1601,7 +1601,8 @@ async def _mark_signal_blocked(pool, sid, reason: str) -> None:
     try:
         async with pool.acquire() as conn:
             await conn.execute(
-                "UPDATE hcm_signal.signals SET fallback_reason=$2, updated_at=now() "
+                "UPDATE hcm_signal.signals SET fallback_reason=$2, "
+                "block_reason=$2, updated_at=now() "
                 "WHERE signal_id=$1 AND signal_status<>3", sid, reason)
     except Exception as _e:
         log.warning("mark signal %s blocked=%s failed (non-fatal): %s", sid, reason, _e)
@@ -2682,6 +2683,65 @@ async def _modify_follower_position(mt5, redis_conn, symbol: str, sl: float, tp:
     return modified
 
 
+async def _follower_consume_sltp(mt5, redis_conn) -> None:
+    """毫秒级跟单 SL/TP 镜像消费：阻塞消费主号桥发布的 hcm:master:sltp 事件，
+    经 _modify_follower_position 精确按票把主号 auto 持仓 SL/TP 即时镜像到跟单仓。
+
+    事件驱动（xreadgroup block=50ms），主循环每轮调用 → 端到端延迟 ~50-250ms，
+    彻底消灭原 10s _sync_follower_sl_tp 轮询滞后（行情已跑远才跟上）。
+    10s 轮询保留作安全网（兜底事件丢失）。仅 IS_FOLLOWER 且 FOLLOW_MASTERS 非空时生效。
+    熔断(FOLLOW_CIRCUIT_BROKEN)不阻断本路径——跟单仓仍需 SL 保护。
+    """
+    if not IS_FOLLOWER or not FOLLOW_MASTERS:
+        return
+    _gid = BRIDGE_GROUP
+    _cname = f"sltp-consumer-{os.getpid()}"
+    try:
+        resp = redis_conn.xreadgroup(_gid, _cname, {"hcm:master:sltp": ">"}, count=32, block=50)
+    except Exception as e:
+        if "NOGROUP" in str(e).upper():
+            try:
+                redis_conn.xgroup_create("hcm:master:sltp", _gid, mkstream=True, id="$")
+            except Exception:
+                pass
+        else:
+            log.warning("SLTP-CONSUME xreadgroup error: %s", e)
+        return
+    if not resp:
+        return
+    for _stream, messages in resp:
+        for msg_id, fields in messages:
+            try:
+                def _g(k):
+                    _v = fields.get(k)
+                    return _v.decode() if isinstance(_v, bytes) else _v
+                master_ticket = int(float(_g("master_ticket") or 0))
+                symbol = _g("symbol") or ""
+                sl = float(_g("sl") or 0.0)
+                tp = float(_g("tp") or 0.0)
+                account_id = int(float(_g("account_id") or 0))
+                if account_id not in FOLLOW_MASTERS:
+                    redis_conn.xack("hcm:master:sltp", _gid, msg_id)
+                    continue
+                # 解析 signal_id：auto 单经 hcm:signal_for_ticket 映射到模型 signal_id，
+                # 手动单回退主号 ticket 本身；与 _modify_follower_position/_follower_pos_matches_master 同空间。
+                target = master_ticket
+                try:
+                    _m = redis_conn.get(f"hcm:signal_for_ticket:{master_ticket}")
+                    if _m:
+                        target = int(_m.decode() if isinstance(_m, bytes) else _m)
+                except Exception:
+                    pass
+                await _modify_follower_position(mt5, redis_conn, symbol, sl, tp, target_ticket=target)
+            except Exception as e:
+                log.warning("SLTP-CONSUME event failed id=%s: %s", msg_id, e)
+            finally:
+                try:
+                    redis_conn.xack("hcm:master:sltp", _gid, msg_id)
+                except Exception:
+                    pass
+
+
 async def _partial_close_follower_position(mt5, redis_conn, symbol: str, volume: float,
                                             target_ticket: int = 0) -> int:
     """Manual mirror PARTIAL_CLOSE：按 symbol 定位跟单号持仓，平掉指定增量手数（1:1 镜像）。
@@ -3206,6 +3266,22 @@ async def main(dry_run=False):
         )
     except Exception as e:
         log.warning(f"xgroup_setid failed: {e}")
+
+    # [2026-08-25] 跟单桥消费组：hcm:master:sltp（主号桥发布的毫秒级 SL/TP 事件流）。
+    # 与 signal:risk_passed 同名 group:{id} 跨流互不干扰；启动时确定性丢弃历史积压
+    # （SL/TP 瞬态，陈旧事件不应再驱动跟单改单）。
+    if IS_FOLLOWER:
+        try:
+            redis_conn.xgroup_create("hcm:master:sltp", BRIDGE_GROUP, mkstream=True, id="$")
+            log.info(f"Created sltp consumer group {BRIDGE_GROUP} (mkstream, id=$)")
+        except Exception as exc:
+            if "BUSYGROUP" not in str(exc).upper():
+                log.exception(f"sltp xgroup_create failed (NOT BUSYGROUP): {exc}")
+        try:
+            redis_conn.xgroup_setid("hcm:master:sltp", BRIDGE_GROUP, "$")
+            log.info("Startup: sltp group reset to latest ($), discarded backlog")
+        except Exception as exc:
+            log.warning(f"sltp xgroup_setid failed: {exc}")
 
     mt5_cfg = _load_mt5_config(redis_conn)
 
@@ -3916,7 +3992,7 @@ async def main(dry_run=False):
                 else:
                     # 加固A2：断连时内部 MT5 调用可能抛异常，局部捕获避免冒泡到主循环
                     try:
-                        _update_trailing_stops(mt5, redis_conn)
+                        await _update_trailing_stops(mt5, redis_conn, pool)
                     except Exception as e:
                         log.error(f"trailing stop update failed: {e}")
                     # P2: 总仓位金额移动止盈（仅检查 + 必要时全平，不移动 SL）
@@ -3925,6 +4001,14 @@ async def main(dry_run=False):
                     except Exception as e:
                         log.error(f"total trailing stop update failed: {e}")
                 last_trail = now
+
+            # [2026-08-25] 毫秒级跟单 SL/TP：每轮消费 hcm:master:sltp（block=50ms 上限），
+            # 主号 trailing/手动改 SL/TP 即时镜像到跟单仓（~50-250ms），10s 轮询作安全网。
+            if IS_FOLLOWER:
+                try:
+                    await _follower_consume_sltp(mt5, redis_conn)
+                except Exception as _sltp_exc:
+                    log.error(f"follower consume sltp failed: {_sltp_exc}")
 
             # P0优化：position_sync 与 trailing-stop 解耦，单独 ~1s 高频轮询。
             # 原绑在 5s 门控导致主号动作检测延迟 ~6s；现降到 ~1s，开仓/平仓双向见效。
@@ -4118,7 +4202,37 @@ async def run_bridge_forever(dry_run: bool = False, max_retries: int = 0) -> Non
             await asyncio.sleep(wait)
 
 
-def _update_trailing_stops(mt5, redis_conn):
+def _publish_trail_sltp_event(redis_conn, pos, new_sl: float, new_tp: float, account_id: int) -> None:
+    """trailing 成功移动主号 SL/TP → XADD hcm:master:sltp（毫秒级跟单消费专用流）。
+
+    真·毫秒级根因点：主号 SL 一动即发，跟单桥 xreadgroup(block=50) 即时镜像，
+    消灭 10s 轮询滞后。字段 str 化；master_ticket 供跟单桥经 hcm:signal_for_ticket 解析 signal_id。
+    """
+    if redis_conn is None:
+        return
+    try:
+        redis_conn.xadd(
+            "hcm:master:sltp",
+            {
+                "master_ticket": str(int(pos.ticket)),
+                "symbol": str(pos.symbol),
+                "sl": str(round(float(new_sl), 5)),
+                "tp": str(round(float(new_tp), 5)),
+                "account_id": str(int(account_id)),
+                "action": "modify",
+                "ts": str(int(time.time())),
+            },
+            maxlen=5000,
+        )
+        log.info(
+            "Trail SL/TP event published (sltp stream): ticket=%s symbol=%s sl=%s tp=%s (account=%s)",
+            pos.ticket, pos.symbol, new_sl, new_tp, account_id,
+        )
+    except Exception as e:
+        log.error("Trail SL/TP event publish failed ticket=%s: %s", pos.ticket, e)
+
+
+async def _update_trailing_stops(mt5, redis_conn, pool):
     """保本 + 单线移动止盈（方案乙，2026-07-14）。
 
     修复原三档(max 棘轮)的缺陷：固定「锁利档」(entry+lock_amount) 会把 SL 钉死，
@@ -4206,6 +4320,9 @@ def _update_trailing_stops(mt5, redis_conn):
         # 每方向仅保留【最新一笔】持仓（open_time 最大）的保本状态；达保本→set "1"(TTL15s)，
         # 未达/无持仓→delete，让标志过期回退 DB 真值源（防"已平仓仍被旧标志拦截"）。
         _be_latest: dict[str, tuple] = {}
+        # 【2026-08-25 口径对齐】与 _write_be_flags / 风控 DB 回退同源容差 risk.cool_be_tolerance，
+        # 避免内联标志(裸 sl>=entry) 与 _write_be_flags(sl>=entry-tol) 判定相反导致标志抖动。
+        _be_tol = _get_close_config(redis_conn, "risk.cool_be_tolerance", 0.0)
 
         for pos in positions:
             if pos.sl == 0 and pos.price_open is None:
@@ -4222,7 +4339,7 @@ def _update_trailing_stops(mt5, redis_conn):
             # ── BE 标志记录（先用当前 SL 估算；下方修改成功后用 new_sl 覆盖）──
             _dir = "BUY" if pos.type == 0 else "SELL"
             _eff_sl = pos.sl or 0.0
-            _at_be = (_eff_sl >= entry) if _dir == "BUY" else (_eff_sl <= entry)
+            _at_be = (_eff_sl >= entry - _be_tol) if _dir == "BUY" else (_eff_sl <= entry + _be_tol)
             _prev_t = (_be_latest.get(_dir) or (0,))[0]
             if _dir and pos.time is not None and pos.time >= _prev_t:
                 _be_latest[_dir] = (pos.time, _at_be)
@@ -4315,8 +4432,28 @@ def _update_trailing_stops(mt5, redis_conn):
                 if r and r.retcode == 10009:
                     log.info(f"Trail #{pos.ticket} {pos_type}: SL {pos.sl}→{new_sl} TP→{new_tp}")
                     # 以最新下发 SL 覆盖 BE 标志（该笔为最新持仓时生效）
-                    _at_be2 = (new_sl >= entry) if _dir == "BUY" else (new_sl <= entry)
+                    _at_be2 = (new_sl >= entry - _be_tol) if _dir == "BUY" else (new_sl <= entry + _be_tol)
                     _be_latest[_dir] = (pos.time, _at_be2)
+                    # 【G1-2026-08-25】移动 SL 成功后立即回写 PG，消除 position_sync 周期差
+                    # 导致的引擎读旧 SL 误判 at_be=False → 误拒同向新单。
+                    # 主号/跟单号经 mt5_ticket 关联，覆盖当前运行账户的全部持仓。
+                    try:
+                        async with pool.acquire() as conn:
+                            await conn.execute(
+                                "UPDATE hcm_trading.positions SET sl=$1, updated_at=now() "
+                                "WHERE mt5_ticket=$2",
+                                round(new_sl, 5), pos.ticket,
+                            )
+                    except Exception as _pg_exc:
+                        log.warning(f"Trail PG flush #{pos.ticket} SL failed: {_pg_exc}")
+                    # 【2026-08-25 毫秒级跟单 SL/TP】trailing 一动即发布 hcm:master:sltp 事件，
+                    # 跟单桥主循环内 xreadgroup(block=50) 即时镜像（~50-250ms），
+                    # 彻底消除原 10s _sync_follower_sl_tp 轮询滞后（行情已跑远才跟上）。
+                    # 仅主号桥走到此（跟单桥 trailing 已跳过），account_id=主号。
+                    try:
+                        _publish_trail_sltp_event(redis_conn, pos, new_sl, new_tp, ACCOUNT_ID_MODE)
+                    except Exception as _sltp_exc:
+                        log.warning(f"Trail SL/TP event publish failed #{pos.ticket}: {_sltp_exc}")
                 else:
                     retcode = r.retcode if r else "N/A"
                     err_info = ""
