@@ -190,6 +190,22 @@ HEXP_KEYS: dict[str, Any] = {
     # 不依赖 pos/趋势结构，让"动量转负即不再追多/追空"（比 momentum_drain 更敏捷的硬护栏）。
     "hexp.momentum_flip_enabled": True,
     "hexp.momentum_flip_mm": 0.04,
+    # 2026-08-26 高位分级加固：momentum_flip 按 ma 多头度动态收紧反向阈值，
+    # 拦 ma 高位 + mm 微负的顶部追单（实证 sid=388640542 BUY@4670.95 ma=97.23 mm=-0.0066）。
+    "hexp.momentum_flip_ma_threshold": 90.0,
+    "hexp.momentum_flip_ma_low": 10.0,
+    "hexp.momentum_flip_ma_mm": 0.005,
+    # 2026-08-26 P0-1 高位微正枯竭加固：momentum_flip 只拦"mm 反向(负)"，漏掉 ma 极高位
+    # + mm 微正枯竭(0<mm<弱阈值)的顶部追多（实证 sig=388640598 BUY@4666.08 ma=100 pos=0.846
+    # mm=+0.0124 regime=NEUTRAL 高位追多被止损）。高位+微正枯竭也拦，防均值回归反打。
+    "hexp.momentum_hi_weak_enabled": True,
+    "hexp.momentum_hi_weak_mm": 0.02,
+    # 2026-08-26 P0-2 震荡市均值回归校验：NEUTRAL/RANGE 市 + hurst<阈值(均值回归态) + 高位
+    # 顺势追单 → 拦（实证 sig=388640598 pos=0.846 hurst=0.449 regime=NEUTRAL 高位追多被止损）。
+    "hexp.range_hurst_enabled": True,
+    "hexp.range_hurst_max": 0.50,
+    "hexp.range_hurst_hi": 0.80,
+    "hexp.range_hurst_regimes": "NEUTRAL,RANGE",
     # 反向单观测（2026-08-21，先观测不下单）：momentum_flip 判动量反向且处于高位/低位时，
     # 记录反向候选落库到 indicator_values._hexp.reverse_candidate，供后续 SQL 对照评估。
     # 2026-08-21 补入白名单：此前仅在引擎 _DEFAULTS，面板无控件 → 改代码默认重启复原。

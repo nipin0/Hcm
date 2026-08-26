@@ -78,7 +78,12 @@ _DEFAULTS: dict[str, Any] = {
     "hexp.ma.ema_fast": 20,
     "hexp.ma.ema_mid": 50,
     "hexp.ma.ema_long": 100,
-    "hexp.ma.align_score": 50.0,
+    # 【2026-08-25 MA 因子失真修复】align_score 50→30。原 50 占满 0~100 一半，
+    # 使「EMA 排列(±50) + 斜率(±40)」在方向同向时立即饱和(多头锁100/空头锁0)，
+    # MA 因子退化成方向开关（历史 87.7% 锁死在 ±1 两档）。降为 30 后：
+    #   多头排列 ma_raw∈[40,100]、空头∈[0,60]，未锁宽度 60/100，
+    #   能区分「刚启动/强趋势/转弱」，恢复斜率项连续表达能力，保住趋势启动捕捉。
+    "hexp.ma.align_score": 30.0,
     "hexp.ma.slope_norm_bp": 3.0,  # EMA 回归斜率达到±40贡献上限所需的bp/根（文档4.1:斜率贡献=±40）。该常数为bp/bar→分数换算的饱和点，文档未给出但必需，须补进文档4.1。
     "hexp.ma.slope_bars": 10,
     "hexp.bbw.window": 120,
@@ -240,6 +245,28 @@ _DEFAULTS: dict[str, Any] = {
     # 此前 _DEFAULTS=0.02 与 web 白名单/引擎 cfg.get fallback=0.04 不一致，未 seed 的
     # 环境引擎用 0.02 而面板显示 0.04，属「保存刷新又复原」一类根因）。
     "hexp.momentum_flip_mm": 0.04,         # 反向阈值：|f_mm|≥此视为动量明确反转（防小回调误杀）
+    # 【2026-08-26 高位分级加固】momentum_flip 只拦"明确反向"(mm<-flip_mm)，漏掉
+    # ma 高位 + mm 微负(0>mm>-flip_mm)的顶部追多（实证 sid=388640542 BUY@4670.95，
+    # ma=97.23 且 mm=-0.0066 仍成交）。现按 ma 多头度动态收紧阈值：多头度≥高位分界时
+    # 用更严的 flip_ma_mm（微负即拦），正常位置仍用基础 flip_mm（明确反向才拦，防误杀）。
+    "hexp.momentum_flip_ma_threshold": 90.0,   # 高位分界：BUY 时 _ma_raw≥此视为极高多头位
+    "hexp.momentum_flip_ma_low": 10.0,          # 低位分界：SELL 时 _ma_raw≤此视为极高空头位
+    "hexp.momentum_flip_ma_mm": 0.005,          # 极端位下更严的反向阈值（|mm|≥此即拦逆动量单）
+    # 【2026-08-26 P0-1 高位微正枯竭加固】momentum_flip 只拦"mm 反向(负)"，漏掉
+    # ma 极高位 + mm 微正枯竭(0<mm<弱阈值)的顶部追多（实证 sig=388640598 BUY@4666.08
+    # ma=100 pos=0.846 mm=+0.0124 regime=NEUTRAL 高位追多被止损）。现扩展：多头度≥高位
+    # 分界且 mm 为正但 <weak_mm（动能枯竭未反转）时同样拦 BUY 追高（SELL 低位对称）。
+    # 仅拦"高位+微正枯竭"，正常位置/动量明显同向不拦，防误杀。
+    "hexp.momentum_hi_weak_enabled": True,     # 高位微正枯竭拦截总开关；False→退回旧行为(仅拦反向)
+    "hexp.momentum_hi_weak_mm": 0.02,          # 高位微正枯竭阈值：BUY 时 0<mm<此 / SELL 时 0>mm>-此 → 拦
+    # 【2026-08-26 P0-2 震荡市均值回归校验】NEUTRAL/RANGE 市(hurst<0.5 均值回归态)中，
+    # 高位(Donchian 分位接近极值)顺势追单易被均值回归反打（实证 sig=388640598 BUY@4666.08
+    # pos=0.846 hurst=0.449 regime=NEUTRAL 高位追多被止损）。震荡市应等回撤/极值反向，
+    # 不应在高低位顺势追单。本闸门：NEUTRAL/RANGE + hurst<hurst_max + pos 高位追高(BUY)/低位追低(SELL) → 拦。
+    "hexp.range_hurst_enabled": True,          # 震荡市 hurst 均值回归校验总开关；False→关闭(向后兼容)
+    "hexp.range_hurst_max": 0.50,              # hurst 均值回归阈值：<此视为均值回归态(反持续)
+    "hexp.range_hurst_hi": 0.80,               # 高位分界：BUY pos>此 / SELL pos<(1-此) 视为极值区追单
+    "hexp.range_hurst_regimes": "NEUTRAL,RANGE",  # 启用本校验的体制（逗号分隔）
     # 反向单观测（2026-08-21，先观测不下单）：momentum_flip 判动量反向且处于高位/低位时，
     # 记录反向候选(dir/pos/er/mm/close/verdict) 落库到 indicator_values._hexp.reverse_candidate，
     # 供后续 SQL 对照未来 K 线评估"若做反向单的胜率"，验证后再启用真下单。零实盘影响。
@@ -431,7 +458,10 @@ class HexpEngine:
                 return int(float(raw))
             if isinstance(default, float):
                 return float(raw)
-            return str(raw)
+            # 【2026-08-25 配置污染修复】所有字符串配置统一 strip，杜绝跨平台
+            # 换行符污染（CRLF 混入值尾，如 hexp.mm.period 曾被存成 'M1\r'）导致
+            # time_frame 匹配不到 klines 数据、MM 因子恒 0 的隐藏卡点。
+            return str(raw).strip()
         except (TypeError, ValueError):
             return default
 
@@ -887,7 +917,22 @@ class HexpEngine:
         momentum_flips: dict[str, bool] = {}
         for p, d in period_data.items():
             fac = d["factors"]
-            ts = sum(wn[k] * abs(fac[k]) for k in wn) * 100.0
+            # 【2026-08-26 状态机识别缺陷修复】原 `sum(wn[k]*abs(fac[k]))*100` 对所有因子
+            # 取绝对值求和，把「震荡特征」当成「趋势强度」计入 TrendScore：
+            #   · hurst<0.5(均值回归) → fac 为负，abs 后反而抬高分数
+            #   · rsi 超买/超卖(反转前兆) → fac 为负，abs 后同样抬高
+            #   实证：D1 300/300 恒 TREND_UP、M5 73% 判趋势、75% 信号多周期不一致，
+            #   震荡市仍出趋势单（主周期 M5/D1 轻量态只看方向不看强度）。
+            # 现改为：adx/er/ma/bbw 用 abs（强度），hurst/rsi 带符号（均值回归/超买超卖
+            # 反向抑制），使震荡市 TrendScore 跌破 exit 判 RANGE。
+            ts = (
+                wn["adx"] * abs(fac["adx"]) +
+                wn["er"] * abs(fac["er"]) +
+                wn["ma"] * abs(fac["ma"]) +
+                wn["bbw"] * abs(fac["bbw"]) +
+                wn["hurst"] * fac["hurst"] +   # 趋势持续(h>0.5,正)加分；均值回归(h<0.5,负)减分
+                wn["rsi"] * fac["rsi"]          # 超买/超卖(负)减分，抑制反转前兆
+            ) * 100.0
             # 该周期方向：ma 与 DI 同向取之，矛盾记 0 且 TrendScore 7 折
             di_dir = 1 if d["plus_di"] >= d["minus_di"] else -1
             ma_dir = 1 if fac["ma"] > 0 else (-1 if fac["ma"] < 0 else 0)
@@ -899,8 +944,20 @@ class HexpEngine:
                 pdir = 0
                 ts *= 0.7
             trend_scores[p] = ts
-            if p in (primary, "D1"):  # 轻量态：仅方向
-                period_states[p] = _TREND_UP if pdir > 0 else (_TREND_DOWN if pdir < 0 else _RANGE)
+            if p in (primary, "D1"):
+                # 【2026-08-26 状态机识别缺陷修复】轻量态原仅看方向(pdir)，不看 TrendScore
+                # 强度 → 震荡中"方向一致但强度低"仍判 TREND（实证 D1 300/300 恒 TREND_UP，
+                # 因 D1 只认 ma/DI 同向方向，永不判 RANGE）。现加入强度门槛：
+                #   方向确定 + ts≥enter → TREND；ts<exit → RANGE；否则 TRANSITION。
+                # 使震荡市(ts 低)正确判 RANGE，不再恒出趋势单。
+                _enter_th = float(cfg["hexp.state.enter_score"])
+                _exit_th = float(cfg["hexp.state.exit_score"])
+                if pdir != 0 and ts >= _enter_th:
+                    period_states[p] = _TREND_UP if pdir > 0 else _TREND_DOWN
+                elif ts < _exit_th:
+                    period_states[p] = _RANGE
+                else:
+                    period_states[p] = _TRANSITION
             else:  # 迟滞状态机（M30/H1/H4，含动量翻转）
                 sm = self._sm.setdefault(f"{symbol}:{p}", _HysteresisState())
                 period_states[p] = sm.update(
@@ -1260,12 +1317,41 @@ class HexpEngine:
         # 与 momentum_drain(近零枯竭+高位)互补：本护栏拦「动量明确反向」，不依赖 pos。
         _flip_enabled = bool(cfg.get("hexp.momentum_flip_enabled", True))
         _flip_mm = float(cfg.get("hexp.momentum_flip_mm", 0.04))
+        # 【2026-08-26 高位分级加固】见 _DEFAULTS 注释。多头度(0~100)≥高位分界时，
+        # 反向阈值收紧到 flip_ma_mm（微负即拦顶部追单）；正常位置用基础 flip_mm。
+        # 拦截信号保留 mm 与 ma 明细，便于日志归因。
+        _flip_ma_th = float(cfg.get("hexp.momentum_flip_ma_threshold", 90.0))
+        _flip_ma_lo = float(cfg.get("hexp.momentum_flip_ma_low", 10.0))
+        _flip_ma_mm = float(cfg.get("hexp.momentum_flip_ma_mm", 0.005))
         if _flip_enabled and not _in_extreme and direction in ("BUY", "SELL") and passed:
             _flip_block = None
-            if direction == "BUY" and f_mm < -_flip_mm:
-                _flip_block = f"hexp_momentum_flip(BUY but mm={f_mm:.3f})"
-            elif direction == "SELL" and f_mm > _flip_mm:
-                _flip_block = f"hexp_momentum_flip(SELL but mm={f_mm:.3f})"
+            # 0~100 多头度：BUY 高=多头高位(顶部追多需拦)；SELL 低=空头低位(底部追空需拦)。
+            _ma_deg = float(pf.get("_ma_raw", 50.0))
+            _eff_th = _flip_mm  # 默认基础阈值（明确反向才拦，防误杀）
+            if direction == "BUY" and _ma_deg >= _flip_ma_th:
+                _eff_th = _flip_ma_mm  # 多头高位：微负即拦顶部追多
+            elif direction == "SELL" and _ma_deg <= _flip_ma_lo:
+                _eff_th = _flip_ma_mm  # 空头低位：微正即拦底部追空
+            if direction == "BUY" and f_mm < -_eff_th:
+                _flip_block = f"hexp_momentum_flip(BUY but mm={f_mm:.4f} ma={_ma_deg:.0f} th={_eff_th:.3f})"
+            elif direction == "SELL" and f_mm > _eff_th:
+                _flip_block = f"hexp_momentum_flip(SELL but mm={f_mm:.4f} ma={_ma_deg:.0f} th={_eff_th:.3f})"
+            # ── 【2026-08-26 P0-1】高位微正枯竭加固 ──
+            # momentum_flip 只拦"mm 反向(负)"，漏掉 ma 极高位 + mm 微正枯竭(0<mm<弱阈值)
+            # 的顶部追多（实证 sig=388640598 BUY@4666.08 ma=100 pos=0.846 mm=+0.0124
+            # regime=NEUTRAL 高位追多被止损）。此处拦「高位 + 动能未反转但已枯竭」：
+            #   BUY : ma≥高位分界 且 0<mm<weak_mm        → 顶部微动量枯竭追多
+            #   SELL: ma≤低位分界 且 0>mm>-weak_mm        → 底部微动量枯竭追空
+            # 仅拦"高位+微正枯竭"；正常位置/动量明显同向(mm≥weak_mm)不拦，防误杀。
+            _hi_weak_enabled = bool(cfg.get("hexp.momentum_hi_weak_enabled", True))
+            if _hi_weak_enabled and _flip_block is None:
+                _hi_weak_mm = float(cfg.get("hexp.momentum_hi_weak_mm", 0.02))
+                if direction == "BUY" and _ma_deg >= _flip_ma_th and 0.0 < f_mm < _hi_weak_mm:
+                    _flip_block = (f"hexp_momentum_hi_weak(BUY but mm={f_mm:.4f} ma={_ma_deg:.0f} "
+                                   f"pos={_pos_pct:.2f} weak<{_hi_weak_mm:.3f})")
+                elif direction == "SELL" and _ma_deg <= _flip_ma_lo and -_hi_weak_mm < f_mm < 0.0:
+                    _flip_block = (f"hexp_momentum_hi_weak(SELL but mm={f_mm:.4f} ma={_ma_deg:.0f} "
+                                   f"pos={_pos_pct:.2f} weak<{_hi_weak_mm:.3f})")
             if _flip_block:
                 logger.info("hexp %s %s | BLOCK %s dir=%s (momentum against direction)",
                             symbol, primary, _flip_block, direction)
@@ -1313,6 +1399,38 @@ class HexpEngine:
                                 float(pf.get("_er_raw", 0.0)), f_mm)
                         else:
                             sr.reverse_candidate = None
+        # ── 【2026-08-26 P0-2】震荡市均值回归校验 ──
+        # NEUTRAL/RANGE 市且 hurst<阈值（均值回归态，反持续）时，高位顺势追单易被
+        # 均值回归反打（实证 sig=388640598 BUY@4666.08 pos=0.846 hurst=0.449 regime=NEUTRAL
+        # 高位追多被止损）。震荡市应等回撤/极值反向，不在高低位顺势追单。
+        #   BUY : regime∈{list} 且 hurst<hurst_max 且 pos>hi          → 拦高位追多
+        #   SELL: regime∈{list} 且 hurst<hurst_max 且 pos<(1-hi)      → 拦低位追空
+        # 仅拦"震荡市 + 均值回归态 + 极值区追单"；趋势市/非均值回归态/中位不拦，防误杀。
+        _rh_enabled = bool(cfg.get("hexp.range_hurst_enabled", True))
+        if _rh_enabled and direction in ("BUY", "SELL") and passed and not _in_extreme:
+            _rh_max = float(cfg.get("hexp.range_hurst_max", 0.50))
+            _rh_hi = float(cfg.get("hexp.range_hurst_hi", 0.80))
+            _rh_regimes = {x.strip().upper() for x in
+                           str(cfg.get("hexp.range_hurst_regimes", "NEUTRAL,RANGE")).split(",") if x.strip()}
+            _hurst_now = float(pf.get("_hurst_raw", 0.5))
+            _rval = str(getattr(regime_result, "regime", ""))
+            _rh_block = None
+            if _rval in _rh_regimes and _hurst_now < _rh_max:
+                if direction == "BUY" and _pos_pct > _rh_hi:
+                    _rh_block = (f"hexp_range_hurst(BUY pos={_pos_pct:.2f} hurst={_hurst_now:.3f} "
+                                 f"regime={_rval} 均值回归高位追多)")
+                elif direction == "SELL" and _pos_pct < (1.0 - _rh_hi):
+                    _rh_block = (f"hexp_range_hurst(SELL pos={_pos_pct:.2f} hurst={_hurst_now:.3f} "
+                                 f"regime={_rval} 均值回归低位追空)")
+            if _rh_block:
+                logger.info("hexp %s %s | BLOCK %s dir=%s (range mean-reversion chase)",
+                            symbol, primary, _rh_block, direction)
+                direction = "NO_TRADE"
+                passed = False
+                sr.threshold_passed = False
+                sr.direction = "NO_TRADE"
+                if not sr.fallback_reason:
+                    sr.fallback_reason = _rh_block
         # B) 回踩支撑位诊断（独立于 A 的封单判定，仅作再评估标记/日志）
         if direction in ("BUY", "SELL"):
             _pivot = self._get_recent_pivot(period_data[primary], direction, cfg)
@@ -1449,7 +1567,10 @@ class HexpEngine:
             "adx": round(float(pf.get("_adx_raw", 0.0)), 2),
             "er": round(float(pf.get("_er_raw", 0.0)), 4),
             "ma": round(float(pf.get("_ma_raw", 50.0)), 2),
-            "bbw_pct": round(float(pf.get("_bbw_pct", 50.0)), 2),
+            # 【2026-08-25 命名一致性】与其他 6 因子统一用因子名 "bbw"（值为 0~100 带宽分位）。
+            # 此前此处用 "bbw_pct"，与 factor_scores/快照(1534)的 "bbw" 不一致，下游按 7 因子名
+            # 读 factor_raws.bbw 会拿到 None。现统一为 "bbw"。
+            "bbw": round(float(pf.get("_bbw_pct", 50.0)), 2),
             "hurst": round(float(pf.get("_hurst_raw", 0.5)), 3),
             "rsi": round(float(pf.get("_rsi_raw", 50.0)), 2),
             "mm": round(float(f_mm), 4),
