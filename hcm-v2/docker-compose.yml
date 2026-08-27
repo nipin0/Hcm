@@ -151,6 +151,10 @@ services:
       - ./hcm-signal-tower/signal_tower/hexp_engine.py:/app/signal_tower/hexp_engine.py
       - ./hcm-signal-tower/signal_tower/micro_state.py:/app/signal_tower/micro_state.py
       - ./hcm-signal-tower/signal_tower/precision_entry.py:/app/signal_tower/precision_entry.py
+      # [2026-08-26] NEUTRAL 模糊区次级确认(hurst+BBW)：regime_classifier 新增 hurst 参数
+      # 与 fuzzy 逻辑，必须绑定挂载跨 recreate 持久，否则镜像旧版无 hurst 参数导致
+      # scheduler(挂载新版传 hurst) 调用崩溃 "unexpected keyword argument 'hurst'"
+      - ./hcm-signal-tower/signal_tower/regime_classifier.py:/app/signal_tower/regime_classifier.py
       # [2026-08-14 闭环] quality_gate 融合闸门 + ai_async_client(DeepSeek 校准融合)：LightGBM+DeepSeek 闭环裁决，跨 recreate 持久
       - ./hcm-signal-tower/signal_tower/quality_gate.py:/app/signal_tower/quality_gate.py
       - ./hcm-signal-tower/signal_tower/ai_async_client.py:/app/signal_tower/ai_async_client.py

@@ -7,7 +7,7 @@ import { GaugeChart } from 'echarts/charts';
 import { CanvasRenderer } from 'echarts/renderers';
 import {
   C, cfgNum, dirColor, dirLabel, gradeColor, gradeDesc, fmt, fmtSigned,
-  tsToClock, stateLabel, phaseLabel, phaseColor,
+  tsToClock, stateLabel, phaseLabel, phaseColor, directionDiag,
 } from './types';
 import type { HexpSnapshot, HexpConfig, TrendPhase, HexpAiSnapshot } from './types';
 
@@ -60,6 +60,8 @@ const DecisionPanel: React.FC<Props> = ({ snap, cfg, ageSec, symbol, aiSnap }) =
   const tpProgress = tp?.progress ?? 0;
   const tpPhase = tp?.phase ?? 'squeeze';
   const pc = phaseColor(tpPhase);
+  // 2026-08-27 方向诊断：迟滞/死标签/翻转状态显式化（状态卡联动）
+  const diag = directionDiag(snap);
 
   const stale = ageSec !== null && ageSec > 20;
 
@@ -129,6 +131,19 @@ const DecisionPanel: React.FC<Props> = ({ snap, cfg, ageSec, symbol, aiSnap }) =
           <Typography sx={{ fontSize: 11, color: C.textDim }}>
             {symbol} · 主周期 {snap?.primary_period ?? '—'}
           </Typography>
+          {/* 2026-08-27 方向诊断标签：死标签/迟滞维持/翻转放行 显式化 */}
+          <Tooltip title={diag.desc} arrow>
+            <Box
+              sx={{
+                display: 'inline-block', mt: 0.3, px: 0.8, py: 0.1, borderRadius: 0.6,
+                fontSize: 9.5, fontWeight: 700,
+                color: diag.color, border: `1px solid ${diag.color}66`, background: `${diag.color}14`,
+                cursor: 'help',
+              }}
+            >
+              {diag.tag}
+            </Box>
+          </Tooltip>
         </Box>
       </Box>
 

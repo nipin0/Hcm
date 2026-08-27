@@ -78,6 +78,17 @@ class RegimeConfig:
     regime_adx_range: float = 22.0
     range_bbw_max: float = 1.0
 
+    # NEUTRAL 模糊区次级确认（2026-08-26）
+    # ADX 落入 [regime_adx_range, regime_adx_trend) 模糊区时，用 hurst（均值回归态）
+    # + BBW 趋势（扩张/收窄）细分，避免一律兜底 NEUTRAL 造成的边界漂移：
+    #   · hurst < 模糊区趋势阈值 且 BBW 收窄（bbw < bbw_ma20）→ RANGE（震荡）
+    #   · hurst ≥ 模糊区趋势阈值 且 (BBW 扩张 或 ADX 上行)  → TREND（趋势初期）
+    #   · 否则保持 NEUTRAL
+    fuzzy_enable: bool = True                     # 模糊区次级确认总开关
+    fuzzy_hurst_trend: float = 0.5                # hurst 趋势/均值回归分界
+    fuzzy_bbw_shrink_max: float = 1.0             # BBW 收窄判据：bbw < bbw_ma20 × 此值
+    fuzzy_use_bbw: bool = True                    # 是否用 BBW 趋势作为次级确认
+
     # VOLATILITY-ADAPTIVE (P1)
     # Dynamically scales ADX thresholds and confirmation bars by relative
     # band width (bbw / bbw_ma20): high vol -> tighten (anti-chatter);
@@ -147,6 +158,7 @@ class RegimeClassifier:
         plus_di: float = 0.0,
         minus_di: float = 0.0,
         ma_alignment: str = "",
+        hurst: float = 0.5,
     ) -> RegimeResult:
         """Classify current market regime.
 
@@ -232,6 +244,34 @@ class RegimeClassifier:
         # ④ RANGE
         if self._is_range(result):
             return self._transition_to(result, Regime.RANGE, "RANGE conditions met")
+
+        # ④.5 NEUTRAL 模糊区次级确认（2026-08-26）
+        # ADX ∈ [regime_adx_range, regime_adx_trend) 时，不属于 RANGE 也不属于 TREND，
+        # 原逻辑一律兜底 NEUTRAL（边界漂移、误判）。现用 hurst（均值回归态）+ BBW 趋势
+        # 细分模糊区：
+        #   · hurst<模糊区趋势阈值 且 BBW 收窄   → RANGE（震荡，均值回归）
+        #   · hurst≥模糊区趋势阈值 且 (BBW扩张或ADX上行) → TREND（趋势初期）
+        #   · 否则保持 NEUTRAL（无强次级信号，不硬归）
+        if self._cfg.fuzzy_enable:
+            _in_fuzzy = self._eff_adx_range <= adx < self._eff_adx_trend
+            if _in_fuzzy:
+                _hurst_t = self._cfg.fuzzy_hurst_trend
+                _bbw_shrink = (
+                    (bbw < self._cfg.fuzzy_bbw_shrink_max * bbw_ma20)
+                    if (self._cfg.fuzzy_use_bbw and bbw_ma20 > 0) else False
+                )
+                _adx_rising = result.adx_rising_bars >= 1
+                if hurst < _hurst_t and _bbw_shrink:
+                    # 均值回归 + 波动收窄 → 震荡，归入 RANGE
+                    return self._transition_to(
+                        result, Regime.RANGE,
+                        f"NEUTRAL fuzzy→RANGE (hurst={hurst:.3f}<{_hurst_t} bbw_shrink={_bbw_shrink})")
+                if hurst >= _hurst_t and (result.bbw_expanding or _adx_rising):
+                    # 趋势持续 + 波动扩张/ADX上行 → 趋势初期，归入 TREND
+                    return self._transition_to(
+                        result, Regime.TREND,
+                        f"NEUTRAL fuzzy→TREND (hurst={hurst:.3f}≥{_hurst_t} "
+                        f"bbw_expand={result.bbw_expanding} adx_up={_adx_rising})")
 
         # ⑤ NEUTRAL (fallback)
         result.regime = Regime.NEUTRAL

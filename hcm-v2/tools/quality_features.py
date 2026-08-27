@@ -61,6 +61,18 @@ def load_signals(conn, mode: str) -> pd.DataFrame:
             WHERE s.signal_mode LIKE %s
               AND s.signal_dir IN ('BUY','SELL')
               AND s.entry_price IS NOT NULL AND s.entry_price > 0
+              -- 【2026-08-25 训练集时间窗对齐】仅保留能与 DeepSeek 落库票
+              -- (hcm_ai.ds_output) 在 ±1800s 同 symbol 近邻匹配上的信号，
+              -- 窗口与下游 _nearest_ds() 严格一致（通过 EXISTS ⟺ 三特征非 0）。
+              -- 根治：此前训练窗(8/10 起)远早于 ds_output 落库起点(8/14)，
+              -- 且 8/21·8/22 断天，致约83pct样本三特征全0 → 模型无从学习
+              -- DeepSeek 语义(ds_nonzero_ratio≈0.16)。对齐后仅训练"有 DS 上下文"
+              -- 的样本，ds_nonzero_ratio→~1.0，模型开始真正吸收 DS 语义。
+              AND EXISTS (
+                SELECT 1 FROM hcm_ai.ds_output d
+                WHERE d.symbol = s.symbol
+                  AND abs(extract(epoch from (s.created_at - d.created_at))) <= 1800
+              )
             ORDER BY s.created_at
             """,
             (mode,),

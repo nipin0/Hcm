@@ -373,7 +373,8 @@ class RiskStreamConsumer:
                     )
                     await self._update_signal_status(
                         signal_id, 2, decision,
-                        signal_mode=str(msg.data.get("signal_mode", "")))
+                        signal_mode=str(msg.data.get("signal_mode", "")),
+                        block_reason=",".join(map(str, rule_result.rejected_rules)))
                 elif decision == "DEGRADE":
                     self._stats["messages_degraded"] += 1
                     # Publish degraded signal to risk_passed
@@ -541,6 +542,9 @@ class RiskStreamConsumer:
             # AI 手数分档（low/mid/high/none）→ 桥端跟单/观测用（链动风控动态手数）
             "ai_lot_tier": str(signal_data.get("ai_lot_tier", "none") or "none"),
             "co_exec_fb": int(signal_data.get("co_exec_fb", 0) or 0),  # 盲点兜底单：桥端 zone 到期不市价追
+            # 2026-08-26 反向单标记：momentum_flip 封 NO_TRADE 后覆写方向产出的接刀单，
+            # 风控 _check_reverse_order 消费；透传供桥端诊断/日志识别。
+            "reverse_order": bool(signal_data.get("reverse_order", False)),
         }
 
         try:
@@ -661,7 +665,7 @@ class RiskStreamConsumer:
         return dict(self._stats)
 
     async def _update_signal_status(self, signal_id: int, status: int, decision: str = "",
-                                    signal_mode: str = "") -> None:
+                                    signal_mode: str = "", block_reason: str = "") -> None:
         """Update signal_status in PostgreSQL.
 
         语义（【B 组】统一）：0=published 在途 / 1=风控 PASS 未成交 / 2=风控 REJECT /
@@ -675,11 +679,16 @@ class RiskStreamConsumer:
            11:48:52 成交置 3，12:04:34 平仓镜像 PASS 又置回 1）。
         2. SQL 加 `AND signal_status <> 3` —— 任何来源都不得让已成交状态降级。
 
+        【2026-08-25 卡点标注修复】status=2(REJECT) 时把 rejected_rules 回写
+        block_reason，使面板「最近信号」能看到风控拒绝的精准卡点（此前只写 Redis
+        审计键，PG block_reason 恒空 → 面板"未标注卡点"）。
+
         Args:
             signal_id: Signal identifier.
             status: 1=PASS, 2=REJECT.
             decision: Decision string for logging.
             signal_mode: 信号模式（manual_mirror 时跳过回写）。
+            block_reason: 拒绝原因（status=2 时写入 block_reason 列）。
         """
         if self._db is None or not self._db.is_initialized:
             return
@@ -689,11 +698,18 @@ class RiskStreamConsumer:
                 signal_id)
             return
         try:
-            await self._db.execute(
-                "UPDATE hcm_signal.signals SET signal_status=$1, updated_at=now() "
-                "WHERE signal_id=$2 AND signal_status <> 3",
-                status, signal_id,
-            )
+            if status == 2 and block_reason:
+                await self._db.execute(
+                    "UPDATE hcm_signal.signals SET signal_status=$1, block_reason=$2, "
+                    "updated_at=now() WHERE signal_id=$3 AND signal_status <> 3",
+                    status, block_reason, signal_id,
+                )
+            else:
+                await self._db.execute(
+                    "UPDATE hcm_signal.signals SET signal_status=$1, updated_at=now() "
+                    "WHERE signal_id=$2 AND signal_status <> 3",
+                    status, signal_id,
+                )
             logger.debug("Signal status updated: signal_id=%s, status=%s", signal_id, status)
         except Exception as exc:
             logger.warning("Failed to update signal_status: signal_id=%s: %s", signal_id, exc)

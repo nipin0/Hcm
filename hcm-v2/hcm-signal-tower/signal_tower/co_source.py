@@ -153,6 +153,15 @@ class CoSourceEngine:
         self._v2_h1_fb_enabled: bool = True
         self._v2_h1_fb_min_strength: float = 0.50
         self._v2_h1_fb_lot_mult: float = 0.6
+        # [2026-08-27] 周期价格位置守卫：发信号前判断当前价格在周期（M5 主周期）里的位置，
+        # 抑制"高点做多 / 低点做空"的逆势接刀。极值区逆位置追单 → NO_TRADE。
+        # 用 ind.recent_highs/lows（最近50根）算滚动极值分位 pos_cycle，
+        # 用 (close - boll_middle)/atr_14 算偏离中枢 ATR 数 pos_z（趋势中也不被通道稀释）。
+        self._v2_cycle_pos_enabled: bool = True
+        self._v2_cycle_pos_look: int = 50
+        self._v2_cycle_pos_hi: float = 0.85
+        self._v2_cycle_pos_lo: float = 0.15
+        self._v2_cycle_pos_z_extreme: float = 3.5
 
     # ── 配置加载（热重载时调用）───────────────
     async def load_config(self) -> None:
@@ -260,6 +269,17 @@ class CoSourceEngine:
                 "co.v2.h1_fallback_min_strength", 0.50)
             self._v2_h1_fb_lot_mult = await self._config.get_float(
                 "co.v2.h1_fallback_lot_mult", 0.6)
+            # [2026-08-27] 周期价格位置守卫
+            self._v2_cycle_pos_enabled = await self._config.get_bool(
+                "co.v2.cycle_pos_enabled", True)
+            self._v2_cycle_pos_look = await self._config.get_int(
+                "co.v2.cycle_pos_look", 50)
+            self._v2_cycle_pos_hi = await self._config.get_float(
+                "co.v2.cycle_pos_hi", 0.85)
+            self._v2_cycle_pos_lo = await self._config.get_float(
+                "co.v2.cycle_pos_lo", 0.15)
+            self._v2_cycle_pos_z_extreme = await self._config.get_float(
+                "co.v2.cycle_pos_z_extreme", 2.5)
             # [2026-07-25] 闸门可观测性：每次热重载/启动打印有效闸门，使"配置了≠生效了"
             # 能直接从日志确认（强/弱/冲击趋势门槛 + 激活模型 + range 拦截 + 归一尺度）。
             effective_active = await self._get_active_model()
@@ -469,6 +489,40 @@ class CoSourceEngine:
                 "h1=%s strength=%.2f confirmed=%s m5_against_h1=%s",
                 h1_bias, h1_context.trend_strength, _h1_confirmed, _m5_against_h1,
             )
+
+        # ── 周期价格位置守卫（2026-08-27）──
+        # 发信号前先判断"当前价格在周期（M5 主周期）里的位置"：
+        #   pos_cycle = 最近 look 根 high/low 滚动极值分位[0,1]
+        #   pos_z     = (close - boll_middle) / atr_14，偏离中枢多少个 ATR（趋势中也不被通道稀释）
+        # 极值区逆位置追单（高位 BUY / 低位 SELL）→ NO_TRADE（不主动反手，仅抑制逆势接刀）。
+        # 与 HEXP 侧 _get_cycle_position 共用同一"抗趋势稀释"语义，两侧行为一致。
+        if (self._v2_cycle_pos_enabled and direction != "NO_TRADE"
+                and ind is not None and ind.recent_highs and ind.recent_lows):
+            _hi = list(ind.recent_highs)[-self._v2_cycle_pos_look:]
+            _lo = list(ind.recent_lows)[-self._v2_cycle_pos_look:]
+            _cl = float(getattr(ind, "close", 0.0) or 0.0)
+            _pos_cycle = 0.5
+            if _hi and _lo and len(_hi) >= 5 and _cl > 0:
+                _hh = max(_hi)
+                _ll = min(_lo)
+                if _hh - _ll > 1e-9:
+                    _pos_cycle = max(0.0, min(1.0, (_cl - _ll) / (_hh - _ll)))
+            _mid = float(getattr(ind, "boll_middle", _cl) or _cl)
+            _atr = max(float(getattr(ind, "atr_14", 0.0) or 0.0), 1e-9)
+            _pos_z = (_cl - _mid) / _atr
+            _at_extreme = (_pos_cycle > self._v2_cycle_pos_hi or _pos_z > self._v2_cycle_pos_z_extreme)
+            _at_bottom = (_pos_cycle < self._v2_cycle_pos_lo or _pos_z < -self._v2_cycle_pos_z_extreme)
+            if (direction == "BUY" and _at_extreme) or (direction == "SELL" and _at_bottom):
+                direction = "NO_TRADE"
+                reason = (f"v2_cycle_pos(dir={direction} pos_cycle={_pos_cycle:.2f} "
+                          f"pos_z={_pos_z:.2f})")
+                eq = 0.0
+                score_result.cycle_pos_blocked = True
+                logger.info(
+                    "CoSource v2 BLOCK %s: cycle position guard → NO_TRADE "
+                    "(extreme zone: pos_cycle=%.2f pos_z=%.2f, dir=%s rejected)",
+                    getattr(score_result, "symbol", "?"), _pos_cycle, _pos_z,
+                    "BUY" if direction == "BUY" else "SELL")
 
         # ── Phase 2：NEUTRAL RSI 通道仅在 REVERSAL/RANGE 微观态 + 结构确认才放行 ──
         _neutral_ok = bool(getattr(score_result, "neutral_rsi_confirmed", False))
@@ -722,19 +776,22 @@ class CoSourceEngine:
                 sr.fallback_reason = "co_range_blocked"
                 return
             # 未启用拦截：NEUTRAL 用专属评分门槛（0-1 尺度，不经 score_scale 归一），
-            # RANGE 仍退化为弱趋势门槛（沿用 co.gate.weak.trend）
-            if regime.regime == Regime.NEUTRAL:
-                base_override = self._neutral_min_score
-                # NEUTRAL 走专属评分门槛，但执行增强参数(lot/sl/rr)需有 gate 源，
-                # 否则下方无条件引用 gate["lot"] 等会抛 UnboundLocalError。
-                gate = self._gate["weak"]
-            else:
+            # RANGE 仍退化为弱趋势门槛（沿用 co.gate.weak.trend）。
+            # 两种情况下执行增强参数(lot/sl/rr)统一沿用 weak 带，band 语义保持不变
+            # （NEUTRAL 保持 "range" 供 co_band 展示，RANGE 归一为 "weak"）。
+            if regime.regime != Regime.NEUTRAL:
                 band = "weak"
+            else:
+                base_override = self._neutral_min_score
 
+        # 统一在最终 band 确定后取 gate（BUG 修复：消除原"NEUTRAL 分支单独设 gate、
+        # RANGE 分支改 band 后再取 gate"的非对称赋值隐患——任一分支漏设即
+        # UnboundLocalError）。NEUTRAL（band 仍为 "range"）沿用 weak 带执行参数，
+        # 其余带取各自 gate。行为与原逻辑字节级等价。
+        gate = self._gate["weak"] if band == "range" else self._gate[band]
         if base_override is not None:
             base = base_override
         else:
-            gate = self._gate[band]
             base = gate["trend"] / scale  # 0–100 → 0–1
 
         # ── 风险等级偏移 ──

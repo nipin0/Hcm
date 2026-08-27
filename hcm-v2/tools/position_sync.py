@@ -231,6 +231,14 @@ _MANUAL_MIRRORED_TICKETS: dict[int, str] = {}   # ticket -> symbol（已镜像�
 _MANUAL_STREAM_KEY = "manual_mode:master_stream:{symbol}"
 _MANUAL_STREAM_MAXLEN = 2000  # 每品种最多保留 2000 条事件（防内存膨胀）
 
+# [2026-08-25 毫秒级跟单 SL/TP] 主号 auto 持仓 SL/TP 变更（含 trailing 移动）独立流：
+# 主号桥在 _update_trailing_stops 成功移动 SL/TP 时即时 XADD（真·毫秒级），
+# 另由本模块 sync_positions 每 ~1s 检测 auto 持仓 SL/TP 变更兜底发布；跟单桥主循环内
+# xreadgroup(block=50) 消费，经 _modify_follower_position 精确按票镜像（~50-250ms），
+# 彻底消除原 10s _sync_follower_sl_tp 轮询滞后（行情已跑远）。10s 轮询保留作安全网。
+_SLTP_STREAM_KEY = "hcm:master:sltp"
+_SLTP_STREAM_MAXLEN = 5000  # 仅 SL/TP 变更事件，量小，保留 5000 条足够
+
 # ═══════════════════════════════════════════════════════════════
 #  手动模式镜像：持仓快照 + 加仓序号（彻底修正"跟单号冻结在开仓初值"）
 #  - _MANUAL_LAST_SNAPSHOT: ticket → {sl, tp, volume}，检测主号 SL/TP 变更 / 加仓 / 部分平仓
@@ -427,6 +435,34 @@ def _xadd_manual_event(redis_conn, symbol: str, payload: dict) -> None:
         )
 
 
+def _publish_master_sltp_event(redis_conn, pos, new_sl: float, new_tp: float, master_account_id: int, action: str = "modify") -> None:
+    """主号 auto 持仓 SL/TP 变更 → XADD hcm:master:sltp（毫秒级跟单消费专用流）。
+
+    与 manual_mode:master_stream 解耦：auto 单不走 manual mirror（避免跟单桥无对应仓→无操作），
+    改走本流由跟单桥 _follower_consume_sltp 直接精确按票镜像 SL/TP。
+    字段统一 str 化（XADD 要求）；master_ticket 供跟单桥经 hcm:signal_for_ticket 解析 signal_id 定位跟单仓。
+    """
+    if redis_conn is None:
+        return
+    try:
+        mapping = {
+            "master_ticket": str(int(pos.ticket)),
+            "symbol": str(pos.symbol),
+            "sl": str(round(float(new_sl), 5)),
+            "tp": str(round(float(new_tp), 5)),
+            "account_id": str(int(master_account_id)),
+            "action": str(action),
+            "ts": str(int(time.time())),
+        }
+        redis_conn.xadd(_SLTP_STREAM_KEY, mapping, maxlen=_SLTP_STREAM_MAXLEN)
+        log.info(
+            "Master SL/TP event published (sltp stream): ticket=%s symbol=%s sl=%s tp=%s (account=%s)",
+            pos.ticket, pos.symbol, new_sl, new_tp, master_account_id,
+        )
+    except Exception as e:
+        log.error("Master SL/TP event publish failed ticket=%s: %s", pos.ticket, e)
+
+
 def _publish_manual_master_modify(redis_conn, pos, new_sl: float, new_tp: float, master_account_id: int) -> None:
     """主号持仓 SL/TP 变更 → 发 modify 事件（signal_id=主号 ticket，action=modify）。
 
@@ -532,12 +568,13 @@ def _detect_and_publish_master_changes(redis_conn, pos, master_account_id: int) 
     """
     if redis_conn is None:
         return
-    # 根治：auto 模型单（主号 _execute_signal 开的单）只由跟单桥自动复制路径继承，
-    # 不走 manual_mirror 的 modify/partial/add 镜像——否则跟单桥收到 modify 事件却无对应
-    # 跟单仓（自动复制因时序竞态 SKIP 时）→ 无操作，且不补开 → 跟单号永不同步主号。
-    if _is_auto_opened_ticket(redis_conn, pos.ticket):
-        return
     t = pos.ticket
+    is_auto = _is_auto_opened_ticket(redis_conn, t)
+    # 首次见到该持仓：登记快照即返回（auto / 手动 都登记，供后续变更检测）。
+    # 根治：auto 模型单（主号 _execute_signal 开的单）SL/TP 变更【不再丢】——
+    # 原 early-return 导致 auto 单 SL/TP 变动完全不发事件，跟单号只能靠 10s 轮询同步。
+    # 现改为：auto 单 SL/TP 变更发布到 hcm:master:sltp（毫秒级跟单消费）；
+    # 手动单维持 manual_mode:master_stream 镜像（open/close/modify/partial/add 全继承）。
     snap = _MANUAL_LAST_SNAPSHOT.get(t)
     if snap is None:
         _MANUAL_LAST_SNAPSHOT[t] = {
@@ -549,6 +586,16 @@ def _detect_and_publish_master_changes(redis_conn, pos, master_account_id: int) 
     new_sl = float(pos.sl) if pos.sl else 0.0
     new_tp = float(pos.tp) if pos.tp else 0.0
     new_vol = float(pos.volume)
+    if is_auto:
+        # auto 模型单：SL/TP 变更发布到 hcm:master:sltp（毫秒级跟单消费）。
+        # 手数增减（partial_close/add）auto 单由跟单桥自动复制路径继承，本路径只管 SL/TP。
+        sl_changed = abs(new_sl - snap["sl"]) > 1e-9
+        tp_changed = abs(new_tp - snap["tp"]) > 1e-9
+        if sl_changed or tp_changed:
+            _publish_master_sltp_event(redis_conn, pos, new_sl, new_tp, master_account_id)
+        _MANUAL_LAST_SNAPSHOT[t] = {"sl": new_sl, "tp": new_tp, "volume": new_vol}
+        return
+    # 手动单：原有 manual_mode:master_stream 镜像逻辑（modify/partial_close/add 全继承）
     changed = False
     # SL/TP 变更（modify）
     if abs(new_sl - snap["sl"]) > 1e-9 or abs(new_tp - snap["tp"]) > 1e-9:

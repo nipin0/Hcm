@@ -159,7 +159,8 @@ def main():
     # 展示的 psi.max/mean/drifted 用"排除豁免特征后"的统计，避免运维看到 max=0.60
     # 误判"重度漂移"。per_feature 仍全量展示（含豁免特征）供深度诊断。
     PSI_EXEMPT_FEATURES = set(
-        (os.environ.get("PSI_EXEMPT_FEATURES", "event_proximity_min") or "").split(",")
+        (os.environ.get("PSI_EXEMPT_FEATURES",
+                        "event_proximity_min,ds_continuity,ds_fake_prob,ds_sl_coeff") or "").split(",")
     )
     _pf = psi.get("per_feature", {})
     _eval = {k: v for k, v in _pf.items() if k not in PSI_EXEMPT_FEATURES}

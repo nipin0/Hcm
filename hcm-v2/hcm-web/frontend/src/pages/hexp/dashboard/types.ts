@@ -118,6 +118,61 @@ export interface HexpSnapshot {
   passed: boolean;
   reason: string;
   ts: number;
+  /** 2026-08-27 方向裁决总分（实时值，死标签/迟滞诊断用） */
+  dir_sum?: number;
+  /** 7 因子分解（adx/er/ma/bbw/hurst/rsi/mm），死标签诊断用 */
+  dir_sum_factors?: Record<string, number>;
+  /** 位置因子贡献（趋势态已降权，见 hexp.pos_factor.trend_scale） */
+  dir_pos_factor?: number;
+  /** 上次 direction（迟滞状态机，死标签/迟滞维持诊断用） */
+  prev_direction?: Direction;
+}
+
+/**
+ * 2026-08-27 方向诊断：把后端迟滞+强制翻转+死标签逻辑显式化到看板。
+ * 输入 live 快照（含 direction / prev_direction / dir_sum / period_states），输出诊断标签：
+ *   - 死标签风险：prev 与实时主周期趋势反向，且被迟滞维持（如下跌趋势 prev=BUY 仍显示 BUY）
+ *   - 迟滞翻转放行：prev≠cur 且越过死区/共识（正常翻转）
+ *   - 死区维持防抖：dir_sum 在死区内维持 cur（正常防抖，非错误）
+ *   - 方向稳定：无切换
+ */
+export function directionDiag(snap: HexpSnapshot | null): {
+  tag: string; color: string; desc: string; switched: boolean; deadLabel: boolean;
+} {
+  const dir = snap?.direction ?? 'NO_TRADE';
+  const prev = snap?.prev_direction ?? 'NO_TRADE';
+  const ds = snap?.dir_sum ?? 0;
+  const ps = snap?.period_states ?? {};
+  const pState = ps[snap?.primary_period ?? ''] ?? '';
+  // 死标签：上次方向与实时主周期趋势相反，且当前仍被维持为该方向
+  const deadLabel = (
+    (prev === 'BUY' && pState === 'TREND_DOWN' && dir === 'BUY')
+    || (prev === 'SELL' && pState === 'TREND_UP' && dir === 'SELL')
+  );
+  const switched = prev !== 'NO_TRADE' && dir !== 'NO_TRADE' && prev !== dir;
+  const inDeadZone = Math.abs(ds) < 0.06;
+  if (deadLabel) {
+    return {
+      tag: '死标签风险', color: C.down,
+      desc: `上次方向 ${dirLabel(prev)} 与实时趋势(${stateLabel(pState)})反向，却被迟滞维持为 ${dirLabel(dir)}`,
+      switched, deadLabel,
+    };
+  }
+  if (switched) {
+    return {
+      tag: '迟滞翻转放行', color: C.up,
+      desc: `方向 ${dirLabel(prev)} → ${dirLabel(dir)}（越过死区/周期共识强制翻转）`,
+      switched, deadLabel,
+    };
+  }
+  if (inDeadZone && dir !== 'NO_TRADE') {
+    return {
+      tag: '死区维持防抖', color: C.textDim,
+      desc: `dir_sum=${ds.toFixed(2)} 在死区内，维持 ${dirLabel(dir)} 防抖（正常，非死标签）`,
+      switched, deadLabel,
+    };
+  }
+  return { tag: '方向稳定', color: C.textDim, desc: `综合方向 ${dirLabel(dir)}`, switched, deadLabel };
 }
 
 /** 配置中心扁平键值（hexp.* 命名空间） */
@@ -463,7 +518,9 @@ export function inferEntryMode(
     };
   }
 
-  const aligned = trendUp ? mmNorm > 0 : mmNorm < 0;
+  // 2026-08-27 铁律对齐：方向语义统一用综合裁决 snap.direction，禁止用 mm 符号
+  // （mm 在 0 附近高频抖 → 方向闪烁缺陷）。mmNorm 仅保留作强度(absMM)，不再驱动 aligned（顺势判定）。
+  const aligned = (snap.direction === 'BUY' && trendUp) || (snap.direction === 'SELL' && trendDown);
   const absMM = Math.abs(mmNorm);
 
   // k 归一（越高越偏凸性 → 越支持突破追单）

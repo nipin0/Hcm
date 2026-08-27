@@ -85,8 +85,13 @@ DRY_RUN = False  # 置 True 时 switch_model 只记录不切换（验证/灰度�
 # 是"距下一重大事件分钟数"，事件日历变化导致其分布随时间剧变），PSI 恒虚高，
 # 既不应作为重训触发依据，也避免干扰 psi_max（制造"重度漂移"假象）。报表仍展示，
 # 仅重训触发时豁免。可从环境变量 PSI_EXEMPT_FEATURES 追加（逗号分隔）。
+# 【2026-08-25 修复】新增豁免 ds_continuity/ds_fake_prob/ds_sl_coeff：三者是
+# DeepSeek 输出特征，训练侧 92%+ 为缺省 0.0（近常数/极偏分布），PSI 对近常数特征
+# 数值爆炸（实证 ds_continuity PSI=3.3154 制造 max 重度漂移假象，且单特征>硬阈值
+# 0.5 会误触发重训）。豁免后不参与重训触发与 psi.max 统计，报表 per_feature 仍展示。
 PSI_EXEMPT_FEATURES = set(
-    (os.environ.get("PSI_EXEMPT_FEATURES", "event_proximity_min") or "").split(",")
+    (os.environ.get("PSI_EXEMPT_FEATURES",
+                    "event_proximity_min,ds_continuity,ds_fake_prob,ds_sl_coeff") or "").split(",")
 )
 
 PY = sys.executable
@@ -318,11 +323,18 @@ def record_retrain_run(payload: dict):
     try:
         import redis
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
-        blob = json.dumps(payload, ensure_ascii=False, default=str)
-        r.set("hcm:ai:retrain:last", blob)
+        _payload = dict(payload)  # 不污染调用方 payload（retrain_once 还要 return）
+        _payload["dry_run"] = bool(DRY_RUN)
+        _payload.setdefault("at", datetime.now(timezone.utc).isoformat())
+        blob = json.dumps(_payload, ensure_ascii=False, default=str)
+        # DRY_RUN 只写 history，不覆盖 retrain:last（避免 dry-run 污染最新真源）
         r.lpush("hcm:ai:retrain:history", blob)
         r.ltrim("hcm:ai:retrain:history", 0, 49)
-        log("[record] retrain run saved to Redis hcm:ai:retrain:last")
+        if DRY_RUN:
+            log("[record] DRY_RUN=True -> skip hcm:ai:retrain:last (history only)")
+        else:
+            r.set("hcm:ai:retrain:last", blob)
+            log("[record] retrain run saved to Redis hcm:ai:retrain:last")
     except Exception as e:
         log(f"[record] Redis save FAILED (non-fatal, see auto_retrain.log): {e}")
 
@@ -338,11 +350,18 @@ def record_shadow_eval(payload: dict):
     try:
         import redis
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
-        blob = json.dumps(payload, ensure_ascii=False, default=str)
-        r.set("hcm:ai:shadow:last", blob)
+        _payload = dict(payload)  # 不污染调用方 payload
+        _payload["dry_run"] = bool(DRY_RUN)
+        _payload.setdefault("at", datetime.now(timezone.utc).isoformat())
+        blob = json.dumps(_payload, ensure_ascii=False, default=str)
+        # DRY_RUN 只写 history，不覆盖 shadow:last（避免 dry-run 污染最新真源）
         r.lpush("hcm:ai:shadow:history", blob)
         r.ltrim("hcm:ai:shadow:history", 0, 49)
-        log("[shadow-record] shadow eval saved to Redis hcm:ai:shadow:history")
+        if DRY_RUN:
+            log("[shadow-record] DRY_RUN=True -> skip hcm:ai:shadow:last (history only)")
+        else:
+            r.set("hcm:ai:shadow:last", blob)
+            log("[shadow-record] shadow eval saved to Redis hcm:ai:shadow:history")
     except Exception as e:
         log(f"[shadow-record] Redis save FAILED (non-fatal): {e}")
 

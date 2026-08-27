@@ -5,7 +5,7 @@
  */
 import React from 'react';
 import { Box, Typography, Tooltip } from '@mui/material';
-import { C, cfgNum, fmt, dirColor, gradeColor } from './types';
+import { C, cfgNum, fmt, dirColor, gradeColor, directionDiag } from './types';
 import type { HexpSnapshot, HexpConfig } from './types';
 
 interface Props {
@@ -70,6 +70,8 @@ const ExecutionPanel: React.FC<Props> = ({ snap, cfg }) => {
   const finalLot = gradeLot * lotMult * (isTransition ? transMult : 1);
   const dc = dirColor(effDir);
   const gc = gradeColor(grade);
+  // 2026-08-27 方向诊断：基于真实方向（realDir）显示迟滞/死标签/翻转状态
+  const diag = directionDiag(snap);
 
   return (
     <Box
@@ -112,6 +114,15 @@ const ExecutionPanel: React.FC<Props> = ({ snap, cfg }) => {
           <Typography sx={{ fontSize: 15, fontWeight: 800, color: dc }}>
             {isBuy ? 'BUY' : 'SELL'}
           </Typography>
+          {/* 2026-08-27 真实方向诊断（迟滞/死标签/翻转） */}
+          <Box
+            sx={{
+              mt: 0.3, px: 0.6, py: 0.1, borderRadius: 0.6, fontSize: 8.5, fontWeight: 700,
+              color: diag.color, border: `1px solid ${diag.color}55`, background: `${diag.color}10`,
+            }}
+          >
+            {diag.tag}
+          </Box>
         </Box>
         <Box
           sx={{

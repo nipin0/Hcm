@@ -82,6 +82,34 @@ async def _session_float(redis, suffix: str, default: float, fallback_keys=()) -
 
 import numpy as np
 
+
+def _calc_hurst_for_regime(closes, max_lag: int = 32) -> float:
+    """轻量 Hurst 估计（简化 R/S），供 regime 模糊区次级确认使用。
+    与 hexp_engine.HexpEngine._hurst 同算法：log(var(ΔlnP))~log(τ) 斜率/2。
+    返回 0.5 表示无足够数据（中性）。
+    """
+    try:
+        arr = np.asarray(closes, dtype=np.float64)
+        if arr.size < max_lag + 4:
+            return 0.5
+        logp = np.log(arr)
+        lags = list(range(2, max_lag + 1))
+        var_vals = []
+        for tau in lags:
+            if tau >= arr.size:
+                break
+            diff = logp[tau:] - logp[:-tau]
+            var_vals.append(float(np.var(diff)))
+        if len(var_vals) < 3 or any(v <= 0 for v in var_vals):
+            return 0.5
+        lags_u = np.log(np.asarray(lags[:len(var_vals)], dtype=np.float64))
+        var_u = np.log(np.asarray(var_vals, dtype=np.float64))
+        slope = np.polyfit(lags_u, var_u, 1)[0]
+        return float(np.clip(slope / 2.0, 0.0, 1.0))
+    except Exception:
+        return 0.5
+
+
 from signal_tower.indicator_calculator import (
     IndicatorCalculator,
     IndicatorResults,
@@ -1260,6 +1288,7 @@ class Scheduler:
                     plus_di=indicators.plus_di,
                     minus_di=indicators.minus_di,
                     ma_alignment=indicators.ma_alignment,
+                    hurst=_calc_hurst_for_regime(indicators.recent_closes),
                 )
                 # B 层保守: 不传 zone（zone_bonus 会让 pre_score 偏高），仅作触发探针；
                 # 真正发单由 _produce_signal 完整管线(含 zone) 判定，不漏判也不误放。
@@ -1788,6 +1817,7 @@ class Scheduler:
             plus_di=indicators.plus_di,
             minus_di=indicators.minus_di,
             ma_alignment=indicators.ma_alignment,
+            hurst=_calc_hurst_for_regime(indicators.recent_closes),
         )
 
         # ── 提前解析 active_model 与机制配置（供 Step4 引擎选择 + bypass + G3 覆盖复用）──
@@ -1802,6 +1832,7 @@ class Scheduler:
             # 下游 Step4b co_source.apply 对非 co_source 模型原样透传，无需特判。
             score_result = await self._hexp_engine.produce(
                 state.symbol, indicators, regime_result, live=False,
+                zone_level=zone_level, zone_type=zone_type, zone_strength=zone_strength,
             )
         else:
             _engine = getattr(self, profile["engine"], self._scoring_engine)
@@ -1848,7 +1879,7 @@ class Scheduler:
         # 启用时再叠加 apply_v2（precision_entry/micro_state 驱动）作为权威决策覆盖
         # score_result。co.v2_enabled=False → 行为与原生产完全一致（零改动）。
         _v2_enabled = await self._is_v2_enabled()
-        _ms, _eq, _theta = await self._compute_v2_inputs(
+        _ms, _eq, _theta, _brk = await self._compute_v2_inputs(
             state, indicators, regime_result, h1_context, score_result)
         _legacy: Optional[Any] = None
         if self._co_source is not None:
@@ -1895,6 +1926,66 @@ class Scheduler:
             getattr(score_result, "co_band", "?"),
         )
 
+        # ── hexp 入场时机裁决（2026-08-26：micro_state/precision_entry 在 hexp 模式参与）──
+        # 目标：避免"趋势衰竭（TREND_EXHAUST）高位/低位追单"。micro_state 判 TREND_EXHAUST
+        # （ADX 回落 + 顶/底背离 + MACD 衰减）时，hexp 顺势方向单被否决（NO_TRADE）。
+        # 只拦 TREND_EXHAUST（衰竭末端，追单必亏），不拦 TREND_ACCEL（加速中段仍有空间）、
+        # 不拦 TREND_PULLBACK（回踩核心买点）。_ms/_eq/_theta 由 _compute_v2_inputs 复用，
+        # 无额外计算开销。开关 hexp.entry_gate_enabled（默认 False），可 config_provider 热回退。
+        if active_model == "hexp" and _ms is not None:
+            _eg_enabled = False
+            if self._config is not None:
+                try:
+                    _eg_enabled = bool(await self._config.get_bool("hexp.entry_gate_enabled", False))
+                except Exception:
+                    _eg_enabled = False
+            if _eg_enabled:
+                _ms_state = getattr(_ms, "state", None)
+                _ms_dir = getattr(_ms, "direction", "") or ""
+                _ms_dir_map = {"UP": "BUY", "DOWN": "SELL"}
+                _cur_dir = score_result.direction
+                # 精准点位闸门（precision_entry 三维买点分：R:R 位置 + 方向对齐）独立开关，
+                # 默认 False=向后兼容；接入后对 hexp 已有方向的信号做"点位质量否决"。
+                # 1) 衰竭否决：趋势末端追单必亏（保留，防接刀）
+                # 2026-08-27 方案A：移除原 "1b) 方向对齐否决"（micro_state 反向即否决 hexp
+                # passed 信号）。该闸门用 micro_state 单维否决 6 维综合已 passed 的信号，
+                # 与"放行严格回到 scorecard_total"冲突；micro_state 仅作方向补强（见 #2），
+                # 不作为否决闸门。故彻底删除 1b 分支及 _pg_enabled 读取。
+                if _cur_dir in ("BUY", "SELL") and _ms_state == MicroState.TREND_EXHAUST:
+                    score_result.direction = "NO_TRADE"
+                    score_result.threshold_passed = False
+                    if not score_result.fallback_reason:
+                        score_result.fallback_reason = (
+                            "hexp_entry_gate(TREND_EXHAUST 衰竭末端不追)"
+                        )
+                    logger.info(
+                        "hexp entry gate BLOCK %s: dir 被否决, micro_state=TREND_EXHAUST "
+                        "(衰竭末端不追单)",
+                        state.symbol)
+                # 2) 方案3：micro_state 直接参与方向 —— 回踩/反转给出明确趋势方向、
+                #    而 hexp 因滞后组未确认仍 NO_TRADE 时，用 micro_state 方向补方向，
+                #    并以精准买点分 entry_quality >= 自适应门槛 θ 保证质量（不无脑放行）。
+                elif (_cur_dir == "NO_TRADE" and _ms_dir in _ms_dir_map
+                      and _ms_state in (MicroState.REVERSAL, MicroState.TREND_PULLBACK)):
+                    _new_dir = _ms_dir_map[_ms_dir]
+                    if float(_eq) >= float(_theta):
+                        score_result.direction = _new_dir
+                        score_result.threshold_passed = True
+                        score_result.pre_score = round(float(_eq), 4)
+                        if not score_result.fallback_reason:
+                            score_result.fallback_reason = (
+                                f"hexp_entry_gate({_ms_state.value} 补方向 {_new_dir})"
+                            )
+                        logger.info(
+                            "hexp entry gate FILL %s: micro_state=%s dir=%s eq=%.3f>=θ=%.3f "
+                            "→ 补方向 %s",
+                            state.symbol, _ms_state.value, _ms_dir, _eq, _theta, _new_dir)
+                    else:
+                        logger.info(
+                            "hexp entry gate SKIP %s: micro_state=%s dir=%s eq=%.3f<θ=%.3f "
+                            "(买点分不足，不补方向)",
+                            state.symbol, _ms_state.value, _ms_dir, _eq, _theta)
+
         # P2: always expose component breakdown + real raw indicators to dashboard
         await self._publish_component_scores(state, indicators, regime_result, score_result)
         await self._publish_raw_indicators(state, indicators)
@@ -1939,6 +2030,9 @@ class Scheduler:
             _direction = getattr(score_result, "direction", "NO_TRADE") or "NO_TRADE"
             _snap = {
                 "hp_score": getattr(score_result, "hp_score", 0.0) or 0.0,
+                # 2026-08-27：补 scorecard_total 进快照，供 quality_gate 手数链动使用
+                # 6 维综合分（稳定），替代 hp_score 强度单维决定动态手数档。
+                "scorecard_total": float(getattr(score_result, "scorecard_total", 0.0) or 0.0),
                 "k": getattr(score_result, "k_value", 1.0) or 1.0,
                 "grade": getattr(score_result, "grade", "C") or "C",
                 "passed": bool(score_result.threshold_passed),
@@ -1984,37 +2078,52 @@ class Scheduler:
             # 手数分档透传：AI 只选档(low/mid/high)，实际倍率由风控面板动态手数决定
             # （不再在 signal_tower 侧乘固定倍率，避免双重倍率叠加）。
             ai_lot_tier = _q_tier
-            # 【B1 配套】仅当 cpl 真正启用时，tier=none 才是"极弱压制"；
-            # cpl 未启用时 decide 恒返回 none（语义=不干预手数），绝不能误杀信号。
+            # 【2026-08-27 修订】链动风控侧动态手数规则：解耦/独立模式下 lot_tier_for(hp_score)
+            # 可能返回 none（hp_score<tier_low），若原样透传会让风控 _apply_dynamic_lot 回退到
+            # confidence(pre_score,0-1 口径) 分档，与「解耦只计 hp_score(0-100)」口径不一致。
+            # 故将 none 归一为 "low"（最小档），保证风控永远走 ai_tier 分支、由风控面板
+            # risk.lot_multiplier_low 驱动最小倍率，且耦合/解耦选档口径统一、手数链动不断。
+            # cpl 未启用时 decide 恒返回 none（=不干预手数），此处同样归一 low 不影响（风控 low
+            # 档等价原 none 回退的最小档语义），仅让行为显式化。
+            if ai_lot_tier == "none":
+                ai_lot_tier = "low"
+            # 【2026-08-27 修订】放行严格回到 6 维综合(scorecard_total)：lot_tier=none 仅当
+            # HEXP 未 passed 时才抑制信号；HEXP 已 passed（6 维达标）时，hp_score 单维低导致的
+            # none 不再抑制下单（仅观测），杜绝单维绕过综合闸门。手数档交由风控动态手数兜底。
+            # cpl 未启用时 decide 恒返回 none（语义=不干预手数），绝不误杀信号。
             if ai_lot_tier == "none" and _decision.get("cpl_enabled"):
-                # 极弱 → 不发信号（等价原 lot_mult=0 语义）
+                if not score_result.threshold_passed:
+                    # 极弱且 HEXP 未过闸 → 不发信号（等价原 lot_mult=0 语义）
+                    logger.info(
+                        "AI quality gate zero-tier %s: c_ai=%.2f total=%.2f — signal suppressed (hexp not passed)",
+                        state.symbol, ai_q["c_ai"], float(_decision.get("total_score") or 0.0),
+                    )
+                    return
+                # HEXP 已过闸（6 维综合达标）：单维 none 不抑制，放行交风控最低手数兜底
                 logger.info(
-                    "AI quality gate zero-tier %s: c_ai=%.2f total=%.2f — signal suppressed (lot_tier=none)",
-                    state.symbol, ai_q["c_ai"], float(_decision.get("total_score") or 0.0),
+                    "AI quality gate zero-tier but HEXP PASSED %s: hp=%.1f total=%.2f "
+                    "— keep signal (6-dim gate honored), lot_tier none→risk fallback",
+                    state.symbol, getattr(score_result, "hp_score", 0.0),
+                    float(_decision.get("total_score") or 0.0),
                 )
-                return
 
-            # 2026-08-17 方案甲：HEXP 已过闸信号的「耦合二次放行门槛」。
-            # 仅当 AI 正常出票(c_ai 有效)且 HEXP 已过闸(threshold_passed 仍 True)时，
-            # 耦合总分 < hexp.coupling_pass_threshold(默认50) → 拦掉（HEXP 已过闸也不下单）。
-            # AI 断联(c_ai=None，上方 if 不进) / 解耦 / 未启用 → 不进此段，HEXP 兜底放行。
-            # 注意：若 AI 赋能打开(ai_opened)信号，threshold_passed 已置 True，同样受此门槛约束
-            # （耦合分不达标则仍不放行，符合「耦合分参与下单判定」语义）。
+            # 2026-08-27 修订：耦合总分(coupling_total)仅用于手数链动(lot_tier，见 quality_gate 275
+            # 行的 lot_tier_for(total))，不再作为下单闸门——下单严格由 HEXP 6 维 passed 决定。
+            # 此处仅观测耦合分是否低于 hexp.coupling_pass_threshold（供报表/诊断），绝不改写
+            # threshold_passed（不拦下单）。AI 耦合时"总分链动"=手数倍率用耦合总分；解耦时
+            # 总分只计 hp_score（quality_gate 解耦分支 total_score=hp_score）。两种情况下单闸门
+            # 均回归 6 维综合(scorecard_total)。
             if _decision.get("coupling_pass") is False and score_result.threshold_passed:
                 _cp_thr = float(_ai_cfg.get("hexp.coupling_pass_threshold", 50.0))
                 _cp_total = float(_decision.get("total_score") or 0.0)
                 self._stats["ai_gate_rejects"] += 1
                 logger.info(
-                    "AI quality gate COUPLING-BELOW-MIN %s %s: total=%.2f < threshold=%.2f "
-                    "(c_ai=%.2f hp=%.1f) — signal suppressed",
+                    "AI quality gate COUPLING-BELOW-MIN(obs) %s %s: total=%.2f < threshold=%.2f "
+                    "(c_ai=%.2f hp=%.1f) — NOT suppressed (6-dim hexp gate honored, coupling drives lot only)",
                     state.symbol, _direction, _cp_total, _cp_thr,
                     ai_q["c_ai"], getattr(score_result, "hp_score", 0.0),
                 )
-                score_result.threshold_passed = False
-                score_result.fallback_reason = (
-                    score_result.fallback_reason or ""
-                ) + f" | hexp_coupling_below_min(total={_cp_total:.1f}<{_cp_thr:.1f})"
-                # 不 return，让下方统一的 threshold_passed 检查走 skipped 分支（与引擎其它拦截同态）
+                # 不修改 threshold_passed：耦合分只影响手数档，不影响放行闸门
 
         if not score_result.threshold_passed:
             logger.info(
@@ -2088,8 +2197,38 @@ class Scheduler:
         # ── Step 8: Final Direction ──
         # 直接采用评分方向（原 AI 对称否决分支已随 five_dim 弃用而删除）。
         final_direction = score_result.direction
-        final_confidence = score_result.pre_score
+        # 2026-08-27 修复：confidence 必须 0–100 制，与风控 risk_min_confidence
+        # （0–100）及手数分档(score_tier_low/mid)口径对齐。pre_score 是 0–1 制，
+        # 原样填入会让满分(A类100分)信号被风控误判 confidence=1.00<60 → REJECT。
+        # 改用 6 维综合分 scorecard_total（0–100，放行强度权威口径）。
+        final_confidence = float(getattr(score_result, "scorecard_total", 0.0) or 0.0)
         self._stats["signals_bypassed"] += 1
+
+        # ── 【2026-08-26 反向单】momentum_flip 高位动量反向候选真下单路径 ──
+        # 背景：hexp 的 momentum_flip 已把原 BUY/SELL 封成 NO_TRADE（_flip_block），
+        # 同时记录 reverse_candidate（方向与原相反、顶部做空/底部做多）。
+        # 当 reverse_candidate.order_intent=True（开关 hexp.reverse_order_enabled 打开）
+        # 且原评分被 flip 拦成 NO_TRADE 时，本分支把 final_direction 覆写为候选的反向
+        # 方向，使信号真正产出（接刀单）。该信号仍须经风控 rule_chain 的接刀护栏
+        # （_check_reverse_order）裁决，未达保本/持仓条件则被拒（防盲目接刀）。
+        # 开关默认 False → 整个分支不触发，行为与旧"纯观测"一致（零实盘影响）。
+        _reverse_order = bool(
+            (getattr(score_result, "reverse_candidate", None) or {}).get("order_intent", False)
+        )
+        if _reverse_order:
+            _rc = getattr(score_result, "reverse_candidate", None) or {}
+            _rc_dir = _rc.get("dir")
+            if _rc_dir in ("BUY", "SELL") and final_direction == "NO_TRADE":
+                logger.info(
+                    "Reverse order intent: override final_direction %s → %s "
+                    "(reverse_candidate at pos=%.2f) — routed to risk engine",
+                    final_direction, _rc_dir, _rc.get("pos", 0.0),
+                )
+                final_direction = _rc_dir
+                final_confidence = float(getattr(score_result, "scorecard_total", 0.0) or 0.0)
+            elif _rc_dir in ("BUY", "SELL"):
+                # 原评分已给出方向（非 flip 拦下）→ 反向候选不再覆写，避免与正常信号冲突
+                _reverse_order = False
 
         # 【2026-08-17 修复】bypass_reason 缺失定义：原代码在 SignalData.fallback_reason
         # 与最终日志均引用 bypass_reason，但函数内从未赋值 → live override 触发路径每
@@ -2523,7 +2662,12 @@ class Scheduler:
                 "dir_sum": getattr(score_result, "dir_sum", None),
                 "k": getattr(score_result, "k_value", None),
                 "verdict": getattr(score_result, "resonance_verdict", None),
+                # mm 仅为微动量强度（非方向）：前端画方向箭头必须用下方 direction 字段，
+                # 禁止用 mm 符号判断方向（mm 在 0 附近高频抖动 → 方向闪烁缺陷，2026-08-27）。
                 "mm": getattr(score_result, "mm_score", None),
+                "mm_smoothed": getattr(score_result, "mm_smoothed", None),
+                # 综合裁决方向（多因子加权和+EMA平滑+迟滞），面板方向箭头唯一正确来源。
+                "direction": getattr(score_result, "direction", "NO_TRADE"),
                 "grade": getattr(score_result, "grade", None),
                 "factor_scores": getattr(score_result, "factor_scores", None),
                 "trend_scores": getattr(score_result, "trend_scores", None),
@@ -2532,14 +2676,24 @@ class Scheduler:
                 "trend_phase": getattr(score_result, "trend_phase", None),
                 "di_plus": getattr(indicators, "plus_di", None),
                 "di_minus": getattr(indicators, "minus_di", None),
-                # 2026-08-21 反向单观测：momentum_flip 高位动量反向时记录的反向候选
-                # (dir/pos/er/mm/close/verdict)，仅观测不下单，供 SQL 回测胜率。
+                # 2026-08-26 反向单（由"纯观测"升级为"经风控后下单"）：momentum_flip 高位
+                # 动量反向时记录的反向候选(dir/pos/er/mm/close/verdict/order_intent)。
+                # order_intent=True 时本信号将覆写 final_direction 为候选方向并经风控
+                # 接刀护栏裁决；False 仅观测（供 SQL 回测胜率，不下单）。
                 "reverse_candidate": getattr(score_result, "reverse_candidate", None),
+                "reverse_order": bool(
+                    (getattr(score_result, "reverse_candidate", None) or {}).get("order_intent", False)
+                ),
                 # 2026-08-24 趋势抢跑观测：phase=ignite+动量同向+pos 中低位的顺势启动候选。
                 # 写进生产 hexp 信号的 indicator_values._hexp（shadow 在 active_model=hexp 时
                 # 被跳过，故必须挂主信号才能积累评估数据）。仅观测不下单。
                 "trend_start_candidate": getattr(score_result, "trend_start_candidate", None),
             }
+        # 2026-08-27 周期位置观测字段：hexp 与 co(和乘幂) 路径统一落库（不在 _hexp 子结构内），
+        # 支撑两侧守卫命中率统计。co_source 不设 mm，本无 mm 闪烁缺陷；此处补齐位置观测一致性。
+        _ind_vals["position_cycle"] = getattr(score_result, "position_cycle", None)
+        _ind_vals["position_z"] = getattr(score_result, "position_z", None)
+        _ind_vals["cycle_pos_blocked"] = bool(getattr(score_result, "cycle_pos_blocked", False))
         signal_data = SignalData(
             signal_id=signal_id,
             task_id=0,
@@ -2566,12 +2720,25 @@ class Scheduler:
             weight_scheme=score_result.weight_scheme,
             # 2026-08-25 极值分层裁决：hexp 极值+保本追单候选 → 透传，风控保本闸门最终裁决
             extreme_pending=bool(getattr(score_result, "extreme_pending", False)),
+            # 2026-08-26 反向单：经 momentum_flip 封 NO_TRADE 后由 reverse_candidate 覆写
+            # 方向产出的接刀单，透传标记 → 风控 _check_reverse_order 接刀护栏裁决。
+            reverse_order=_reverse_order,
             # 2026-08-13 修复：优先用 hexp 引擎落库的 Donchian 分位（sr.position_in_range），
             # 支撑「高位做多/低位做空」SQL 敏捷识别；非 hexp 路径回退 range_position。
             position_in_range=(
                 getattr(score_result, "position_in_range", None)
                 if getattr(score_result, "position_in_range", None) is not None
                 else (round(score_result.range_position.pct_b_range, 4) if score_result.range_position else None)
+            ),
+            # 2026-08-27 C4 位置/极值溯源字段落库：复盘"高位开多/低位开空"止损归因。
+            position_cycle=getattr(score_result, "position_cycle", None),
+            position_z=getattr(score_result, "position_z", None),
+            ma_raw=getattr(score_result, "ma_raw", None),
+            cycle_pos_blocked=bool(getattr(score_result, "cycle_pos_blocked", False)),
+            extreme_reversal_blocked=bool(getattr(score_result, "extreme_reversal_blocked", False)),
+            threshold_passed=(
+                None if getattr(score_result, "threshold_passed", None) is None
+                else bool(score_result.threshold_passed)
             ),
             trace_id=trace_id,
             produced_at=datetime.now(timezone.utc).isoformat(),  # D7-1: T0 信号生产决策时刻
@@ -2681,7 +2848,7 @@ class Scheduler:
             tp1=0.0,
             tp2=0.0,
             lot=0.0,
-            confidence=score_result.pre_score,
+            confidence=float(getattr(score_result, "scorecard_total", 0.0) or 0.0),
             signal_mode="filtered",
             indicator_values={
                 "adx_14": round(indicators.adx_14, 2),
@@ -2719,6 +2886,16 @@ class Scheduler:
                 getattr(score_result, "position_in_range", None)
                 if getattr(score_result, "position_in_range", None) is not None
                 else (round(score_result.range_position.pct_b_range, 4) if score_result.range_position else None)
+            ),
+            # 2026-08-27 C4 位置/极值溯源字段落库（filtered 路径保持一致口径）。
+            position_cycle=getattr(score_result, "position_cycle", None),
+            position_z=getattr(score_result, "position_z", None),
+            ma_raw=getattr(score_result, "ma_raw", None),
+            cycle_pos_blocked=bool(getattr(score_result, "cycle_pos_blocked", False)),
+            extreme_reversal_blocked=bool(getattr(score_result, "extreme_reversal_blocked", False)),
+            threshold_passed=(
+                None if getattr(score_result, "threshold_passed", None) is None
+                else bool(score_result.threshold_passed)
             ),
             trace_id=trace_id,
             zone_level=zone_level,
@@ -2888,7 +3065,7 @@ class Scheduler:
         与 co.v2_enabled 均关闭时返回 (None,0,0)（零开销）。
         """
         if self._co_source is None or self._micro_state is None or self._precision_entry is None:
-            return None, 0.0, 0.0
+            return None, 0.0, 0.0, None
         _want_compute = True
         if self._config is not None:
             try:
@@ -2899,7 +3076,7 @@ class Scheduler:
             except Exception:
                 _want_compute = True
         if not _want_compute:
-            return None, 0.0, 0.0
+            return None, 0.0, 0.0, None
         if not self._shadow_v2_loaded:
             await self._micro_state.load_config()
             await self._precision_entry.load_config()
@@ -2909,7 +3086,7 @@ class Scheduler:
             indicators, _ms, h1_context, score_result)
         _theta = self._micro_state.adaptive_theta(
             _ms.state, getattr(regime_result, "vol_factor", 1.0))
-        return _ms, _eq, _theta
+        return _ms, _eq, _theta, _breakdown
 
     async def _run_shadow_v2(
         self,
@@ -3052,7 +3229,13 @@ class Scheduler:
         """双跑和乘幂引擎，仅落库不下单。"""
         # 守卫：当 hexp 本身就是生产模型时不再双跑影子（避免 self-vs-self 对照、
         # 每根 bar 重复拉取多周期 K 线造成的无谓开销）。
+        # 但趋势启动候选(trend_start_candidate)在生产信号里持续落库，需周期性触发
+        # reconcile 评估其"假设成交"胜率（影子评估，零实盘影响）。
         if active_model == "hexp":
+            _now = time.time()
+            if _now - getattr(self, "_hexp_shadow_last_recon", 0.0) >= 60:
+                self._hexp_shadow_last_recon = _now
+                await self._reconcile_hexp_shadow()
             return
         if self._config is not None:
             _enabled = await self._config.get_bool("hexp.shadow_enabled", False)
@@ -3257,7 +3440,102 @@ class Scheduler:
                     _sid, _sym, _tf, _dir, _entry, _sl, _tp, _created,
                     _eval_bars, _outcome, _dir_hit, round(_pnl_r, 4),
                 )
-            logger.info("SHADOW hexp reconcile: evaluated %d shadow signals", len(_rows))
+            # ── 趋势启动候选影子评估（2026-08-26）──
+            # 读生产信号里落库的 trend_start_candidate（indicator_values._hexp.trend_start_candidate），
+            # 用 hexp 默认 SL/TP 参数（sl_atr_mult=2.0 / rr_min=1.5）模拟"在趋势启动初期
+            # 轻仓顺势下单"的假设成交 win/loss，落 hexp_shadow_eval（复用 signal_id 唯一键，
+            # 生产信号与 hexp_shadow 信号 signal_id 同序列、不冲突）。
+            # 供「趋势启动下单」在开 hexp.trend_start_order_enabled 真下单前评估胜率/盈亏比。
+            _ts_rows = await self._db.fetch(
+                """
+                SELECT s.signal_id, s.symbol, s.time_frame, s.created_at,
+                       (s.indicator_values->'_hexp'->>'trend_start_candidate')::jsonb AS ts
+                FROM hcm_signal.signals s
+                WHERE s.indicator_values->'_hexp'->>'trend_start_candidate' IS NOT NULL
+                  AND s.created_at < NOW() - $1::interval
+                  AND NOT EXISTS (
+                      SELECT 1 FROM hcm_signal.hexp_shadow_eval e
+                      WHERE e.signal_id = s.signal_id
+                  )
+                ORDER BY s.created_at ASC
+                LIMIT 500
+                """,
+                _horizon,
+            )
+            for _r in _ts_rows:
+                _ts = _r["ts"]
+                if not isinstance(_ts, dict):
+                    continue
+                _ts_dir = _ts.get("dir")
+                _ts_close = float(_ts.get("close") or 0.0)
+                _ts_atr = float(_ts.get("atr") or 4.0)
+                if _ts_dir not in ("BUY", "SELL") or _ts_close <= 0 or _ts_atr <= 0:
+                    continue
+                # 趋势启动单 SL/TP 参数（与 hexp.exec.sl_atr_mult=2.0 / rr_min=1.5 一致）
+                _ts_sl_mult = 2.0
+                _ts_rr = 1.5
+                _ts_tp_mult = _ts_sl_mult * _ts_rr
+                if _ts_dir == "BUY":
+                    _ts_sl = _ts_close - _ts_sl_mult * _ts_atr
+                    _ts_tp = _ts_close + _ts_tp_mult * _ts_atr
+                else:
+                    _ts_sl = _ts_close + _ts_sl_mult * _ts_atr
+                    _ts_tp = _ts_close - _ts_tp_mult * _ts_atr
+                _ts_kl = await self._db.fetch(
+                    """
+                    SELECT open_time, high, low, close
+                    FROM hcm_market.klines
+                    WHERE symbol = $1 AND time_frame = $2
+                      AND open_time > $3
+                    ORDER BY open_time ASC
+                    LIMIT $4
+                    """,
+                    _r["symbol"], _r["time_frame"], _r["created_at"], _eval_bars,
+                )
+                _ts_outcome = "expired"
+                _ts_pnl_r = 0.0
+                _ts_dir_hit = False
+                for _b in _ts_kl:
+                    _hi = float(_b["high"])
+                    _lo = float(_b["low"])
+                    _cl = float(_b["close"])
+                    if _ts_dir == "BUY":
+                        if _lo <= _ts_sl:
+                            _ts_outcome = "loss"
+                            _ts_pnl_r = -1.0
+                            break
+                        if _hi >= _ts_tp:
+                            _ts_outcome = "win"
+                            _ts_pnl_r = (_ts_tp - _ts_close) / max(_ts_close - _ts_sl, 1e-9)
+                            break
+                        if _cl >= _ts_close + _dir_ratio * _ts_atr:
+                            _ts_dir_hit = True
+                    else:
+                        if _hi >= _ts_sl:
+                            _ts_outcome = "loss"
+                            _ts_pnl_r = -1.0
+                            break
+                        if _lo <= _ts_tp:
+                            _ts_outcome = "win"
+                            _ts_pnl_r = (_ts_close - _ts_tp) / max(_ts_sl - _ts_close, 1e-9)
+                            break
+                        if _cl <= _ts_close - _dir_ratio * _ts_atr:
+                            _ts_dir_hit = True
+                await self._db.execute(
+                    """
+                    INSERT INTO hcm_signal.hexp_shadow_eval
+                        (signal_id, symbol, time_frame, signal_dir, entry_price,
+                         sl_price, tp1, created_at, eval_at, horizon_bars,
+                         outcome, dir_hit, pnl_r)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),$9,$10,$11,$12)
+                    ON CONFLICT (signal_id) DO NOTHING
+                    """,
+                    _r["signal_id"], _r["symbol"], _r["time_frame"], _ts_dir, _ts_close,
+                    _ts_sl, _ts_tp, _r["created_at"],
+                    _eval_bars, _ts_outcome, _ts_dir_hit, round(_ts_pnl_r, 4),
+                )
+            logger.info("SHADOW hexp reconcile: evaluated %d shadow signals, %d trend-start candidates",
+                        len(_rows), len(_ts_rows))
         except Exception as _e:
             logger.warning("SHADOW hexp reconcile failed: %s", _e)
 
@@ -4174,6 +4452,11 @@ class Scheduler:
                 vol_adapt_enable=await self._config.get_bool("regime_vol_adapt_enable", False),
                 vol_adapt_scale=await self._config.get_float("regime_vol_adapt_scale", 0.15),
                 vol_adapt_band_ref=await self._config.get_float("regime_vol_adapt_band_ref", 1.0),
+                # NEUTRAL 模糊区次级确认（2026-08-26）
+                fuzzy_enable=await self._config.get_bool("regime_fuzzy_enable", True),
+                fuzzy_hurst_trend=await self._config.get_float("regime_fuzzy_hurst_trend", 0.5),
+                fuzzy_bbw_shrink_max=await self._config.get_float("regime_fuzzy_bbw_shrink_max", 1.0),
+                fuzzy_use_bbw=await self._config.get_bool("regime_fuzzy_use_bbw", True),
             )
             self._regime_classifier.update_config(cfg)
             logger.info(

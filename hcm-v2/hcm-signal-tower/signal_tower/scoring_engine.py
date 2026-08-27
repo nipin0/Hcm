@@ -155,7 +155,10 @@ class ScoreResult:
     component_scores: dict[str, Tuple[float, float]] = field(default_factory=dict)
     # component_scores: {component: (buy_contribution, sell_contribution)}
     range_position: Optional[RangePosition] = None
-    range_bonus_applied: float = 0.0
+    # 诊断标签字段：实际承载 float（RANGE 位置 bonus 数值）或 str（rsi_overbought /
+    # rsi_overheat_suppressed / zone_* / adx_floor 等"最后施加的原因标签"）。
+    # 历史注解误标 float，与 str 赋值不一致；已纠正为 Any 以如实反映双语义。
+    range_bonus_applied: Any = 0.0
 
     # ── Bar momentum (Fix #2) ──
     bar_momentum_applied: float = 0.0
@@ -196,6 +199,24 @@ class ScoreResult:
     #   此时 hexp 不硬封方向，标记此字段并交由风控保本闸门做最终裁决（放行+轻仓/拦截）。
     #   无保本持仓时极值护栏照常硬封（hexp_extreme_guard），此字段保持 False。
     extreme_pending: bool = False
+
+    # ── 2026-08-27 方案A: hp_floor 观测标记 ──
+    # hp_score(hp_100) 低于 hexp.scorecard.hp_floor 时置 True，仅作面板观测标注，
+    # 不再强制改写 grade/passed（放行严格由 6 维综合 scorecard_total 决定）。
+    is_hp_red: bool = False
+
+    # ── 2026-08-27 周期价格位置（抗 Donchian 通道拉宽稀释）──
+    # position_cycle = 长 lookback 滚动极值分位[0,1]（0=贴区间下沿,1=贴上沿）
+    # position_z     = 偏离长周期中枢多少个 ATR（趋势中也不被通道稀释）
+    # 二者用于发信号前判断"当前价格在周期里的位置"，抑制极值区逆势追单/接刀。
+    position_cycle: float = 0.5
+    position_z: float = 0.0
+    # 2026-08-27 周期位置守卫命中标记：由 pos_cycle/pos_z 触发 NO_TRADE 时置 True，
+    # 落库供 SQL 统计命中率（可观测性，不阻断逻辑）。
+    cycle_pos_blocked: bool = False
+    # 2026-08-27 微动量平滑值（EMA，消抖）：前端画方向箭头若要用 mm 视角，必须用此平滑值，
+    # 禁止用 mm_score（原始瞬时值，0 附近高频抖 → 方向闪烁缺陷）。
+    mm_smoothed: float = 0.0
 
 
 class ScoringEngine:
@@ -983,6 +1004,42 @@ class ScoringEngine:
         if getattr(result, "neutral_rsi_confirmed", False) and result.direction != "NO_TRADE":
             result.threshold = 0.0
             result.threshold_passed = True
+
+        # 【P0-2 2026-08-26 均值回归 RSI 极值硬校验】震荡/中性市的反向开仓强制 RSI 极值。
+        # 根因：RANGE 均值回归闸门只对 regime==RANGE 生效，而 live_override 实时触发时
+        # regime 常判 NEUTRAL 或空，中性区反向单漏网（实证 10 条 RANGE 成交单 RSI 全在
+        # 28~70 中性区）。此兜底不依赖 regime：凡震荡/中性市（非趋势），反向开仓但
+        # 未达反向极值(stoch/rsi) 即拦截，杜绝"中性区追涨杀跌当均值回归"。
+        if (result.direction in ("BUY", "SELL")
+                and result.regime in (Regime.RANGE, Regime.NEUTRAL)
+                and not getattr(result, "neutral_rsi_confirmed", False)):
+            _rd = result.direction
+            _rrsi = getattr(indicators, "rsi_14", None)
+            _rpct = getattr(indicators, "pct_b", None)
+            _rk = getattr(indicators, "stoch_k", None)
+            _rlow = self._range_rsi_extreme_low
+            _rhigh = self._range_rsi_extreme_high
+            _rstoch = self._range_stoch_extreme
+            _rmin = self._range_min_pct_b
+            if _rd == "BUY":
+                _rsi_ok = (_rrsi is not None and _rrsi < _rlow)
+                _edge_ok = (_rpct is not None and _rpct < _rmin and _rk is not None and _rk < _rstoch)
+            else:  # SELL
+                _rsi_ok = (_rrsi is not None and _rrsi > _rhigh)
+                _edge_ok = (_rpct is not None and _rpct > (1.0 - _rmin) and _rk is not None and _rk > (100.0 - _rstoch))
+            if not _rsi_ok and not _edge_ok:
+                result.direction = "NO_TRADE"
+                result.threshold_passed = False
+                result.neutral_rsi_confirmed = False
+                result.fallback_reason = (
+                    f"range_rsi_hardgate({_rd} need rsi{'<' if _rd=='BUY' else '>'}"
+                    f"{_rlow if _rd=='BUY' else _rhigh} or %b edge+rsi/stoch extreme)"
+                )
+                logger.info(
+                    "range_rsi_hardgate block: %s %s rsi=%s pct=%s stoch=%s reason=%s",
+                    getattr(regime, "symbol", ""), _rd, _rrsi, _rpct, _rk,
+                    result.fallback_reason,
+                )
 
         return result
 

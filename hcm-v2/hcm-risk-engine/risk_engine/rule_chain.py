@@ -251,6 +251,25 @@ class RuleChain:
             }
             return result
 
+        # ── 反向接刀护栏（2026-08-26）──
+        # 仅当信号标记 reverse_order=True（momentum_flip 封 NO_TRADE 后覆写方向产出的
+        # 高位动量反转接刀单）时触发。反向接刀逆原趋势、风险高，须已有同向持仓且已
+        # 保本（利润垫）才放行 + 轻仓（×0.5）；否则拒绝（防盲目接刀）。
+        # 复用与 _check_cooldown 同口径的 BE 真值源（Redis 标志 / PG positions），
+        # DB 不可达 → fail-closed 拒绝（从严，防接刀）。
+        _rro = bool(signal_data.get("reverse_order", False))
+        if _rro:
+            r = await self._check_reverse_order(signal_data)
+            result.results.append(r)
+            if not r.passed:
+                result.passed = False
+                result.rejected_rules.append(r.rule_name)
+                result.violations[r.rule_name] = {
+                    "actual": r.actual_value,
+                    "threshold": r.threshold,
+                }
+                return result
+
         # Rule 9: Spread Check Enabled flag (pass-through, already handled in #7)
         r = RuleResult(
             rule_name="risk_spread_check_enabled",
@@ -557,6 +576,18 @@ class RuleChain:
                         threshold=0.0,
                         message="extreme_pending + BE 真值源(DB)不可达 → 拒绝(防极值接刀)",
                     )
+                # 【2026-08-25 BUG 修复】无同向持仓(_db_be=None) → 放行，等价正常路径的
+                # entry is None 语义。原 `bool(None)=False` 会把"账户根本无同向持仓"误判成
+                # "有持仓但未保本"而拒绝，导致 A 级 SELL 信号在无持仓时被 risk_cool_minutes
+                # 错误拦截（接刀护栏本意是拦"已有持仓未保本仍追单"，不拦首笔开仓）。
+                if _db_be is None:
+                    return RuleResult(
+                        rule_name="risk_cool_minutes",
+                        passed=True,
+                        actual_value=0.0,
+                        threshold=0.0,
+                        message="extreme_pending + 无同向持仓 → 放行(首笔开仓,无接刀风险)",
+                    )
                 _account_be = bool(_db_be)
             if _account_be:
                 # 账户同向已保本（Redis 或 PG 确认）→ 放行 + 轻仓（极值追单，suggested_lot_ratio×0.5）
@@ -705,6 +736,110 @@ class RuleChain:
                 account_id, direction, exc,
             )
             return (None, True)
+
+
+    async def _check_reverse_order(self, signal_data: dict) -> "RuleResult":
+        """反向接刀护栏（2026-08-26）。
+
+        signal_data["reverse_order"]=True 表示本信号是 momentum_flip 封 NO_TRADE 后
+        由 hexp reverse_candidate 覆写方向产出的「高位动量反转接刀单」（顶部 SELL /
+        底部 BUY，逆原趋势）。
+
+        接刀逆原趋势、风险高。分层放行（2026-08-26 起）：
+          - 首单（无同向 open 持仓，flat）→ 豁免直接放行 + 最轻仓（×0.3）；
+            反转起点第一笔裸接刀本就无利润垫，允许用户策略「首单直接下单」；
+          - 次单（已有同向持仓）→ 走 BE 校验：
+              · Redis hcm:pos:be:{account}:{dir}=1 或 PG 同向持仓 SL≥保本 → 放行 + 轻仓×0.5；
+              · 有同向持仓但 SL 未达保本 → 拒绝（利润垫不足）；
+          - DB 不可达 / 无法确认保本（Redis 标志异常分支）→ fail-closed 拒绝（从严）。
+        与 _check_cooldown 的 extreme_pending 分支共用同一 BE 真值源范式
+        （Redis 标志 + PG positions 回退），保证一致性。
+        """
+        direction = (signal_data.get("direction") or "NO_TRADE") if isinstance(signal_data, dict) else "NO_TRADE"
+        account_id = int(signal_data.get("account_id", 0) or 0) if isinstance(signal_data, dict) else 0
+        try:
+            account_id = int(account_id)
+        except (TypeError, ValueError):
+            account_id = 0
+
+        if direction not in ("BUY", "SELL"):
+            # 无明确方向 → 不接刀（防御）
+            return RuleResult(
+                rule_name="risk_reverse_order",
+                passed=False,
+                actual_value=0.0,
+                threshold=0.0,
+                message=f"reverse_order but direction={direction} — reject",
+            )
+
+        tol = float(getattr(self, "_be_tolerance", 0.0) or 0.0)
+
+        # ── BE 真值源：Redis 标志优先，缺失/异常 → 回退 PG ──
+        _account_be = False
+        _be_source = "redis"
+        if self._redis is not None:
+            try:
+                _af = await self._redis.get(f"hcm:pos:be:{account_id}:{direction}")
+                _account_be = (_af is not None and str(_af).strip() == "1")
+            except Exception:
+                _account_be = False
+        if not _account_be:
+            _be_source = "pg"
+            _db_be, _db_err = await self._account_be_from_db(account_id, direction, tol)
+            if _db_err:
+                # DB 不可达：无法确认保本 → 从严拒绝（fail-closed，防接刀）
+                logger.critical(
+                    "reverse_order BE check DB FAILED (account=%s, dir=%s) — "
+                    "reject (fail-closed, 防接刀)", account_id, direction,
+                )
+                return RuleResult(
+                    rule_name="risk_reverse_order",
+                    passed=False,
+                    actual_value=0.0,
+                    threshold=0.0,
+                    message="reverse_order + BE 真值源(DB)不可达 → 拒绝(防接刀)",
+                )
+            if _db_be is True:
+                _account_be = True
+            elif _db_be is False:
+                # 有同向持仓但未保本 → 拒绝（利润垫不足）
+                return RuleResult(
+                    rule_name="risk_reverse_order",
+                    passed=False,
+                    actual_value=0.0,
+                    threshold=0.0,
+                    message=f"reverse_order: 同向持仓未达保本(利润垫不足) → 拒绝(防接刀)",
+                )
+            # _db_be is None → 无同向 open 持仓（flat）。
+            # 【2026-08-26 修复】首单接刀豁免：反转起点第一笔裸接刀直接放行（轻仓×0.3），
+            # 次单（已有同向持仓）仍走上方 BE 校验路径。与用户策略「首单直接下单、
+            # 次单走风控」一致——首单是反转起点的第一笔，本就无利润垫，不应被拒绝。
+            try:
+                _sig_lot = float(signal_data.get("suggested_lot_ratio", 1.0) or 1.0)
+            except (TypeError, ValueError):
+                _sig_lot = 1.0
+            signal_data["suggested_lot_ratio"] = _sig_lot * 0.3
+            return RuleResult(
+                rule_name="risk_reverse_order",
+                passed=True,
+                actual_value=0.0,  # 首单无利润垫，豁免
+                threshold=1.0,
+                message="reverse_order: 首单裸接刀(无同向持仓)豁免放行 + 轻仓×0.3",
+            )
+
+        # BE 已确认（次单已保本）→ 放行 + 轻仓接刀（×0.5）
+        try:
+            _sig_lot = float(signal_data.get("suggested_lot_ratio", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            _sig_lot = 1.0
+        signal_data["suggested_lot_ratio"] = _sig_lot * 0.5
+        return RuleResult(
+            rule_name="risk_reverse_order",
+            passed=True,
+            actual_value=1.0,  # 已保本
+            threshold=1.0,
+            message=f"reverse_order: 账户同向已保本(BE源={_be_source})，放行 + 轻仓×0.5",
+        )
 
 
     async def mark_cooldown(self, signal_data: dict) -> None:

@@ -1,0 +1,902 @@
+[
+ {
+  "signal_id": 1517215,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-19 05:20:05.719967+00:00"
+ },
+ {
+  "signal_id": 1517217,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-19 05:25:15.606375+00:00"
+ },
+ {
+  "signal_id": 1517219,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-19 05:30:00.665774+00:00"
+ },
+ {
+  "signal_id": 1517223,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-19 05:40:11.686880+00:00"
+ },
+ {
+  "signal_id": 1517235,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-19 06:15:00.646841+00:00"
+ },
+ {
+  "signal_id": 1517254,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 07:40:00.654797+00:00"
+ },
+ {
+  "signal_id": 1517256,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 07:45:01.702741+00:00"
+ },
+ {
+  "signal_id": 1517258,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 07:50:11.795045+00:00"
+ },
+ {
+  "signal_id": 1517260,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 07:55:00.661277+00:00"
+ },
+ {
+  "signal_id": 1517262,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 08:00:12.703581+00:00"
+ },
+ {
+  "signal_id": 1517268,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 08:20:05.697936+00:00"
+ },
+ {
+  "signal_id": 1517270,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 08:25:15.765498+00:00"
+ },
+ {
+  "signal_id": 1517272,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 08:30:25.765514+00:00"
+ },
+ {
+  "signal_id": 388638946,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 08:55:13.687414+00:00"
+ },
+ {
+  "signal_id": 388638975,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 11:15:17.692239+00:00"
+ },
+ {
+  "signal_id": 388638978,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 11:20:00.672878+00:00"
+ },
+ {
+  "signal_id": 388638982,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 11:30:15.715205+00:00"
+ },
+ {
+  "signal_id": 388638984,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 11:35:00.676798+00:00"
+ },
+ {
+  "signal_id": 388638988,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 11:45:22.698740+00:00"
+ },
+ {
+  "signal_id": 388639002,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 12:25:11.631479+00:00"
+ },
+ {
+  "signal_id": 388639004,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 12:30:00.665013+00:00"
+ },
+ {
+  "signal_id": 388639006,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 12:35:15.692763+00:00"
+ },
+ {
+  "signal_id": 388639008,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 12:40:28.700865+00:00"
+ },
+ {
+  "signal_id": 388639012,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 12:50:00.683868+00:00"
+ },
+ {
+  "signal_id": 388639014,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-19 12:55:03.691399+00:00"
+ },
+ {
+  "signal_id": 388639168,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 00:00:23.744613+00:00"
+ },
+ {
+  "signal_id": 388639170,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 00:06:00.709669+00:00"
+ },
+ {
+  "signal_id": 388639176,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 00:20:01.631776+00:00"
+ },
+ {
+  "signal_id": 388639200,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-20 02:00:02.667545+00:00"
+ },
+ {
+  "signal_id": 388639323,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-20 12:10:06.650740+00:00"
+ },
+ {
+  "signal_id": 388639325,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-20 12:15:15.681688+00:00"
+ },
+ {
+  "signal_id": 388639327,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-20 12:20:26.702558+00:00"
+ },
+ {
+  "signal_id": 388639335,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-20 12:40:04.668234+00:00"
+ },
+ {
+  "signal_id": 388639337,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-20 12:45:15.680708+00:00"
+ },
+ {
+  "signal_id": 388639341,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 13:00:10.680251+00:00"
+ },
+ {
+  "signal_id": 388639343,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 13:05:00.619432+00:00"
+ },
+ {
+  "signal_id": 388639368,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 15:00:17.714050+00:00"
+ },
+ {
+  "signal_id": 388639379,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 15:30:16.655366+00:00"
+ },
+ {
+  "signal_id": 388639381,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 15:35:00.641695+00:00"
+ },
+ {
+  "signal_id": 388639383,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 15:40:08.630051+00:00"
+ },
+ {
+  "signal_id": 388639385,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 15:45:19.669705+00:00"
+ },
+ {
+  "signal_id": 388639387,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 15:50:00.635276+00:00"
+ },
+ {
+  "signal_id": 388639389,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 15:55:00.613785+00:00"
+ },
+ {
+  "signal_id": 388639391,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 16:00:07.657814+00:00"
+ },
+ {
+  "signal_id": 388639393,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 16:05:00.627279+00:00"
+ },
+ {
+  "signal_id": 388639395,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-20 16:10:08.735617+00:00"
+ },
+ {
+  "signal_id": 388639504,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 02:10:17.704030+00:00"
+ },
+ {
+  "signal_id": 388639506,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 02:15:00.645446+00:00"
+ },
+ {
+  "signal_id": 388639508,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 02:20:08.631528+00:00"
+ },
+ {
+  "signal_id": 388639510,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 02:25:19.701192+00:00"
+ },
+ {
+  "signal_id": 388639512,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 02:30:28.692923+00:00"
+ },
+ {
+  "signal_id": 388639514,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 02:35:00.613186+00:00"
+ },
+ {
+  "signal_id": 388639516,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 02:40:03.659569+00:00"
+ },
+ {
+  "signal_id": 388639518,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 02:45:00.617447+00:00"
+ },
+ {
+  "signal_id": 388639522,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 02:55:24.699266+00:00"
+ },
+ {
+  "signal_id": 388639524,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 03:01:00.736368+00:00"
+ },
+ {
+  "signal_id": 388639527,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 03:06:00.753086+00:00"
+ },
+ {
+  "signal_id": 388639531,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 03:15:00.650033+00:00"
+ },
+ {
+  "signal_id": 388639535,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 03:25:15.700274+00:00"
+ },
+ {
+  "signal_id": 388639539,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 03:35:30.689061+00:00"
+ },
+ {
+  "signal_id": 388639541,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 03:40:00.668983+00:00"
+ },
+ {
+  "signal_id": 388639544,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 03:45:05.625000+00:00"
+ },
+ {
+  "signal_id": 388639546,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 03:50:00.678296+00:00"
+ },
+ {
+  "signal_id": 388639548,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 03:55:04.683447+00:00"
+ },
+ {
+  "signal_id": 388639554,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 04:10:00.659101+00:00"
+ },
+ {
+  "signal_id": 388639560,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 04:35:00.647438+00:00"
+ },
+ {
+  "signal_id": 388639566,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 04:50:04.651402+00:00"
+ },
+ {
+  "signal_id": 388639568,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 04:55:14.685685+00:00"
+ },
+ {
+  "signal_id": 388639574,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 05:10:00.652960+00:00"
+ },
+ {
+  "signal_id": 388639594,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 06:25:12.654593+00:00"
+ },
+ {
+  "signal_id": 388639596,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 06:30:00.784654+00:00"
+ },
+ {
+  "signal_id": 388639598,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 06:35:01.678117+00:00"
+ },
+ {
+  "signal_id": 388639602,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 06:45:00.623566+00:00"
+ },
+ {
+  "signal_id": 388639604,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 06:50:08.658975+00:00"
+ },
+ {
+  "signal_id": 388639615,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 07:20:06.628223+00:00"
+ },
+ {
+  "signal_id": 388639623,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 07:41:00.739624+00:00"
+ },
+ {
+  "signal_id": 388639635,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 08:10:22.728063+00:00"
+ },
+ {
+  "signal_id": 388639637,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 08:15:00.653199+00:00"
+ },
+ {
+  "signal_id": 388639639,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 08:20:06.655645+00:00"
+ },
+ {
+  "signal_id": 388639641,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 08:25:14.674760+00:00"
+ },
+ {
+  "signal_id": 388639643,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 08:30:00.658477+00:00"
+ },
+ {
+  "signal_id": 388639645,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 08:35:03.663949+00:00"
+ },
+ {
+  "signal_id": 388639647,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 08:40:09.653986+00:00"
+ },
+ {
+  "signal_id": 388639657,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 09:06:00.685840+00:00"
+ },
+ {
+  "signal_id": 388639659,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 09:10:00.629921+00:00"
+ },
+ {
+  "signal_id": 388639661,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 09:15:00.634095+00:00"
+ },
+ {
+  "signal_id": 388639671,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 09:50:00.661327+00:00"
+ },
+ {
+  "signal_id": 388639673,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 09:55:03.652872+00:00"
+ },
+ {
+  "signal_id": 388639675,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 10:00:10.714820+00:00"
+ },
+ {
+  "signal_id": 388639677,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 10:05:17.677625+00:00"
+ },
+ {
+  "signal_id": 388639681,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 10:15:05.624508+00:00"
+ },
+ {
+  "signal_id": 388639683,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 10:20:16.679033+00:00"
+ },
+ {
+  "signal_id": 388639685,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 10:25:26.679532+00:00"
+ },
+ {
+  "signal_id": 388639687,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 10:30:00.653511+00:00"
+ },
+ {
+  "signal_id": 388639689,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 10:35:00.625176+00:00"
+ },
+ {
+  "signal_id": 388639691,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 10:40:00.625561+00:00"
+ },
+ {
+  "signal_id": 388639693,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 10:45:07.631906+00:00"
+ },
+ {
+  "signal_id": 388639695,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 10:50:15.666447+00:00"
+ },
+ {
+  "signal_id": 388639699,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 11:01:00.662102+00:00"
+ },
+ {
+  "signal_id": 388639701,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 11:06:00.727990+00:00"
+ },
+ {
+  "signal_id": 388639704,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 11:15:02.625792+00:00"
+ },
+ {
+  "signal_id": 388639706,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 11:20:08.670847+00:00"
+ },
+ {
+  "signal_id": 388639712,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 11:35:29.755189+00:00"
+ },
+ {
+  "signal_id": 388639716,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 11:45:03.665346+00:00"
+ },
+ {
+  "signal_id": 388639718,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 11:50:00.635701+00:00"
+ },
+ {
+  "signal_id": 388639720,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 11:55:02.624652+00:00"
+ },
+ {
+  "signal_id": 388639722,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 12:00:08.629999+00:00"
+ },
+ {
+  "signal_id": 388639724,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 12:05:15.668842+00:00"
+ },
+ {
+  "signal_id": 388639734,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-21 12:35:01.657175+00:00"
+ },
+ {
+  "signal_id": 388639736,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-21 12:40:00.689336+00:00"
+ },
+ {
+  "signal_id": 388639738,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-21 12:45:11.672435+00:00"
+ },
+ {
+  "signal_id": 388639740,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-21 12:50:21.728910+00:00"
+ },
+ {
+  "signal_id": 388639742,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-21 12:55:30.733953+00:00"
+ },
+ {
+  "signal_id": 388639752,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 13:20:10.731102+00:00"
+ },
+ {
+  "signal_id": 388639754,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-21 13:25:18.718357+00:00"
+ },
+ {
+  "signal_id": 388639758,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 13:30:00.679334+00:00"
+ },
+ {
+  "signal_id": 388639762,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 13:40:11.656930+00:00"
+ },
+ {
+  "signal_id": 388639764,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 13:45:00.740557+00:00"
+ },
+ {
+  "signal_id": 388639768,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 13:55:10.653314+00:00"
+ },
+ {
+  "signal_id": 388639774,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 14:10:04.642085+00:00"
+ },
+ {
+  "signal_id": 388639778,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 14:20:00.684304+00:00"
+ },
+ {
+  "signal_id": 388639788,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 14:50:30.709412+00:00"
+ },
+ {
+  "signal_id": 388639790,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 14:56:00.698733+00:00"
+ },
+ {
+  "signal_id": 388639792,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 15:00:00.656478+00:00"
+ },
+ {
+  "signal_id": 388639794,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 15:05:00.651716+00:00"
+ },
+ {
+  "signal_id": 388639798,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 15:15:18.715162+00:00"
+ },
+ {
+  "signal_id": 388639800,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 15:20:25.689401+00:00"
+ },
+ {
+  "signal_id": 388639804,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-21 23:21:33.565306+00:00"
+ },
+ {
+  "signal_id": 388639824,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-22 02:36:00.720307+00:00"
+ },
+ {
+  "signal_id": 388639825,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-22 02:45:30.873019+00:00"
+ },
+ {
+  "signal_id": 388639826,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-22 02:51:00.692531+00:00"
+ },
+ {
+  "signal_id": 388639827,
+  "symbol": "XAUUSD",
+  "dir": "SELL",
+  "created_at": "2026-08-22 02:58:24.526551+00:00"
+ },
+ {
+  "signal_id": 388639853,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 00:05:19.593244+00:00"
+ },
+ {
+  "signal_id": 388639855,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 00:10:27.628572+00:00"
+ },
+ {
+  "signal_id": 388639882,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 01:50:00.575348+00:00"
+ },
+ {
+  "signal_id": 388639886,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 02:00:14.711128+00:00"
+ },
+ {
+  "signal_id": 388639888,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 02:05:23.676476+00:00"
+ },
+ {
+  "signal_id": 388639890,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 02:10:00.576192+00:00"
+ },
+ {
+  "signal_id": 388639892,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 02:15:06.572523+00:00"
+ },
+ {
+  "signal_id": 388639894,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 02:20:00.658838+00:00"
+ },
+ {
+  "signal_id": 388639898,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 02:30:10.655000+00:00"
+ },
+ {
+  "signal_id": 388639906,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 02:57:37.499252+00:00"
+ },
+ {
+  "signal_id": 388639910,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 03:07:35.745829+00:00"
+ },
+ {
+  "signal_id": 388639912,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 03:13:08.253455+00:00"
+ },
+ {
+  "signal_id": 388639914,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 03:18:07.499996+00:00"
+ },
+ {
+  "signal_id": 388639916,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 03:23:06.992168+00:00"
+ },
+ {
+  "signal_id": 388639918,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 03:28:06.822419+00:00"
+ },
+ {
+  "signal_id": 388639921,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 03:33:04.853882+00:00"
+ },
+ {
+  "signal_id": 388639923,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 03:38:08.401070+00:00"
+ },
+ {
+  "signal_id": 388639925,
+  "symbol": "XAUUSD",
+  "dir": "BUY",
+  "created_at": "2026-08-24 03:41:00.713255+00:00"
+ }
+]

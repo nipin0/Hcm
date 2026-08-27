@@ -79,6 +79,13 @@ class SignalData:
     pre_score: Optional[float] = None
     weight_scheme: Optional[str] = None
     position_in_range: Optional[float] = None
+    # 2026-08-27 C4 位置/极值溯源字段：复盘"高位开多/低位开空"止损归因用。
+    position_cycle: Optional[float] = None   # 长窗口极值分位[0,1]
+    position_z: Optional[float] = None       # (close-SMA)/ATR 偏离
+    ma_raw: Optional[float] = None            # 0-100 多头度
+    cycle_pos_blocked: bool = False          # 周期位置守卫是否拦截
+    extreme_reversal_blocked: bool = False   # 极值反转护栏是否拦截
+    threshold_passed: Optional[bool] = None  # 极值护栏是否放行
     trace_id: str = ""
     # ── Manual mirror (2026-07-20): 区分 open/close/modify/partial_close/add 的复合去重键 ──
     # 与 signal_id(ticket) 配合：同 ticket 的五类事件各自独立放行，不再因共用 ticket 被塌缩吞掉。
@@ -110,6 +117,10 @@ class SignalData:
     # 2026-08-25 极值分层裁决：hexp 极值区+动量回撤但该 symbol 已有同向保本持仓时置 True，
     # 不硬封方向，交由风控保本闸门最终裁决（放行+轻仓 / 拦截）。True 表示"极值追单候选"。
     extreme_pending: bool = False
+    # 2026-08-26 反向单：经 momentum_flip 封 NO_TRADE 后由 reverse_candidate 覆写方向产出的
+    # 接刀单。True 表示本信号为高位动量反转反向单，交由风控 _check_reverse_order 接刀护栏
+    # 裁决（按账户保本/持仓状态，未达条件则拒绝，防盲目接刀）。
+    reverse_order: bool = False
     produced_at: str = ""  # T0: 信号生产决策时刻 (UTC ISO)，供桥侧计算端到端延迟
     # 2026-08-10 修复：scheduler._run_shadow_hexp 构造 SignalData 时传入 created_at
     # （datetime），此前 SignalData 无此字段 → TypeError: __init__() got an unexpected
@@ -302,6 +313,9 @@ class SignalPublisher:
             "zone_tp_level": signal.zone_tp_level,
             # 2026-08-25 极值分层裁决标记：hexp 极值+保本追单候选，风控保本闸门消费
             "extreme_pending": getattr(signal, "extreme_pending", False),
+            # 2026-08-26 反向单标记：momentum_flip 封 NO_TRADE 后覆写方向产出的接刀单，
+            # 风控 _check_reverse_order 接刀护栏消费
+            "reverse_order": getattr(signal, "reverse_order", False),
             # ── P1a/P1c collaboration fields (consumed by mt5_bridge) ──
             "ai_sl_mult": signal.ai_sl_mult,
             "ai_tp_mult": signal.ai_tp_mult,
@@ -371,11 +385,14 @@ class SignalPublisher:
                         macro_snapshot_id, sentiment_snapshot_id,
                         fallback_reason, pre_score, weight_scheme,
                         position_in_range, regime,
+                        position_cycle, position_z, ma_raw,
+                        cycle_pos_blocked, extreme_reversal_blocked, threshold_passed,
                         zone_level, zone_type, zone_strength,
                         created_at, signal_status)
                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                                $12, $13, $14, $15, $16, $17, $18,
-                               $19, $20, $21, $22, $23, $24, $25, $26)
+                               $19, $20, $21, $22, $23, $24, $25, $26,
+                               $27, $28, $29, $30, $31, $32)
                        ON CONFLICT (signal_id) DO NOTHING""",
                     signal.signal_id,
                     signal.task_id if signal.task_id > 0 else None,
@@ -410,6 +427,12 @@ class SignalPublisher:
                     signal.weight_scheme or "",
                     signal.position_in_range,
                     signal.regime or "",
+                    signal.position_cycle,
+                    signal.position_z,
+                    signal.ma_raw,
+                    signal.cycle_pos_blocked,
+                    signal.extreme_reversal_blocked,
+                    signal.threshold_passed,
                     signal.zone_level if getattr(signal, "zone_level", 0) else None,
                     signal.zone_type or None,
                     signal.zone_strength if getattr(signal, "zone_strength", 0) else 0,

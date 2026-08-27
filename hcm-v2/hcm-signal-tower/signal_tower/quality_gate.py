@@ -61,6 +61,10 @@ CFG_FALLBACK: dict[str, Any] = {
     # 低于此值 → coupling_pass=False → scheduler 侧拦掉（HEXP 已过闸也不下单）。
     # AI 断联(c_ai=None)/解耦/未启用 → 透传纯 HEXP，coupling_pass 恒 True（兜底放行，不误杀）。
     # 与面板 ai.cpl.tier_low(现行=50) 对齐；置 0 即等效「不设门槛」（完全回退）。
+    # 2026-08-26 hexp 独立/解耦模式手数链动总开关：为 true 时，无 c_ai(纯 HEXP/
+    # 解耦/断联)的信号用 hp_score 经 lot_tier_for 选档进风控动态手数；
+    # false 时保持原 none 语义(不干预手数)。coupled 模式不受此开关影响(走 total 融合)。
+    "hexp.lot_tier_enabled": True,
     "hexp.coupling_pass_threshold": 50.0,
     # tier 门槛按真实 total 分布标定(2026-08-14)：total=w·hp+(1-w)·c_ai 实测≈50~65，
     # 原 85/70/60 全部高于分布上限 → 任何信号都 tier=none 被压制(全量不下单)。
@@ -223,6 +227,10 @@ def decide(
     enabled = _g(cfg, "ai.enabled")
     mode = str(cfg.get("ai.mode", "decoupled"))
     hp_score = float(snapshot.get("hp_score") or snapshot.get("scorecard_total") or 0.0)
+    # 2026-08-27 修正：手数链动严格使用 6 维综合分 scorecard_total（稳定），
+    # 禁止用 hp_score（强度单维，行情强度暴涨暴跌不稳定）决定动态手数档。
+    # 解耦/耦合两种模式的手数分档(low/mid/high)均由 scorecard_total 经 lot_tier_for 选出。
+    scorecard_total = float(snapshot.get("scorecard_total") or 0.0)
     k = float(snapshot.get("k") or 1.0)
     grade = str(snapshot.get("grade") or "C")
     passed = bool(snapshot.get("passed", False))
@@ -232,13 +240,28 @@ def decide(
 
     # 纯 HEXP 透传（未启用 / 解耦 / 无融合票 / 无方向）
     if not enabled or mode != "coupled" or c_ai is None or direction == "NO_TRADE":
+        # 【2026-08-26 手数链动】hexp 独立/解耦/无融合票模式也链动手数：
+        # 用 HEXP 自身评分 hp_score 经 lot_tier_for 选档（不再恒 none），
+        # 让「hexp 独立下单」也能进风控动态手数（risk.lot_multiplier_*）。
+        # 受 hexp.lot_tier_enabled 总开关控制；关闭时保持原 none 语义（不干预手数）。
+        _hexp_lot_enabled = _g(cfg, "hexp.lot_tier_enabled")
+        _lot_tier = ("none", False)
+        if _hexp_lot_enabled:
+            # 手数链动用 6 维综合分（scorecard_total），不用强度单维 hp_score
+            _tier = lot_tier_for(scorecard_total, cfg)
+            _lot_tier = (_tier, bool(_tier != "none"))
+        else:
+            _lot_tier = ("none", False)
         return {
             "action": "HOLD",
             "final_grade": grade,
-            "lot_tier": "none",
-            "total_score": hp_score,
+            "lot_tier": _lot_tier[0],
+            "total_score": round(hp_score, 2),
             "c_ai": None,
             "s_hp": hp_score,
+            "ai_opened": False,
+            "coupling_pass": True,   # hexp 独立：无耦合，兜底放行
+            "cpl_enabled": _lot_tier[1],  # 仅当 hexp 独立选档真正产出非 none 时才非"极弱压制"
             "c_ai_meta": meta,
         }
 
@@ -252,9 +275,10 @@ def decide(
     #    实现双信号融合的真正赋能（任一侧强信号都应能开仓）。
     action, final_grade = adjust_grade(c_ai / 100.0, grade, cfg, passed=passed)
 
-    # 2) 耦合总分 → 手数分档（low/mid/high/none）
+    # 2) 手数分档（low/mid/high/none）：统一用 6 维综合分 scorecard_total 决定，
+    #    禁止用耦合总分 total（含 hp_score 强度权重，不稳定）或 hp_score 单维。
     #    none 表示极弱（不发）；实际倍率由风控面板动态手数决定（链动需求）。
-    lot_tier = lot_tier_for(total, cfg) if _g(cfg, "ai.cpl.enabled") else "none"
+    lot_tier = lot_tier_for(scorecard_total, cfg) if _g(cfg, "ai.cpl.enabled") else "none"
 
     # 否决 → 手数分档置 none（不发信号）
     if action == "VETO":

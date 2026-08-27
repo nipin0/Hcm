@@ -325,6 +325,14 @@ CREATE TABLE hcm_signal.signals (
     pre_score         REAL,
     weight_scheme     VARCHAR(30),
     position_in_range REAL,
+    -- 2026-08-27 C4 位置/极值溯源字段：用于复盘"高位开多/低位开空"止损归因。
+    -- 这些字段让每条信号带当时周期位置快照，SQL 即可筛 pos_cycle>0.8 的止损单。
+    position_cycle        REAL,   -- 长窗口极值分位[0,1]：0=贴下沿 1=贴上沿（抗趋势稀释）
+    position_z            REAL,   -- (close-SMA)/ATR：偏离长周期中枢的 ATR 数
+    ma_raw               REAL,   -- 0-100 多头度（EMA 排列+斜率），>90=极高位
+    cycle_pos_blocked     BOOLEAN DEFAULT FALSE,  -- 是否被周期位置守卫拦截
+    extreme_reversal_blocked BOOLEAN DEFAULT FALSE, -- 是否被极值反转护栏拦截
+    threshold_passed      BOOLEAN DEFAULT TRUE,   -- 极值护栏是否放行（False=被硬封）
     created_at        TIMESTAMPTZ DEFAULT now(),
     updated_at        TIMESTAMPTZ DEFAULT now()
 );

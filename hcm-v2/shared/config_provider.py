@@ -161,6 +161,10 @@ class ConfigProviderV3:
         # L1: Local memory cache
         cached = self._cache.get(key)
         if cached and (time.time() - cached.ts) < self._local_ttl:
+            # 空串等同「未设置」（空串穿透防御，见 set/set_batch 空值归一）
+            if cached.value == "":
+                self._cache.pop(key, None)
+                return None
             return cached.value
 
         # L2: Redis
@@ -170,6 +174,10 @@ class ConfigProviderV3:
                 redis_ver = await self._redis.hget(CONFIG_VERSION_KEY, key)
                 if redis_val is not None:
                     val = redis_val.decode("utf-8") if isinstance(redis_val, bytes) else redis_val
+                    # 空串视为未设置：不缓存、不返回（避免面板空白框 + 引擎静默回退默认）
+                    if val == "":
+                        self._cache.pop(key, None)
+                        return None
                     ver = redis_ver.decode("utf-8") if isinstance(redis_ver, bytes) and redis_ver else ""
                     self._cache[key] = CacheEntry(value=val, version=ver)
                     return val
@@ -186,6 +194,10 @@ class ConfigProviderV3:
                     )
                 if row is not None and row[0] is not None:
                     val = str(row[0])
+                    # 空串视为未设置（防御历史数据残留空串穿透）
+                    if val == "":
+                        self._cache.pop(key, None)
+                        return None
                     self._cache[key] = CacheEntry(value=val, version=str(time.time()))
                     return val
             except Exception as exc:
@@ -313,6 +325,17 @@ class ConfigProviderV3:
             logger.error("Cannot write config: no PostgreSQL connection")
             return False
 
+        # 空值归一：空串 / 纯空白 / None 一律视为「未设置」。PG current_value 写 NULL、
+        # Redis 删除该键，使 L2/L3 与「未显式设置」语义一致。彻底根治「空串穿透」缺陷
+        # （空串被当成字面 current_value 落库 → 面板空白框 + 引擎静默回退默认）。
+        # 这是铁律「全部配置参数必须双写」的核心修复（2026-08-22）。
+        is_empty = (value is None) or (isinstance(value, str) and value.strip() == "")
+        # 【2026-08-25 配置污染修复】写入前统一 strip，杜绝跨平台 CRLF 混入值尾
+        # （如 hexp.mm.period 曾被存成 'M1\r' → time_frame 匹配不到数据 → MM 因子恒 0）。
+        # 归一化后的 value 用于 PG 与 Redis 双写，保证两端一致（治本防 split-brain）。
+        value = value.strip() if isinstance(value, str) and not is_empty else value
+        pg_value = None if is_empty else str(value)
+
         # 1. Write to PG (Source of Truth) — must succeed
         try:
             async with self._pg.acquire() as conn:
@@ -320,7 +343,7 @@ class ConfigProviderV3:
                     "INSERT INTO hcm_config.metadata (config_key, default_value, current_value, value_type, category) "
                     "VALUES ($1, $2, $3, 'string', 'scoring') "
                     "ON CONFLICT (config_key) DO UPDATE SET current_value=EXCLUDED.current_value, updated_at=now()",
-                    key, value, value,
+                    key, "" if is_empty else str(value), pg_value,
                 )
         except Exception as exc:
             logger.error("Config PG write failed for key=%s: %s", key, exc)
@@ -329,11 +352,18 @@ class ConfigProviderV3:
         # 2. Update Redis (L2 cache) — non-fatal, but evict stale value on failure
         if self._redis is not None:
             try:
-                version = str(time.time())
-                async with self._redis.pipeline() as pipe:
-                    pipe.hset(CONFIG_HASH_KEY, key, value)
-                    pipe.hset(CONFIG_VERSION_KEY, key, version)
-                    await pipe.execute()
+                if is_empty:
+                    # 空值 → 从 Redis 彻底删除，避免残留空串
+                    async with self._redis.pipeline() as pipe:
+                        pipe.hdel(CONFIG_HASH_KEY, key)
+                        pipe.hdel(CONFIG_VERSION_KEY, key)
+                        await pipe.execute()
+                else:
+                    version = str(time.time())
+                    async with self._redis.pipeline() as pipe:
+                        pipe.hset(CONFIG_HASH_KEY, key, str(value))
+                        pipe.hset(CONFIG_VERSION_KEY, key, version)
+                        await pipe.execute()
             except Exception as exc:
                 logger.warning(
                     "Redis cache write failed for key=%s (PG is source of truth): %s",
@@ -347,7 +377,10 @@ class ConfigProviderV3:
                     pass
 
         # 3. Update local cache immediately
-        self._cache[key] = CacheEntry(value=value, version=str(time.time()))
+        if is_empty:
+            self._cache.pop(key, None)
+        else:
+            self._cache[key] = CacheEntry(value=str(value), version=str(time.time()))
 
         # 4. Broadcast invalidation (non-fatal)
         if self._redis is not None:
@@ -356,7 +389,7 @@ class ConfigProviderV3:
             except Exception as exc:
                 logger.warning("Config invalidation publish failed for key=%s: %s", key, exc)
 
-        logger.info("Config key=%s updated to value=%s", key, value[:50])
+        logger.info("Config key=%s updated to value=%s", key, ("<empty/None→NULL>" if is_empty else str(value)[:50]))
         return True
 
     async def set_batch(self, items: dict, category: str = "scoring") -> dict:
@@ -377,22 +410,31 @@ class ConfigProviderV3:
             return {k: False for k in items}
 
         norm: dict = {}
+        empty_keys: set = set()
         for k, v in items.items():
-            norm[str(k)] = str(v)
+            if v is None or (isinstance(v, str) and v.strip() == ""):
+                empty_keys.add(str(k))
+            else:
+                norm[str(k)] = str(v)
 
         # 1. PG 批量 upsert（Source of Truth，必须成功）
+        #    空值键：current_value 写 NULL（语义=未设置）；非空键：current_value=值。
         try:
             async with self._pg.acquire() as conn:
-                await conn.executemany(
-                    "INSERT INTO hcm_config.metadata "
-                    "(config_key, default_value, current_value, value_type, category) "
-                    "VALUES ($1, $2, $3, 'string', $4) "
-                    "ON CONFLICT (config_key) DO UPDATE SET current_value=EXCLUDED.current_value, updated_at=now()",
-                    [(k, v, v, category) for k, v in norm.items()],
-                )
+                entries = [(k, v, v, category) for k, v in norm.items()]
+                for k in empty_keys:
+                    entries.append((k, "", None, category))
+                if entries:
+                    await conn.executemany(
+                        "INSERT INTO hcm_config.metadata "
+                        "(config_key, default_value, current_value, value_type, category) "
+                        "VALUES ($1, $2, $3, 'string', $4) "
+                        "ON CONFLICT (config_key) DO UPDATE SET current_value=EXCLUDED.current_value, updated_at=now()",
+                        entries,
+                    )
         except Exception as exc:
             logger.error("Config PG batch write failed: %s", exc)
-            return {k: False for k in norm}
+            return {k: False for k in items}
 
         # 2. Redis（L2 缓存，非致命；失败则逐键清理避免 split-brain）
         if self._redis is not None:
@@ -402,6 +444,9 @@ class ConfigProviderV3:
                     for k, v in norm.items():
                         pipe.hset(CONFIG_HASH_KEY, k, v)
                         pipe.hset(CONFIG_VERSION_KEY, k, version)
+                    for k in empty_keys:
+                        pipe.hdel(CONFIG_HASH_KEY, k)
+                        pipe.hdel(CONFIG_VERSION_KEY, k)
                     await pipe.execute()
             except Exception as exc:
                 logger.warning(
@@ -421,14 +466,19 @@ class ConfigProviderV3:
         for k, v in norm.items():
             self._cache[k] = CacheEntry(value=v, version=str(time.time()))
             result[k] = True
+        for k in empty_keys:
+            self._cache.pop(k, None)
+            result[k] = True
         if self._redis is not None:
             try:
                 for k in norm:
                     await self._redis.publish(INVALIDATION_CHANNEL, k)
+                for k in empty_keys:
+                    await self._redis.publish(INVALIDATION_CHANNEL, k)
             except Exception as exc:
                 logger.warning("Config batch invalidation publish failed: %s", exc)
 
-        logger.info("Config batch updated %d keys", len(norm))
+        logger.info("Config batch updated %d keys (%d empty→NULL)", len(norm), len(empty_keys))
         return result
 
     async def invalidate_local(self, key: str) -> None:

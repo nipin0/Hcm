@@ -5,7 +5,7 @@
  */
 import React from 'react';
 import { Box, Typography, Tooltip } from '@mui/material';
-import { C, cfgNum, fmt, fmtSigned, inferEntryMode } from './types';
+import { C, cfgNum, fmt, fmtSigned, inferEntryMode, directionDiag } from './types';
 import type { HexpSnapshot, HexpConfig } from './types';
 
 interface Props {
@@ -78,6 +78,12 @@ const MicroPanel: React.FC<Props> = ({ snap, cfg }) => {
   const inf = inferEntryMode(snap, cfg);
   const mmNorm = inf.mmNorm;
   const ms = momentumState(mmNorm, inf.aligned, accelTh);
+  // 2026-08-27 铁律对齐：方向指针/颜色统一用综合裁决 snap.direction（已 EMA 平滑+多因子，不抖），
+  // 禁止用 mm 符号驱动（mm 在 0 附近高频抖 → 指针闪烁缺陷）。dirSign: BUY=+1/SELL=-1/NO_TRADE=0。
+  const dirSign = snap?.direction === 'BUY' ? 1 : snap?.direction === 'SELL' ? -1 : 0;
+  const dirColor = dirSign > 0 ? C.up : dirSign < 0 ? C.down : C.textDim;
+  // 2026-08-27 方向诊断：把迟滞/死标签/翻转状态显式化（后端 direction_hysteresis 修复配套）
+  const diag = directionDiag(snap);
 
   /** -1~1 映射到 0~100 */
   const pos = (v: number): number => Math.min(100, Math.max(0, ((v + 1) / 2) * 100));
@@ -100,7 +106,7 @@ const MicroPanel: React.FC<Props> = ({ snap, cfg }) => {
           <Typography sx={{ fontSize: 11, color: C.textFaint }}>MM(M1)</Typography>
           <Typography
             sx={{
-              fontSize: 18, fontWeight: 800, color: ms.color,
+              fontSize: 18, fontWeight: 800, color: dirColor,
               fontVariantNumeric: 'tabular-nums', lineHeight: 1,
             }}
           >
@@ -110,7 +116,7 @@ const MicroPanel: React.FC<Props> = ({ snap, cfg }) => {
             <Box
               sx={{
                 px: 0.8, py: 0.15, borderRadius: 0.8, fontSize: 10, fontWeight: 700,
-                color: ms.color, border: `1px solid ${ms.color}66`, background: `${ms.color}14`,
+                color: dirColor, border: `1px solid ${dirColor}66`, background: `${dirColor}14`,
               }}
             >
               {ms.label}
@@ -140,10 +146,10 @@ const MicroPanel: React.FC<Props> = ({ snap, cfg }) => {
             <Box
               sx={{
                 position: 'absolute', top: 1,
-                left: `${pos(mmNorm)}%`,
+                left: `${pos(dirSign)}%`,
                 transform: 'translateX(-50%)',
                 width: 3, height: 18, borderRadius: 1.5,
-                background: ms.color, boxShadow: `0 0 8px ${ms.color}`,
+                background: dirColor, boxShadow: `0 0 8px ${dirColor}`,
                 transition: 'left .4s ease',
               }}
             />
@@ -151,7 +157,24 @@ const MicroPanel: React.FC<Props> = ({ snap, cfg }) => {
         </Box>
         <Typography sx={{ fontSize: 9.5, color: C.textFaint }}>
           原始 mm={snap ? snap.mm.toExponential(2) : '—'} · 归一尺度 {fmt(scale, 4)}
+          （mm 仅作强度，方向以综合 direction 为准）
         </Typography>
+        {/* 2026-08-27 方向诊断：迟滞/死标签/翻转状态显式化 */}
+        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.6, mt: 0.8, flexWrap: 'wrap' }}>
+          <Tooltip title={diag.desc} arrow>
+            <Box
+              sx={{
+                px: 0.8, py: 0.15, borderRadius: 0.8, fontSize: 10, fontWeight: 700,
+                color: diag.color, border: `1px solid ${diag.color}66`, background: `${diag.color}14`,
+              }}
+            >
+              {diag.tag}
+            </Box>
+          </Tooltip>
+          <Typography sx={{ fontSize: 10, color: C.textDim, fontVariantNumeric: 'tabular-nums' }}>
+            dir_sum={fmt(snap?.dir_sum ?? 0, 2)} · 上次 {snap?.prev_direction ?? '—'}
+          </Typography>
+        </Box>
       </Box>
 
       {/* 入场模式推断 */}

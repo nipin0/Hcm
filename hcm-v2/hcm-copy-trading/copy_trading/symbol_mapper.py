@@ -90,8 +90,10 @@ class SymbolMapper:
         self._db = db_pool
         self._redis = redis_client
 
-        # Primary hash: (master_account_id, master_symbol) → SymbolMapping
-        self._mappings: dict[tuple, SymbolMapping] = {}
+        # Primary hash: master_symbol → SymbolMapping（精确匹配按品种名索引）。
+        # 注意：当前数据模型无账户维度（DB 表仅有 master_broker/follower_broker），
+        # 故精确映射未按 master_account_id 隔离；按账户隔离需 DB 加 account 字段。
+        self._mappings: dict[str, SymbolMapping] = {}
 
         # Regex mappings (evaluated in priority order when exact fails)
         self._regex_mappings: list[SymbolMapping] = []
@@ -159,15 +161,15 @@ class SymbolMapper:
         mapping = self._mappings.get(symbol)
         if mapping is not None:
             return self._apply_mapping(symbol, mapping)
-        if mapping is not None:
-            return self._apply_mapping(symbol, mapping)
 
         # 3. Try regex patterns
+        # BUG 修复：原代码在此按 rm.master_account_id / rm.follower_account_id 过滤，
+        # 但 SymbolMapping 数据类并无这两个字段（DB 表 hcm_copy.symbol_mappings 亦无
+        # account 维度，仅 master_broker/follower_broker），一旦配置了 regex 映射、
+        # 精确匹配 miss 进入此循环即抛 AttributeError，被上游 try 捕获后跟单失败。
+        # 精确匹配(上方)本就未按账户过滤，此处删除 account 过滤保持语义一致
+        # （按 broker 隔离的完整实现需 DB 加 account 字段，属数据契约变更，另行评估）。
         for rm in self._regex_mappings:
-            if rm.master_account_id not in (0, master_account_id):
-                continue
-            if rm.follower_account_id not in (0, follower_account_id):
-                continue
             result = self._apply_regex_mapping(symbol, rm)
             if result is not None:
                 return result
@@ -259,7 +261,7 @@ class SymbolMapper:
                 "ORDER BY match_priority ASC"
             )
 
-            new_mappings: dict[tuple, SymbolMapping] = {}
+            new_mappings: dict[str, SymbolMapping] = {}
             new_regex: list[SymbolMapping] = []
 
             for row in rows:

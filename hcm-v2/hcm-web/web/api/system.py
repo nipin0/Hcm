@@ -2972,18 +2972,31 @@ def create_system_router(
             vv = v.decode() if isinstance(v, bytes) else v
             decoded[kk] = vv
         to_set = {}
+        to_del = {}
         for r in rows:
             key = r["config_key"]
-            pg_v = "" if r["v"] is None else str(r["v"])
+            if r["v"] is None:
+                # PG 两侧皆空 → 该键在 PG 中未显式设置。禁止把空串写进 Redis（空串穿透
+                # Bug 根因）；改为清理 Redis 中该键残留值（若存在），使其与 PG 的「未设置」一致。
+                redis_v0 = decoded.get(key)
+                if redis_v0 is not None and str(redis_v0).strip() != "":
+                    to_del[key] = str(redis_v0)
+                    res["drifts"].append({
+                        "key": key,
+                        "pg": None,
+                        "redis": str(redis_v0),
+                    })
+                continue
+            pg_v = str(r["v"])
             redis_v = decoded.get(key)
             if redis_v is None or str(redis_v).strip() != pg_v.strip():
-                to_set[key] = "" if r["v"] is None else str(r["v"])
+                to_set[key] = pg_v
                 res["drifts"].append({
                     "key": key,
                     "pg": pg_v,
                     "redis": None if redis_v is None else str(redis_v),
                 })
-        if dry_run or not to_set:
+        if dry_run or (not to_set and not to_del):
             return res
         try:
             version = str(_t.time())
@@ -2991,13 +3004,21 @@ def create_system_router(
                 for k, v in to_set.items():
                     pipe.hset("hcm:config:v2", k, v)
                     pipe.hset("hcm:config:version", k, version)
+                for k in to_del:
+                    pipe.hdel("hcm:config:v2", k)
+                    pipe.hdel("hcm:config:version", k)
                 await pipe.execute()
             for k in to_set:
                 try:
                     await redis_client.raw.publish("hcm:config:invalidate", k)
                 except Exception:
                     pass
-            res["calibrated"] = len(to_set)
+            for k in to_del:
+                try:
+                    await redis_client.raw.publish("hcm:config:invalidate", k)
+                except Exception:
+                    pass
+            res["calibrated"] = len(to_set) + len(to_del)
         except Exception as exc:
             res["errors"].append("写回 Redis 失败: %s" % exc)
         return res
@@ -3064,9 +3085,27 @@ def create_system_router(
                         key = f"close.{s}.{suf}"
                         if await rc.raw.hget("hcm:config:v2", key) is None:
                             val = SESSION_DEFAULTS[s][suf]
-                            await rc.raw.hset("hcm:config:v2", key, str(val).lower() if isinstance(val, bool) else str(val))
+                            strval = str(val).lower() if isinstance(val, bool) else str(val)
+                            # 双写（PG SoT + Redis L2 + PUB）：单写 Redis 会在 Redis 重启/
+                            # 校准覆盖后丢失（空串穿透同类缺陷）。铁律 5.2 禁止单端直写。
+                            if db_pool is not None and db_pool.is_initialized:
+                                try:
+                                    await db_pool.execute(
+                                        "INSERT INTO hcm_config.metadata "
+                                        "(config_key, default_value, current_value, value_type, category) "
+                                        "VALUES ($1, $2, $3, 'string', 'close') "
+                                        "ON CONFLICT (config_key) DO UPDATE SET current_value=EXCLUDED.current_value, updated_at=now()",
+                                        key, strval, strval,
+                                    )
+                                except Exception as _pgerr:
+                                    logger.warning("reseed_session_config PG write failed key=%s: %s", key, _pgerr)
+                            await rc.raw.hset("hcm:config:v2", key, strval)
+                            try:
+                                await rc.raw.publish("hcm:config:invalidate", key)
+                            except Exception:
+                                pass
                             cnt += 1
-                applied.append(f"reseed_session_config: 回填 {cnt} 个会话系数键")
+                applied.append(f"reseed_session_config: 回填 {cnt} 个会话系数键（PG+Redis 双写）")
                 succeeded.add("reseed_session_config")
             except Exception as exc:
                 applied.append(f"reseed_session_config: 失败 {exc}")
@@ -4409,8 +4448,25 @@ def create_system_router(
                     risk_msg += f" (score_tier_low={tier_low} 过高!)"
                     risk_fix = "lower_risk_score_tier_low"
                 if auto_heal and risk_fix == "lower_risk_score_tier_low":
+                    # 双写（PG SoT + Redis L2 + PUB）：单写 Redis 会在校准/重启后被 PG 旧值
+                    # 覆盖（「改了又复原」）。铁律 5.2 禁止单端直写。
+                    if db_pool is not None and db_pool.is_initialized:
+                        try:
+                            await db_pool.execute(
+                                "INSERT INTO hcm_config.metadata "
+                                "(config_key, default_value, current_value, value_type, category) "
+                                "VALUES ($1, $2, $3, 'string', 'risk') "
+                                "ON CONFLICT (config_key) DO UPDATE SET current_value=EXCLUDED.current_value, updated_at=now()",
+                                "risk.score_tier_low", "0.10", "0.10",
+                            )
+                        except Exception as _pgerr:
+                            logger.warning("lower_risk_score_tier_low PG write failed: %s", _pgerr)
                     await redis_client.hset("hcm:config:v2", "risk.score_tier_low", "0.10")
-                    risk_msg += " → 已自动修复为0.10"
+                    try:
+                        await redis_client.publish("hcm:config:invalidate", "risk.score_tier_low")
+                    except Exception:
+                        pass
+                    risk_msg += " → 已自动修复为0.10（PG+Redis 双写）"
                     risk_ok = True; risk_fix = ""
         except Exception as e:
             risk_ok = False; risk_msg = str(e)[:80]; risk_fix = "restart_risk_engine"

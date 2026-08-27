@@ -36,10 +36,6 @@ HEXP_KEYS: dict[str, Any] = {
     "hexp.k.max": 3.0,
     "hexp.k.alpha": 0.8,
     "hexp.k.beta": 0.4,
-    "hexp.k.state_trend": 2.0,
-    "hexp.k.state_range": 0.65,
-    "hexp.k.state_transition": 1.0,
-    "hexp.k.state_fade": 2.5,
     # 六因子 + 微结构动量基础权重
     "hexp.factor.adx_weight": 25.0,
     "hexp.factor.er_weight": 25.0,
@@ -142,10 +138,18 @@ HEXP_KEYS: dict[str, Any] = {
     "hexp.exec.vol_scale_max": 1.0,
     # 方向判定
     "hexp.direction_min_score": 0.20,
+    # 2026-08-27 方向迟滞死区：dir_sum 在 0 附近微动跨阈值翻转 → direction 闪烁（防抖）。
+    "hexp.direction_hysteresis": 0.06,
+    # 2026-08-27 方向强制翻转阈值：|dir_sum|>=此值或 MTF 周期共识反向 → 绕过死区立即翻，
+    # 避免迟滞"死黏"首次方向（如下跌趋势被位置因子顶在小幅 → 永久 BUY 死标签）。
+    "hexp.direction_hysteresis_strong": 0.20,
     # 位置因子（BUG-1 修复 2026-08-13）：Donchian 分位→均值回归方向因子参与方向裁决，
     # 底部托 BUY / 顶部压 SELL / 中部无影响，根治"高多低空"。
     "hexp.pos_factor.enabled": True,
     "hexp.pos_factor.weight": 0.15,
+    # 2026-08-27 位置因子趋势态降权系数：趋势/反转态下 pos_factor 权重乘此值（默认 0.25），
+    # 避免下跌趋势 pos_cycle 低位强推 BUY 与真实 SELL 反向（死标签根因）。
+    "hexp.pos_factor.trend_scale": 0.25,
     # 精确信号闸门：最低可下单分级（S/A/B/C）。低于此级只落库观测、不产交易方向。
     "hexp.min_grade": "C",
     # 部署意图档位：一键诊断 min_grade_drift 节点的"锚点"。换档位只改此键即可，
@@ -384,6 +388,113 @@ def create_hexp_router(
         except Exception as exc:
             logger.error("Hexp signal read failed: %s", exc)
             return {"code": "WB_HEXP_004", "data": None, "message": str(exc)}
+
+    # ── 假设方向预演（2026-08-27）：基于 live 快照套用 direction 裁决链推演方向 + 死标签诊断 ──
+    def _hypothesis_preview(snapshot: dict) -> dict:
+        """把 live 快照喂入已落地的 direction 裁决链（4 步），推演预演方向并指出死标签/漏翻风险。"""
+        prev = snapshot.get("prev_direction", "NO_TRADE")
+        try:
+            dir_sum = float(snapshot.get("dir_sum") or 0.0)
+        except (TypeError, ValueError):
+            dir_sum = 0.0
+        factors = snapshot.get("dir_sum_factors", {}) or {}
+        period_states = snapshot.get("period_states", {}) or {}
+        # 候选方向（端点仅做方向预演，忽略全弱→NO_TRADE 简化）
+        if abs(dir_sum) < 0.01:
+            cand = "NO_TRADE"
+        elif dir_sum > 0:
+            cand = "BUY"
+        else:
+            cand = "SELL"
+        # 强制翻转条件：|dir_sum|>=strong(0.20) 或 MTF 周期共识反向
+        strong = abs(dir_sum) >= 0.20
+        _cons = [s for s in period_states.values() if s in ("TREND_UP", "TREND_DOWN")]
+        _opp = sum(
+            1 for s in _cons
+            if (s == "TREND_UP" and prev == "SELL") or (s == "TREND_DOWN" and prev == "BUY")
+        )
+        consensus = len(_cons) > 0 and _opp >= max(1, len(_cons) // 2)
+        predicted = cand
+        if prev in ("BUY", "SELL") and cand in ("BUY", "SELL") and cand != prev:
+            predicted = cand if (strong or consensus) else prev  # 强反转/共识→翻；否则死区维持
+        # 死标签风险：prev 与实时趋势相反且被维持
+        _down = sum(1 for s in period_states.values() if s == "TREND_DOWN")
+        _up = sum(1 for s in period_states.values() if s == "TREND_UP")
+        dead_label = (
+            (prev == "BUY" and _down >= max(1, _up) and predicted == "BUY")
+            or (prev == "SELL" and _up >= max(1, _down) and predicted == "SELL")
+        )
+        flip_blocked = (
+            prev in ("BUY", "SELL") and cand in ("BUY", "SELL")
+            and cand != predicted and not strong and not consensus
+        )
+        return {
+            "symbol": snapshot.get("symbol"),
+            "prev_direction": prev,
+            "predicted_direction": predicted,
+            "candidate_direction": cand,
+            "dir_sum": round(dir_sum, 4),
+            "dir_sum_factors": factors,
+            "strong_reverse": strong,
+            "consensus_reverse": consensus,
+            "dead_label_risk": "HIGH" if dead_label else "LOW",
+            "flip_blocked": "HIGH" if flip_blocked else "LOW",
+            "period_states": period_states,
+            "note": ("死标签风险：prev 与实时趋势反向且被迟滞维持"
+                     if dead_label else ("方向被死区黏住（漏翻）" if flip_blocked else "方向稳定/正常翻转")),
+        }
+
+    @router.get("/api/v1/hexp/hypothesis/{symbol}")
+    async def get_hexp_hypothesis(
+        symbol: str,
+        request: Request,
+        user: HTTPAuthorizationCredentials = Depends(auth_handler.require_auth),
+    ):
+        """假设方向预演：读取 live 快照并推演预演方向（含死标签/漏翻诊断）。"""
+        if redis_client is None or not getattr(redis_client, "is_initialized", False):
+            return {"code": "SERVICE_NOT_READY", "data": None, "message": "Redis not available"}
+        try:
+            raw = await redis_client.get(f"hcm:live:hexp:{symbol.upper()}")
+            if not raw:
+                return {"code": 0, "data": None, "message": "no_signal_yet"}
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            snap = json.loads(raw)
+            snap["symbol"] = symbol.upper()
+            return {"code": 0, "data": _hypothesis_preview(snap), "message": "ok"}
+        except Exception as exc:
+            logger.error("Hexp hypothesis failed: %s", exc)
+            return {"code": "WB_HEXP_HYP_001", "data": None, "message": str(exc)}
+
+    @router.get("/api/v1/hexp/hypothesis/scan")
+    async def scan_hexp_hypothesis(
+        request: Request,
+        user: HTTPAuthorizationCredentials = Depends(auth_handler.require_auth),
+    ):
+        """扫描全部 live 品种，返回死标签/漏翻风险榜（自动选品种做预演）。"""
+        if redis_client is None or not getattr(redis_client, "is_initialized", False):
+            return {"code": "SERVICE_NOT_READY", "data": None, "message": "Redis not available"}
+        try:
+            keys = await redis_client.keys("hcm:live:hexp:*")
+            risks = []
+            for k in keys:
+                key = k.decode("utf-8") if isinstance(k, bytes) else k
+                raw = await redis_client.get(key)
+                if not raw:
+                    continue
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                snap = json.loads(raw)
+                sym = key.split("hcm:live:hexp:")[-1]
+                snap["symbol"] = sym
+                hp = _hypothesis_preview(snap)
+                if hp["dead_label_risk"] == "HIGH" or hp["flip_blocked"] == "HIGH":
+                    risks.append(hp)
+            risks.sort(key=lambda x: (x["dead_label_risk"] != "HIGH", x["flip_blocked"] != "HIGH"))
+            return {"code": 0, "data": {"count": len(risks), "risks": risks}, "message": "ok"}
+        except Exception as exc:
+            logger.error("Hexp hypothesis scan failed: %s", exc)
+            return {"code": "WB_HEXP_HYP_002", "data": None, "message": str(exc)}
 
     # ── AI 信号质量评分快照（和乘幂面板三分数卡数据源）──
     @router.get("/api/v1/hexp/ai/{symbol}")

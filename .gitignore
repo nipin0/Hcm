@@ -30,3 +30,27 @@ hcm-v2/tools/bridge_launcher.lock
 *.bak
 hcm-v2/tools/_artifacts/snapshots/
 hcm-v2/tools/_artifacts/_scratch_*
+
+# ===== AI model weights / calibrators (auto-retrained & shadow-elected at runtime) =====
+# 模型由 auto_retrain.py 训练 + 影子选举写入 ai.lm.model_path，无需进版本库（避免仓库膨胀/泄版本）。
+hcm-v2/tools/models/*.pkl
+hcm-v2/tools/models/lgbm_quality_v*.txt
+hcm-v2/tools/_artifacts/lgbm_quality_v*.txt
+hcm-v2/tools/_artifacts/lgbm_state.pkl
+hcm-v2/tools/_artifacts/features*.csv
+hcm-v2/tools/_artifacts/labels*.csv
+
+# ===== session debug / scratch leftovers (never commit) =====
+_diag*.txt
+hcm-v2/_diag*.txt
+hcm-v2/tools/_tmp*.py
+hcm-v2/tools/_tmp*.txt
+$null
+disp*.txt
+risk_*.txt
+_scratch/
+*.bak_*
+铁律.md
+docs/hexp_direction
+hcm-v2/hcm-web/web/api/*.bak_*
+hcm-v2/shared/*.bak_*
