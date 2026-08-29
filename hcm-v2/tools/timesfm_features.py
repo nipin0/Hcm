@@ -470,7 +470,14 @@ def cmd_extract(args) -> None:
                    if i + 1 >= CTX_BARS]
         if not targets:
             raise SystemExit("[fatal] 指定区间内无可用 bar")
-        log(f"extract bars={len(targets)}")
+        # 成本提示：每根 bar 需 1 次主周期推理 + 至多 4 次多周期推理（mtf_resonance），
+        # 实测约 1.5s/根 —— 全量约 1.7 万根需 7 小时。故支持等间隔抽样先做小样本验证。
+        raw_targets = len(targets)
+        estride = max(1, int(args.extract_stride))
+        if estride > 1:
+            targets = targets[::estride]
+        log(f"extract bars={len(targets)} (窗口内 {raw_targets} 根，stride={estride})；"
+            f"预计耗时 ~{len(targets) * 1.5 / 60:.1f} 分钟")
 
         model = load_model(args.model_dir, args.repo, args.normalize_inputs)
 
@@ -614,6 +621,9 @@ def main() -> None:
     ap.add_argument("--pca-end", default=None)
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
+    ap.add_argument("--extract-stride", type=int, default=1,
+                    help="抽取时按每 N 根 bar 等间隔抽样（默认 1=全量）。"
+                         "全量约 7 小时，建议先用较大 stride 小样本验证")
     ap.add_argument("--create-table", action="store_true",
                     help="建表 hcm_ai.timesfm_features（缺省不建，避免误改库）")
     ap.add_argument("--dry-run", action="store_true", help="只打印不落库")
