@@ -17,7 +17,6 @@ import {
   CellTower,
   CloudDownload,
   Psychology,
-  Send,
   Shield,
   Cancel,
   ContentCopy,
@@ -41,15 +40,18 @@ const navGroups: NavGroup[] = [
     icon: <Dashboard />,
     basePath: '/dashboard',
     children: [
-      { label: '实时信号流', path: '/dashboard/realtime' },
+      // 【2026-08-28】移除「实时信号流」(/dashboard/realtime)、「校准时序」
+      // (/dashboard/calibration-timeline)、「统计分析」(/dashboard/statistics) 三个菜单项。
       { label: '和乘幂信号状态', path: '/hexp/dashboard' },
       { label: '信号漏斗', path: '/dashboard/funnel' },
-      { label: '校准时序', path: '/dashboard/calibration-timeline' },
       { label: '仓位与盈亏', path: '/dashboard/positions' },
-      { label: '统计分析', path: '/dashboard/statistics' },
       { label: '系统健康', path: '/dashboard/health' },
       { label: '外部因子', path: '/dashboard/factors' },
-      { label: '品种对比', path: '/dashboard/compare' },
+      // 【2026-08-28】移除「品种对比」(/dashboard/compare) 菜单项（页面已下线）。
+      // 【2026-08-29】AI 中枢监控（LightGBM 三头 + DeepSeek 效果，只读）。
+      //   注：菜单按用户要求挂在本组，但路由前缀为 /engine，故访问时分组高亮
+      //   会落在「推理引擎」（Layout 第 185 行按 basePath startsWith 判定）。
+      { label: 'AI 中枢监控', path: '/engine/ai-ops' },
     ],
   },
   {
@@ -71,10 +73,10 @@ const navGroups: NavGroup[] = [
     basePath: '/signal-tower',
     children: [
       { label: '信号模式与市况', path: '/signal-tower/mode' },
-      { label: '评分阈值（公用）', path: '/signal-tower/threshold' },
+      // 【2026-08-28】移除「评分阈值（公用）」菜单项（页面 Threshold.tsx 已删除）。
       { label: 'Prompt 模板', path: '/signal-tower/prompt' },
       { label: '看门狗状态', path: '/signal-tower/watchdog' },
-      { label: '品种级配置', path: '/signal-tower/symbol-config' },
+      // 【2026-08-28】移除「品种级配置」(/signal-tower/symbol-config) 菜单项（页面已下线）。
     ],
   },
   {
@@ -97,14 +99,7 @@ const navGroups: NavGroup[] = [
       { label: '模型监控(PSI/漂移)', path: '/engine/model-monitor' },
     ],
   },
-  {
-    label: '分发',
-    icon: <Send />,
-    basePath: '/dispatch',
-    children: [
-      { label: '分发配置', path: '/dispatch' },
-    ],
-  },
+  // 【2026-08-28】移除「分发」整组（含子项「分发配置」/dispatch，页面已下线）。
   {
     label: '风控',
     icon: <Shield />,

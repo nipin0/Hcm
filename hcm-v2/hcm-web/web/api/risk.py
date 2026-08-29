@@ -235,9 +235,21 @@ def create_risk_router(
                     # 尽管 config_provider.set 已写 PG + Redis L2，此处再显式 hset 作为即时双写保险，
                     # 确保 signal-tower / mt5_bridge 直接读 Redis L2 时即时生效（不依赖 L2 TTL 回源延迟），
                     # 杜绝"配置中心改了但运行时仍读旧值 / 容器重建后双写丢失"的隐患。
+                    #
+                    # 【2026-08-28 P1-8】铁律 5.2「空值即未设置」：config_provider.set 已把
+                    # 空串/None 归一为 PG current_value=NULL + Redis HDEL。此处若无条件把
+                    # update.value 再 hset 回去，空串会被写回 Redis → PG=NULL 而 Redis=""
+                    # 永久分裂（面板显示空白、桥侧 float("") 崩溃或静默回退默认）。
+                    # 故仅当值为非空字符串时才做这次即时双写保险；空值交由 set() 的 HDEL 处理。
                     try:
-                        if redis_client is not None:
+                        if (redis_client is not None
+                                and update.value is not None
+                                and str(update.value).strip() != ""):
                             await redis_client.hset("hcm:config:v2", full_key, update.value)
+                        elif update.value is not None and str(update.value).strip() == "":
+                            # 双保险：确保空值提交后 Redis 侧确实无残留键（防历史脏值）
+                            if redis_client is not None:
+                                await redis_client.hdel("hcm:config:v2", full_key)
                     except Exception as rw_exc:
                         logger.debug("redis dual-write failed (non-fatal): %s", rw_exc)
                     # Broadcast invalidation so risk-engine immediately reloads

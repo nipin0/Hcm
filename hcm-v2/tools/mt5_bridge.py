@@ -1181,6 +1181,36 @@ def _detect_tp_lock_conflict(redis_conn, atr: float, lock_trigger: float) -> Non
         )
 
 
+# ── 账户可用性铁律（2026-08-28 新增）──
+# 模块级缓存：MT5 账号是否登录且可交易。由各路径统一读取，避免每次 IPC 调 account_info()。
+# 健康检查循环（每 30s）与消费前闸门（每 2s 现查）共同刷新；启动期由 discovery 结果初始化。
+# 任何 MT5 写操作（开仓/平仓）前必须过 mt5_trade_ready() 铁律：不可用则【硬失败】，绝不操作。
+MT5_TRADE_OK = True
+
+
+def mt5_trade_ready(mt5, force_check: bool = False) -> bool:
+    """账户可用性铁律（不可绕过的最后兜底）。
+
+    返回 False 的语义：终端未连 / 账号登出 / trade_allowed=False / account_info() 异常。
+    此时任何 MT5 写操作（开仓、平仓）都应立即中止，绝不下单/平仓——
+    账户状态未知或不可交易时操作风险极高（可能下到错误/冻结账号）。
+
+    force_check=True 时现查 account_info()（用于消费前高频关键路径，并顺带刷新缓存）；
+    否则读模块级缓存 MT5_TRADE_OK（高频路径如 sync_positions 用，零 IPC 开销）。
+    """
+    global MT5_TRADE_OK
+    if force_check:
+        try:
+            _ai = mt5.account_info()
+        except Exception as _aie:
+            log.warning("MT5 account_info() raised in trade-ready check: %s", _aie)
+            _ai = None
+        ok = bool(_ai) and bool(getattr(_ai, "trade_allowed", False))
+        MT5_TRADE_OK = ok
+        return ok
+    return MT5_TRADE_OK
+
+
 def place_mt5_order(mt5, signal_data, symbol, timeframe_str, redis_conn=None):
     """Place an order on MT5 based on signal data.
 
@@ -1194,6 +1224,14 @@ def place_mt5_order(mt5, signal_data, symbol, timeframe_str, redis_conn=None):
     Returns:
         Dict with code, message, mt5_ticket, filled_price, volume.
     """
+    # ── 账户可用性铁律（2026-08-28 新增）──
+    # 所有开仓路径（含 reconcile 补开、信号消费）的统一兜底闸门。账户不可用则硬失败返回，
+    # 绝不向未知/冻结账号下单。调用方收到 code=-1 应视为失败（不误判成功、留待重试/留流）。
+    if not mt5_trade_ready(mt5):
+        log.critical("MT5 account NOT trade-ready — place_mt5_order BLOCKED by trade-ready guard "
+                     "(code=-1, no order sent)")
+        return {"code": -1, "message": "MT5 account unavailable — order blocked by trade-ready guard",
+                "mt5_ticket": None, "filled_price": None, "volume": 0.0}
     sig_id = signal_data.get('signal_id', 0)
     direction = signal_data.get('direction', 'BUY')
     lot = float(signal_data.get('lot', 0.01))
@@ -1341,14 +1379,19 @@ def place_mt5_order(mt5, signal_data, symbol, timeframe_str, redis_conn=None):
         CLOSE_CONFIG_DEFAULTS["close.max_sl_atr_mult"],
     ) if redis_conn else CLOSE_CONFIG_DEFAULTS["close.max_sl_atr_mult"]
 
-    # SL: 仅当 AI/zone 路径未设置时，用 trailing_stop_distance 设初始宽保护
+    # SL: 仅当 AI/zone 路径未设置时，用【时段系数】设初始宽保护。
+    # _session_cfg_float 优先读 close.<session>.trailing_stop_distance（亚/欧/美盘独立，
+    #   已在 hcm:config:v2 配=2），回退 close.trailing_stop_distance，再回退 default 2.0。
+    # 主号/跟单号共用本函数 → 初值同口径、天然统一。
     if redis_conn and sl == 0:
         try:
             trailing_enabled = redis_conn.hget("hcm:config:v2", "close.trailing_stop_enabled")
             if trailing_enabled and trailing_enabled.lower() in ('true', '1'):
-                sl_mult_str = _session_cfg_float(redis_conn, "trailing_stop_distance", 2.0)
+                _sess = _current_session()
+                sl_mult_str = _session_cfg_float(
+                    redis_conn, "trailing_stop_distance", SESSION_DEFAULTS[_sess]["sl"])
                 if not sl_mult_str:
-                    log.warning("SL not applied: close.trailing_stop_distance not configured")
+                    log.warning("SL not applied: close.%s.trailing_stop_distance not configured", _sess)
                 else:
                     sl_mult = float(sl_mult_str)
                     sl_distance = atr * sl_mult
@@ -1431,20 +1474,23 @@ def place_mt5_order(mt5, signal_data, symbol, timeframe_str, redis_conn=None):
                     tp = (tick.ask + tp_distance) if direction == "BUY" else (tick.bid - tp_distance)
                     log.info("TP forced (ai_tp baseline=session): tp=%.3f (%.1fATR)", tp, _tp_baseline_atr)
                 else:
-                    tp_mult_str = _session_cfg_float(redis_conn, "tp_atr_multiplier", 3.0)
+                    _sess = _current_session()
+                    tp_mult_str = _session_cfg_float(
+                        redis_conn, "tp_atr_multiplier", SESSION_DEFAULTS[_sess]["tp"])
                     if not tp_mult_str:
-                        log.warning("TP not applied: close.tp_atr_multiplier not configured")
+                        log.warning("TP not applied: close.%s.tp_atr_multiplier not configured", _sess)
                     else:
                         tp_mult = float(tp_mult_str)
                         if tp_mult <= 0:
-                            log.info("TP disabled: close.tp_atr_multiplier <= 0")
+                            log.info("TP disabled: close.%s.tp_atr_multiplier <= 0", _sess)
                         else:
                             tp_distance = atr * tp_mult
                             if direction == "BUY":
                                 tp = tick.ask + tp_distance
                             else:
                                 tp = tick.bid - tp_distance
-                            log.info("TP forced: tp=%.3f (%.1fATR=%.2f pts)", tp, tp_mult, tp_distance)
+                            log.info("TP forced (session %s): tp=%.3f (%.1fATR=%.2f pts)",
+                                     _sess, tp, tp_mult, tp_distance)
         except Exception as exc:
             log.error(f"TP calc failed: {exc}")
 
@@ -1669,7 +1715,16 @@ async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
     # 防止任一账号（含跟单号）无限开仓。复用全局配置，与现有风控阈值一致。
     if _dir in ("BUY", "SELL"):
         try:
-            _cap_val = _get_close_config(redis_conn, "risk_max_open_positions", 3.0)
+            # 【2026-08-28 口径统一（风控为主）】账号维度最大持仓数改用与风控引擎
+            # 同一真源 risk.max_concurrent_signals（用户裁定：统一口径、风控为主）。
+            # 原两键两值：桥读 risk_max_open_positions(=3)、风控读
+            # risk.max_concurrent_signals(=5)，同语义不同值 → 限仓口径不一致。
+            # 旧键保留为回退：风控键缺失/非法(<=0)时才使用，避免配置丢失时兜底失效。
+            # 注意：旧键仍在 shared/redis_client.py 的 CRITICAL_SAFETY_KEYS
+            # 启动自检清单内，待确认无回归后再决定是否清理。
+            _cap_val = _get_close_config(redis_conn, "risk.max_concurrent_signals", 0.0)
+            if _cap_val <= 0:
+                _cap_val = _get_close_config(redis_conn, "risk_max_open_positions", 3.0)
             _max_pos = int(_cap_val)
             if _max_pos > 0:
                 _pos_all = mt5.positions_get() or []
@@ -1801,6 +1856,13 @@ async def _force_close_positions(mt5, redis_conn, symbol: str, mode: str = "all"
     - 优先用 real_symbol(symbol) 转换后查（精确）
     - 兜底：查全量 positions，再按 real_symbol(symbol) 或 symbol 匹配
     """
+    # ── 账户可用性铁律（2026-08-28 新增）──
+    # 平仓路径统一兜底闸门：账户不可用则【硬失败】跳过平仓（持仓保留，不误平/不卡死），
+    # 恢复后下一轮正常平。绝不向未知/冻结账号发平仓指令（可能平错/平不掉）。
+    if not mt5_trade_ready(mt5):
+        log.critical("MT5 account NOT trade-ready — FORCE_CLOSE SKIPPED by trade-ready guard "
+                     "(positions retained)")
+        return 0
     real_sym = real_symbol(symbol) if symbol else ""
     try:
         # 根因修复(2026-07-27)：一律取【全量】持仓，绝不用 mt5.positions_get(symbol=...) 按名查询——
@@ -3053,6 +3115,7 @@ def _discover_account(terminal_path):
 async def main(dry_run=False):
     import asyncpg
     import redis as redis_py
+    global MT5_TRADE_OK  # 铁律缓存：main() 内多处刷新模块级变量
 
     pool = await asyncpg.create_pool(PG_DSN)
     redis_conn = redis_py.Redis.from_url(REDIS_URL, decode_responses=True)
@@ -3063,6 +3126,12 @@ async def main(dry_run=False):
     global ACCOUNT_ID_MODE, BRIDGE_GROUP, BRIDGE_LOCK_KEY
     global IS_MASTER, IS_FOLLOWER, FOLLOW_MASTERS, FOLLOW_LOT_MULT
     global BROKER_NAME, SYMBOL_MAP, ACCOUNT_IS_ACTIVE, ACCOUNT_STATUS_PG
+    # 【2026-08-28 熔断恢复修复】_FOLLOW_BASELINE_LAST_DAY / _follow_circuit_last_check
+    # 在 main 主循环内被赋值（行 4070 / 4077），若不在函数作用域顶层 global 声明，
+    # Python 会将其视作局部变量 → 读取时抛 UnboundLocalError（实测 07:00 每日触发
+    # "follower baseline record failed"），导致 bridge:follow:baseline:{account} 基准键
+    # 永不写入 → 熔断分母回退当前 balance（当日亏损后变小）→ 百分比放大 → 误触发熔断。
+    global _FOLLOW_BASELINE_LAST_DAY, _follow_circuit_last_check
 
     # ── 动态发现（禁用硬编码）：先连终端读实登账号，再反查 PG 得 account_id ──
     # 必须在抢锁/建组之前完成，因为锁键与消费组名都依赖发现到的 account_id / live login。
@@ -3325,6 +3394,9 @@ async def main(dry_run=False):
     ai = mt5.account_info()
     log.info("MT5 connected (reused from discovery) login=%s trade_allowed=%s",
              live_login, (ai.trade_allowed if ai else '?'))
+    # 启动期初始化铁律缓存：discovery 阶段已确认账号登录，直接据此置位（不默认 True），
+    # 避免启动 30s 内健康检查未跑、缓存误判可用。
+    MT5_TRADE_OK = bool(ai) and bool(getattr(ai, "trade_allowed", False))
 
     # Load initial klines for primary symbol — all timeframes (P2-7)
     for tf in all_timeframes:
@@ -3526,6 +3598,17 @@ async def main(dry_run=False):
                     if not info:
                         log.error("MT5 terminal disconnected — triggering full reconnect")
                         raise ConnectionError("MT5 terminal_info() returned None")
+                    # 铁律缓存刷新：终端连着 ≠ 账号可交易。额外查 account_info() 确认登录态与
+                    # trade_allowed，合并写模块级 MT5_TRADE_OK（供 mt5_trade_ready() 无 IPC 读取）。
+                    try:
+                        _ai = mt5.account_info()
+                    except Exception as _aie:
+                        log.warning("health-check account_info() raised: %s", _aie)
+                        _ai = None
+                    MT5_TRADE_OK = bool(_ai) and bool(getattr(_ai, "trade_allowed", False))
+                    if not MT5_TRADE_OK:
+                        log.error("MT5 account NOT trade-ready (account_info=%s) — trade-ready guard ACTIVE",
+                                  ('None' if _ai is None else f"trade_allowed={_ai.trade_allowed}"))
                 except asyncio.TimeoutError:
                     log.warning("MT5 terminal_info() timeout — skipping health check")
                 main._last_health_check = now  # type: ignore[attr-defined]
@@ -3563,6 +3646,32 @@ async def main(dry_run=False):
 
             # Check for risk-passed signals to execute orders (consumer group — new only)
             if now - last_risk > 2:
+                # ── MT5 实时可用性闸门（2026-08-28 修复）──
+                # 根因：消费组 group:<account_id> 仅标识"本桥在消费"，不保证 MT5 账号已登录/
+                # 可交易。若终端连着但账号登出(trade_allowed=False)或 account_info() 返回 None
+                # （意外断开），原逻辑仍 XREADGROUP 并 XACK 消费 → place_mt5_order 时
+                # symbol_info_tick=None 下单失败 → 信号被 ACK 永久丢失（"group 活着但 MT5 停了，
+                # 信号照吃不报"）。
+                # 修复：消费前先查 MT5 实时可用性，不可用则【根本不调用 XREADGROUP】，信号留在
+                # 流里（未被任何消费者读、未进 PEL）→ 账户恢复后下一轮正常消费执行，杜绝静默丢失。
+                # 用 XREADGROUP ">" 模式，任何被读的消息即进 PEL，故"不读"才是最安全的保留方式。
+                # 用 mt5_trade_ready(force_check=True) 现查并刷新模块级 MT5_TRADE_OK 缓存（供
+                # place_mt5_order / _force_close_positions 铁律兜底读取，零额外 IPC）。
+                _ai = mt5.account_info() if mt5 else None
+                _trade_ok = bool(_ai) and bool(getattr(_ai, "trade_allowed", False))
+                MT5_TRADE_OK = _trade_ok
+                if not _trade_ok:
+                    if now - getattr(main, "_mt5_dead_log_ts", 0) > 30:
+                        log.critical(
+                            "MT5 account %s UNAVAILABLE (account_info=%s, trade_allowed=%s) — "
+                            "SKIP signal consumption; signals retained in stream until MT5 recovers",
+                            ACCOUNT_ID_MODE,
+                            _ai is not None,
+                            getattr(_ai, "trade_allowed", False) if _ai else False,
+                        )
+                        main._mt5_dead_log_ts = now  # type: ignore[attr-defined]
+                    last_risk = now  # 仍按节奏节流，避免空转过快
+                    continue
                 try:
                     msgs = await asyncio.wait_for(
                         asyncio.get_event_loop().run_in_executor(
@@ -3821,6 +3930,58 @@ async def main(dry_run=False):
                                 redis_conn.set(f"bridge:processed:{ACCOUNT_ID_MODE}:{sid}:partial_close", "done", ex=2592000)
                                 redis_conn.xack("signal:risk_passed", BRIDGE_GROUP, msg_id)
                                 continue
+                            # ── Manual mirror ADD：主号加仓 → 跟单号开一笔等量新仓（1:1 继承加仓动作）──
+                            #    master_stream 的 add 事件经 signal_tower 镜像为 signal_mode=manual_mirror、
+                            #    direction=BUY/SELL、action=add、lot=主号加仓量、signal_id=add_id；
+                            #    此处按 FOLLOW_LOT_MULT 缩放开新仓并登记 hcm:signal_for_ticket 映射，
+                            #    使后续主号平仓镜像能精确匹配。
+                            if msg_data.get("action") == "add":
+                                msg_symbol = msg_data.get("symbol", primary_symbol)
+                                add_dir = (msg_data.get("direction") or "").upper()
+                                add_vol = float(msg_data.get("lot", 0) or 0)
+                                add_sl = float(msg_data.get("sl_price", msg_data.get("sl", 0)) or 0)
+                                add_tp = float(msg_data.get("tp1", msg_data.get("tp", 0)) or 0)
+                                master_account_id = int(msg_data.get("account_id") or 0)
+                                # 注释码对齐：add_id = 主号ticket*100000 + 加仓序号(position_sync._publish_manual_master_add)，
+                                # 反解为「主号原开仓 signal_id」，使跟单号加仓注释与主号原持仓注释一致（便于核对）。
+                                # 主号平仓镜像经 hcm:signal_for_ticket 解析出同一 signal_id 精确匹配，故映射值也必须用解析值
+                                # （不能用合成 add_id，否则跟单号加仓仓永远关不掉=孤儿单）。
+                                _add_resolved = sid
+                                if sid and sid > 0:
+                                    _mt = sid // 100000
+                                    _add_resolved = _mt
+                                    try:
+                                        _m = redis_conn.get(f"hcm:signal_for_ticket:{_mt}")
+                                        if _m:
+                                            _add_resolved = int(_m.decode() if isinstance(_m, bytes) else _m)
+                                    except Exception:
+                                        pass
+                                if add_dir not in ("BUY", "SELL") or add_vol <= 0:
+                                    log.warning(
+                                        "Manual mirror ADD: signal_id=%s (resolved=%s) bad dir/vol dir=%s vol=%s — SKIP",
+                                        sid, _add_resolved, add_dir, add_vol,
+                                    )
+                                else:
+                                    log.info(
+                                        "Manual mirror ADD: signal_id=%s (resolved=%s) symbol=%s dir=%s vol=%s sl=%s tp=%s master=%s",
+                                        sid, _add_resolved, msg_symbol, add_dir, add_vol, add_sl, add_tp, master_account_id,
+                                    )
+                                    try:
+                                        _mp = {
+                                            "symbol": msg_symbol,
+                                            "direction": add_dir,
+                                            "volume": add_vol,
+                                            "sl": add_sl,
+                                            "tp": add_tp,
+                                        }
+                                        await _open_follower_position(
+                                            mt5, redis_conn, pool, _mp, master_account_id, str(_add_resolved)
+                                        )
+                                    except Exception as add_exc:
+                                        log.exception("Manual mirror ADD failed: %s", add_exc)
+                                redis_conn.set(f"bridge:processed:{ACCOUNT_ID_MODE}:{sid}:add", "done", ex=2592000)
+                                redis_conn.xack("signal:risk_passed", BRIDGE_GROUP, msg_id)
+                                continue
                             # ── Safety Rail 1 (MOVED UP + STRICT): 禁止过期/缺时间戳信号下单 ──
                             # 现优先用 signal_generated_at(T0) 算 age；前置为第一道闸门。
                             if not _is_signal_fresh(msg_data, max_signal_age, redis_conn):
@@ -4010,10 +4171,11 @@ async def main(dry_run=False):
                 except Exception as _sltp_exc:
                     log.error(f"follower consume sltp failed: {_sltp_exc}")
 
-            # P0优化：position_sync 与 trailing-stop 解耦，单独 ~1s 高频轮询。
-            # 原绑在 5s 门控导致主号动作检测延迟 ~6s；现降到 ~1s，开仓/平仓双向见效。
-            # trailing-stop 仍维持 5s（见上方 if now - last_trail > 5 块）。
-            if now - last_sync > 1.0:
+            # P0优化：position_sync 与 trailing-stop 解耦，单独高频轮询。
+            # 【2026-08-28 毫秒级同步改造】原 ~1s 门控 → 降到 ~0.2s，使主号开/平仓动作
+            # 检测与 hcm:direct_close:* 发布延迟从 ~1s 降到 ~0.2s，配合跟单桥 0.1s 消费，
+            # 端到端平仓同步进入 tick 级（<0.5s）。trailing-stop 仍维持 5s（上方块）。
+            if now - last_sync > 0.2:
                 try:
                     await asyncio.wait_for(
                         sync_positions(mt5, pool, redis_conn, account_id_mode=ACCOUNT_ID_MODE),
@@ -4058,7 +4220,7 @@ async def main(dry_run=False):
                 # 否则本地 07:00(=UTC 前一日 23:00) 永远不满足 hour==7 → baseline 键一直缺失，
                 # 分母回退当前 balance 而非当日初始本金基准（语义不准）。
                 try:
-                    _local_now = datetime.now()  # 本地时区，与 resume_time 口径一致
+                    _local_now = datetime.now()  # 本地时区，与 resume_time 口径一致；_FOLLOW_BASELINE_LAST_DAY 已在 main 顶层 global
                     if _local_now.hour == 7 and _FOLLOW_BASELINE_LAST_DAY != _local_now.date():
                         _bal = _follower_account_balance(mt5)
                         if _bal > 0:
@@ -4077,9 +4239,12 @@ async def main(dry_run=False):
 
             # [2026-07-24 直连快速通道] 消费主号桥直接写入的 hcm:direct_close:* 平仓指令。
             # 绕过 signal_tower→risk→risk_passed 长链（该链因 ack 失败/XPENDING 堆积/
-            # 信号塔重启 xgroup_setid→"$" 抛历史消息而不可靠），每 2s 检查，低延时复刻。
+            # 信号塔重启 xgroup_setid→"$" 抛历史消息而不可靠）。
+            # 【2026-08-28 毫秒级同步改造】原每 2s 巡检 → 改为紧跟主循环每轮（>0.1s 门控），
+            # 配合主循环 sleep(0.1) 与 sync_positions 0.2s 高频发布，端到端平仓同步延迟
+            # 从 ~2s 降到 ~0.3s（tick 级）；保留原逻辑作兜底，仅缩短巡检间隔。
             # 仅 IS_FOLLOWER 生效（跟单桥），保留原事件链路为第一优先路径。
-            if IS_FOLLOWER and now - last_direct_close > 2.0:
+            if IS_FOLLOWER and now - last_direct_close > 0.1:
                 try:
                     _dc_keys = redis_conn.keys("hcm:direct_close:*")
                     if _dc_keys:
@@ -4141,7 +4306,7 @@ async def main(dry_run=False):
                     log.error("Direct close check failed: %s", e)
                 last_direct_close = now
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
         except KeyboardInterrupt:
             break
         except ConnectionError:

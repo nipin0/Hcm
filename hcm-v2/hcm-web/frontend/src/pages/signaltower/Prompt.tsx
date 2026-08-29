@@ -43,8 +43,10 @@ const modelFields: ConfigField[] = [
 ];
 
 // 信号模型的 Tab（顺序与 scheduler 机制对齐；五维 ai_dynamic 已弃用 2026-07-24）
+// 【2026-08-28 co_source 清除】双源信号模式下线，模型 Tab 改为「和乘幂 / 手动模式」。
+// 与后端 scheduler 的 per-model 提示词读取列表 ("hexp", "manual") 保持一致。
 const MODEL_TABS: { key: string; label: string }[] = [
-  { key: 'co_source', label: '双源信号' },
+  { key: 'hexp', label: '和乘幂' },
   { key: 'manual', label: '手动模式' },
 ];
 

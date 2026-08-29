@@ -89,6 +89,9 @@ HEXP_KEYS: dict[str, Any] = {
     "hexp.mtf.weight_H4": 0.35,
     "hexp.mtf.weight_H1": 0.25,
     "hexp.mtf.weight_M30": 0.15,
+    # 2026-08-28 闸门清除：G1 MTF 多周期共识否决已移除（veto_enabled/reverse/notrade 删除）。
+    # flat_band 保留用于 sr.mtf_dir 观测。
+    "hexp.mtf.flat_band": 0.15,
     "hexp.resonance.tailwind_bonus": 0.0,   # 方案 B：顺风加成(默认0=完全对称)
     "hexp.resonance.penalty": 0.15,         # 方案 B：逆风折扣(硬封已移除)
     # B' 延伸（2026-08-17）：逆风/回踩单综合评分(total)额外下压系数。
@@ -127,15 +130,11 @@ HEXP_KEYS: dict[str, Any] = {
     # 是否把主执行周期(M5)方向切换也计入反转态（默认 False，避免减仓常驻）
     "hexp.exec.reversal_include_primary": False,
     "hexp.exec.transition_lot_mult": 0.5,
-    # 极值区手数递减（2026-08-21 方案2）：处于 Donchian 极值区(_in_extreme)且未被护栏
-    # 封单的放行单，按此折扣降仓（与 transition/reversal 用 min() 聚合，不叠加打折）。
-    # 2026-08-21 补入白名单：此前仅在引擎 _DEFAULTS，面板无控件 → 改代码默认重启复原。
-    "hexp.exec.extreme_lot_mult": 0.5,
-    # 行情波动率缩放手数（2026-08-21 方案2）：ATR 相对常态缩放，让风控基础手数随行情调整。
-    "hexp.exec.vol_scale_enabled": True,
-    "hexp.exec.vol_scale_atr_ref": 7.0,
-    "hexp.exec.vol_scale_min": 0.5,
-    "hexp.exec.vol_scale_max": 1.0,
+    # 2026-08-28 趋势单保护：transition 减仓仅看主执行周期。原 any(周期==TRANSITION)
+    # 会让"主周期明确趋势、仅辅助周期(如D1)犹豫"的顺势趋势单被误减半仓（实锤
+    # state=TREND_DOWN 趋势单 lot×0.50）。开启后仅主周期在 TRANSITION 才减仓。
+    "hexp.exec.transition_primary_only": True,
+    # 2026-08-28 闸门清除：D3 极值区降仓(extreme_lot_mult)、D4 波动率缩放(vol_scale_*) 已移除。
     # 方向判定
     "hexp.direction_min_score": 0.20,
     # 2026-08-27 方向迟滞死区：dir_sum 在 0 附近微动跨阈值翻转 → direction 闪烁（防抖）。
@@ -199,11 +198,14 @@ HEXP_KEYS: dict[str, Any] = {
     "hexp.momentum_flip_ma_threshold": 90.0,
     "hexp.momentum_flip_ma_low": 10.0,
     "hexp.momentum_flip_ma_mm": 0.005,
-    # 2026-08-26 P0-1 高位微正枯竭加固：momentum_flip 只拦"mm 反向(负)"，漏掉 ma 极高位
-    # + mm 微正枯竭(0<mm<弱阈值)的顶部追多（实证 sig=388640598 BUY@4666.08 ma=100 pos=0.846
-    # mm=+0.0124 regime=NEUTRAL 高位追多被止损）。高位+微正枯竭也拦，防均值回归反打。
-    "hexp.momentum_hi_weak_enabled": True,
-    "hexp.momentum_hi_weak_mm": 0.02,
+    # 2026-08-28 趋势单保护：momentum_flip 纯动量(M1 f_mm_s)否决不辨趋势结构，会误杀
+    # 顺势趋势单正常回撤（实锤 388642131-163 连续 BUY 被 mm=-0.01~-0.18 拦）。仅放行
+    # "顺势趋势单"（主周期 TREND_UP/DOWN 且方向同向；或 ADX≥trend_adx 且 ma 方向一致）
+    # 时用更宽阈值 flip_trend_mm 放行回调；逆势单/弱趋势仍敏捷拦截。与引擎 _DEFAULTS 对齐。
+    "hexp.momentum_flip_trend_enabled": True,
+    "hexp.momentum_flip_trend_adx": 25.0,
+    "hexp.momentum_flip_trend_mm": 0.15,
+    # 2026-08-28 闸门清除：G5b 高位微正枯竭加固(momentum_hi_weak_*) 已移除。
     # 2026-08-26 P0-2 震荡市均值回归校验：NEUTRAL/RANGE 市 + hurst<阈值(均值回归态) + 高位
     # 顺势追单 → 拦（实证 sig=388640598 pos=0.846 hurst=0.449 regime=NEUTRAL 高位追多被止损）。
     "hexp.range_hurst_enabled": True,

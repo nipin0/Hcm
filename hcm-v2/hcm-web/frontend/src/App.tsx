@@ -15,30 +15,23 @@ import Notifications from './pages/system/Notifications';
 import Cache from './pages/system/Cache';
 import Mode from './pages/signaltower/Mode';
 import Prompt from './pages/signaltower/Prompt';
-import Threshold from './pages/signaltower/Threshold';
 import Watchdog from './pages/signaltower/Watchdog';
-import SymbolConfig from './pages/signaltower/SymbolConfig';
 import SignalFunnel from './pages/signaltower/SignalFunnel';
 import AiQualityConfig from './pages/signaltower/AiQualityConfig';
 import AiReport from './pages/signaltower/AiReport';
 import ModelReport from './pages/signaltower/ModelReport';
 import ModelMonitor from './pages/signaltower/ModelMonitor';
+import AiOpsConsole from './pages/signaltower/AiOpsConsole';
 import DatasourceList from './pages/datasource/DatasourceList';
 import EngineRules from './pages/engine/EngineRules';
-import DispatchConfig from './pages/dispatch/DispatchConfig';
 import RiskConfig from './pages/risk/RiskConfig';
 import CloseConfig from './pages/close/CloseConfig';
 import CopyLayout from './pages/copy/CopyLayout';
-import CoSourceConfig from './pages/cosource/CoSourceConfig';
 import HexpConfig from './pages/hexp/HexpConfig';
 import HexpDashboard from './pages/hexp/HexpDashboard';
-import Realtime from './pages/dashboard/Realtime';
-import CalibrationTimeline from './pages/dashboard/CalibrationTimeline';
 import Positions from './pages/dashboard/Positions';
-import Statistics from './pages/dashboard/Statistics';
 import Health from './pages/dashboard/Health';
 import Factors from './pages/dashboard/Factors';
-import Compare from './pages/dashboard/Compare';
 
 const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { isAuthenticated, isLoading } = useAuth();
@@ -78,14 +71,16 @@ const App: React.FC = () => {
 
       {/* Signal Tower */}
                 <Route path="/signal-tower/mode" element={<ProtectedRoute><Mode /></ProtectedRoute>} />
-                <Route path="/signal-tower/threshold" element={<ProtectedRoute><Threshold /></ProtectedRoute>} />
+                {/* 【2026-08-28】移除 /signal-tower/threshold 路由（评分阈值公用参数页已下线）。 */}
                 <Route path="/signal-tower/prompt" element={<ProtectedRoute><Prompt /></ProtectedRoute>} />
       <Route path="/signal-tower/watchdog" element={<ProtectedRoute><Watchdog /></ProtectedRoute>} />
-      <Route path="/signal-tower/symbol-config" element={<ProtectedRoute><SymbolConfig /></ProtectedRoute>} />
+      {/* 【2026-08-28】移除 /signal-tower/symbol-config 路由（品种级配置页已下线）。 */}
       <Route path="/engine/ai-quality" element={<ProtectedRoute><AiQualityConfig /></ProtectedRoute>} />
       <Route path="/engine/ai-report" element={<ProtectedRoute><AiReport /></ProtectedRoute>} />
       <Route path="/engine/model-report" element={<ProtectedRoute><ModelReport /></ProtectedRoute>} />
       <Route path="/engine/model-monitor" element={<ProtectedRoute><ModelMonitor /></ProtectedRoute>} />
+      {/* [2026-08-29] AI 中枢监控：LightGBM 三头运作 + DeepSeek 效果（只读） */}
+      <Route path="/engine/ai-ops" element={<ProtectedRoute><AiOpsConsole /></ProtectedRoute>} />
 
       {/* Datasource */}
       <Route path="/datasource" element={<ProtectedRoute><DatasourceList /></ProtectedRoute>} />
@@ -94,27 +89,27 @@ const App: React.FC = () => {
       <Route path="/engine/rules" element={<ProtectedRoute><EngineRules /></ProtectedRoute>} />
 
       {/* Other config pages */}
-      <Route path="/dispatch" element={<ProtectedRoute><DispatchConfig /></ProtectedRoute>} />
+      {/* 【2026-08-28】移除 /dispatch 路由（分发配置页已下线）。 */}
       <Route path="/risk" element={<ProtectedRoute><RiskConfig /></ProtectedRoute>} />
       <Route path="/close" element={<ProtectedRoute><CloseConfig /></ProtectedRoute>} />
       <Route path="/copy" element={<ProtectedRoute><CopyLayout /></ProtectedRoute>} />
-      <Route path="/cosource" element={<ProtectedRoute><CoSourceConfig /></ProtectedRoute>} />
       <Route path="/hexp" element={<ProtectedRoute><HexpConfig /></ProtectedRoute>} />
       <Route path="/hexp/dashboard" element={<ProtectedRoute><HexpDashboard /></ProtectedRoute>} />
 
       {/* Dashboard */}
-      <Route path="/dashboard/realtime" element={<ProtectedRoute><Realtime /></ProtectedRoute>} />
-      <Route path="/dashboard/calibration-timeline" element={<ProtectedRoute><CalibrationTimeline /></ProtectedRoute>} />
+      {/* 【2026-08-28】移除 /dashboard/realtime、/dashboard/calibration-timeline、
+          /dashboard/statistics 三条路由（对应页面已下线）。 */}
       <Route path="/dashboard/positions" element={<ProtectedRoute><Positions /></ProtectedRoute>} />
-      <Route path="/dashboard/statistics" element={<ProtectedRoute><Statistics /></ProtectedRoute>} />
       <Route path="/dashboard/health" element={<ProtectedRoute><Health /></ProtectedRoute>} />
       <Route path="/dashboard/factors" element={<ProtectedRoute><Factors /></ProtectedRoute>} />
-      <Route path="/dashboard/compare" element={<ProtectedRoute><Compare /></ProtectedRoute>} />
+      {/* 【2026-08-28】移除 /dashboard/compare 路由（品种对比页已下线）。 */}
       <Route path="/dashboard/funnel" element={<ProtectedRoute><SignalFunnel /></ProtectedRoute>} />
 
       {/* Default redirect */}
-      <Route path="/" element={<Navigate to="/dashboard/realtime" replace />} />
-      <Route path="*" element={<Navigate to="/dashboard/realtime" replace />} />
+      {/* 【2026-08-28】「实时信号流」页下线，默认/Catch-all 落地页改到和乘幂信号状态
+          （生产主引擎看板）。原目标 /dashboard/realtime 路由已删除，不改会导致白屏。 */}
+      <Route path="/" element={<Navigate to="/hexp/dashboard" replace />} />
+      <Route path="*" element={<Navigate to="/hexp/dashboard" replace />} />
     </Routes>
   );
 };

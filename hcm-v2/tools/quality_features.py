@@ -485,6 +485,30 @@ def main():
             row["ds_fake_prob"] = _fp
             row["ds_sl_coeff"] = _sl
             row["ds_continuity"] = _cont
+            # 【阶段 2·方案 A·质量头治本】入场质量特征（与推理侧 build_features 同口径）。
+            # 质量标签 R = atr * ai_sl_mult（build_labels.label_one 同定义）→ 入场质量用**无量纲**
+            # 信号，避免 entry/sl 与 atr 单位不一致陷阱：
+            #   r_dist_atr      : ai_sl_mult（实际 SL 倍数，越大=越易达标）
+            #   sl_mult_used    : 同上（冗余对齐）
+            #   entry_atr_ratio : (entry - 近期close均值)/atr（入场价位 ATR 归一 z，量纲无关）
+            _atr_f = float(r.get("atr_14") or 0.0) or 1e-9
+            _mult_f = r.get("ai_sl_mult")
+            _entry_f = r.get("entry_price")
+            try:
+                _mult_f = float(_mult_f) if pd.notna(_mult_f) and _mult_f is not None else 2.0
+                _entry_z = 0.0
+                if pd.notna(_entry_f) and _entry_f is not None and kl is not None and not kl.empty:
+                    _entry_v = float(_entry_f)
+                    _close_arr = kl["close"].astype(float)
+                    _close_mean = float(_close_arr.iloc[-20:].mean()) if len(_close_arr) >= 20 else float(_close_arr.iloc[-1])
+                    _entry_z = (_entry_v - _close_mean) / (_atr_f + 1e-9)
+                row["r_dist_atr"] = _mult_f
+                row["sl_mult_used"] = _mult_f
+                row["entry_atr_ratio"] = _entry_z
+            except (TypeError, ValueError):
+                row["r_dist_atr"] = 2.0
+                row["sl_mult_used"] = 2.0
+                row["entry_atr_ratio"] = 0.0
             feats.append(row)
 
         df = pd.DataFrame(feats)

@@ -130,8 +130,12 @@ class OrderExecutor:
             float(copy_config.get("tp_offset_pips", 0)),
         )
 
-        # Generate client_id for idempotency
-        client_id = f"copy-{account_id}-{signal_id}-{int(time.time() * 1000)}"
+        # Generate client_id for idempotency.
+        # 【2026-08-28 P1-13】去掉毫秒时间戳：原 client_id 每次重试/每次构造都不同，
+        # 使下游无法据其做幂等去重 —— gRPC 已成交但回包超时/丢包时，PUB/SUB 兜底
+        # 路径会再下一单 → 跟单账号重复开仓。改为仅由 (account_id, signal_id) 构成，
+        # 使同一信号的重试与兜底路径复用同一幂等键（下游可按 client_id 去重）。
+        client_id = f"copy-{account_id}-{signal_id}"
 
         # Compute magic number
         magic = DEFAULT_MAGIC_PREFIX + (account_id % 1000)

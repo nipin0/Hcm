@@ -189,10 +189,21 @@ class RiskStreamConsumer:
 
     # ── Lifecycle ───────────────────────────────
 
-    async def start(self) -> None:
-        """Start the consumer loop as a background task."""
+    async def start(self) -> bool:
+        """Start the consumer loop as a background task.
+
+        Returns:
+            True  — 消费循环已启动（或本就在运行）；
+            False — 启动自检失败（安全配置校验不通过 / 校验抛异常），
+                    消费循环**未**启动，风控处于停摆状态。
+
+        【2026-08-28 P1-11】原实现在启动自检失败时静默 `return`，调用方（main.py）
+        既不检查返回值也照常打印 "fully initialized" → 风控实际停摆，而容器健康检查
+        与日志都显示"健康"，signal:stream 中的信号无人裁决、风控形同虚设。
+        改为返回 bool，供调用方 fail-fast（见 main.py 的启动检查）。
+        """
         if self._running:
-            return
+            return True
 
         # Ensure consumer group exists.
         # start_id="0" means: if the group is being created for the first
@@ -201,13 +212,18 @@ class RiskStreamConsumer:
         # before the risk engine came online.  On subsequent restarts the
         # group already exists (BUSYGROUP) and start_id is ignored — the
         # group continues from its last delivered position.
+        # 【2026-08-28 P0-5】start_id 由 "0" 改为 "$"。
+        # 原值 "0"（E 组 P2-15 引入，意图是"风控上线前发布的信号不丢失"）意味着：
+        # 一旦消费组不存在（Redis 重建 / RDB 回滚 / 运维 XGROUP DESTROY），会把
+        # signal:stream 内 maxlen=10000 的历史信号全量重放，经风控 PASS 后推入
+        # signal:risk_passed，由桥/跟单批量开仓 —— 属不可接受的放大面。
+        # 改为 "$" 后仅消费启动之后的新信号；"不丢信号"由采集侧的持久化和
+        # 桥的年龄闸门（bridge.max_signal_age_seconds）保证，而非靠全量重放。
         await self._redis.xgroup_create(
             self._config.signal_stream,
             self._config.group_name,
             mkstream=True,
-            # 【E 组 P2-15】与注释/publisher 对齐："0" 首次建组从头消费，
-            # 风控上线前发布的信号不丢失（原 "$" 会跳过全部历史信号）。
-            start_id="0",
+            start_id="$",
         )
 
         # Also create group for risk_passed stream (for future consumers)
@@ -232,11 +248,11 @@ class RiskStreamConsumer:
                 for e in errors:
                     logger.critical("SAFETY FAIL: %s", e)
                 logger.critical("Aborting startup — safety config validation failed")
-                return
+                return False
             logger.info("Safety config validated: %d keys OK", len(CRITICAL_SAFETY_KEYS))
         except Exception as exc:
             logger.critical("Safety validation failed: %s — aborting startup", exc)
-            return
+            return False
 
         self._running = True
         self._task = asyncio.create_task(self._consume_loop())
@@ -244,6 +260,7 @@ class RiskStreamConsumer:
             "RiskStreamConsumer started: group=%s, stream=%s",
             self._config.group_name, self._config.signal_stream,
         )
+        return True
 
     async def stop(self) -> None:
         """Gracefully stop the consumer loop."""

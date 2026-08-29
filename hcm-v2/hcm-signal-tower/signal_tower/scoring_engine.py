@@ -180,6 +180,13 @@ class ScoreResult:
     # 规则②顺势放行（豁免 M5 体制对顺势方向的额外抬高门槛）。
     h1_bias: Optional[str] = None
 
+    # ── 2026-08-28: MTF 多周期共振加权共识方向（HEXP 引擎产出）──
+    # 与 h1_bias 同源（多周期方向共识），但覆盖全部非主周期(M30/H1/H4/D1)
+    # 按 weight_* 加权求和：>0 偏多 / <0 偏空 / ≈0 无共识。
+    # 用于 HEXP 方向裁决闸：共识强反向时否决/翻转主周期候选方向。
+    mtf_dir: str = ""          # BUY / SELL / ""（无共识）
+    mtf_verdict: float = 0.0   # 加权共识强度 ∈ [-1, 1]
+
     # ── 2026-08-13: hexp 极值动量感知闸门诊断标记 ──
     # extreme_chase: 极值区且 mm 动量仍朝原方向 → 允许极值追单（True）。
     # extreme_support_pullback: 价格已回踩到近期摆动支撑带内，方向交 7 因子重裁。

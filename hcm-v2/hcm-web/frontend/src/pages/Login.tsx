@@ -15,9 +15,10 @@ const Login: React.FC = () => {
   const navigate = useNavigate();
 
   // Already logged in
+  // 【2026-08-28】「实时信号流」页下线，落地页改到和乘幂信号状态（生产主引擎看板）。
   React.useEffect(() => {
     if (isAuthenticated) {
-      navigate('/dashboard/realtime', { replace: true });
+      navigate('/hexp/dashboard', { replace: true });
     }
   }, [isAuthenticated, navigate]);
 
@@ -33,7 +34,7 @@ const Login: React.FC = () => {
 
     try {
       await login(username.trim(), password);
-      navigate('/dashboard/realtime', { replace: true });
+      navigate('/hexp/dashboard', { replace: true });
     } catch (err: unknown) {
       if (err && typeof err === 'object' && 'response' in err) {
         const axiosErr = err as { response?: { data?: { detail?: string }; status?: number } };

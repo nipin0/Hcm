@@ -588,11 +588,24 @@ def _detect_and_publish_master_changes(redis_conn, pos, master_account_id: int) 
     new_vol = float(pos.volume)
     if is_auto:
         # auto 模型单：SL/TP 变更发布到 hcm:master:sltp（毫秒级跟单消费）。
-        # 手数增减（partial_close/add）auto 单由跟单桥自动复制路径继承，本路径只管 SL/TP。
+        # 手数增减（partial_close/add）同步发布到 master_stream，由跟单桥镜像执行——
+        # 跟单桥的广播信号独立开仓路径【不会】在主号部分平仓/加仓时触发，
+        # 若不显式发布，自动单的部分平仓/加仓永远不被跟单号继承（动作发散）。
+        # 注：开仓事件（open）仍跳过——跟单号随广播信号独立开仓，避免与 master_stream 重复开仓。
         sl_changed = abs(new_sl - snap["sl"]) > 1e-9
         tp_changed = abs(new_tp - snap["tp"]) > 1e-9
         if sl_changed or tp_changed:
             _publish_master_sltp_event(redis_conn, pos, new_sl, new_tp, master_account_id)
+        # 手数减少（partial_close）
+        if new_vol < snap["volume"] - 1e-9:
+            _publish_manual_master_partial_close(
+                redis_conn, pos, round(snap["volume"] - new_vol, 2), master_account_id
+            )
+        # 手数增加（add）
+        elif new_vol > snap["volume"] + 1e-9:
+            _publish_manual_master_add(
+                redis_conn, pos, round(new_vol - snap["volume"], 2), master_account_id
+            )
         _MANUAL_LAST_SNAPSHOT[t] = {"sl": new_sl, "tp": new_tp, "volume": new_vol}
         return
     # 手动单：原有 manual_mode:master_stream 镜像逻辑（modify/partial_close/add 全继承）

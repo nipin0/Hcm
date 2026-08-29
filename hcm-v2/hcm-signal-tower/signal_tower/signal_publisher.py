@@ -40,6 +40,15 @@ STREAM_MAXLEN = 10000
 # 自动写回校准因子的总开关（经 ConfigProvider.set 可热关，调试/人工接管时用）
 CALIB_AUTO_APPLY_KEY = "co.calib.auto_apply"
 
+# ── 订单状态枚举（hcm_trading.orders.order_status）────────────────────────
+# 铁律 4.6：禁止在 SQL/代码里裸写 1/2 等状态字面量（历史上裸写 order_status=1
+# 曾导致 1015 笔订单假 open、风控冷却全面失效，见铁律 10.1）。
+# 语义经 PG 实测确认（2026-08-28）：
+#   OPEN(1)  → 492 行，close_time 全部为 NULL；
+#   CLOSED(2)→ 1157 行，close_time 全部非空。
+ORDER_STATUS_OPEN = 1
+ORDER_STATUS_CLOSED = 2
+
 
 def _regime_to_calib_key(regime_str: str) -> Optional[str]:
     """把 DB 的 m5_regime 字符串映射到 co.calib.* 配置键（复用 co_source._CALIB_KEYS）。
@@ -69,6 +78,14 @@ class SignalData:
     tp2: float = 0.0
     lot: float = 0.0
     confidence: float = 0.0
+    # ── 2026-08-28 修复：多因子外部市场评分(composite)落库 + 参与方向/仓位 ──
+    # 此前 composite_score 列在 SignalData 与 INSERT 中均缺失 → 全表 NULL（BUG，非设计）。
+    # 取值自 hcm-market-intel 计算的宏观+情绪+事件+流动性 4 维聚合分(0~1，Redis
+    # hcm:market:composite:score，每 30s 刷新)，代表「外部市场环境对本品种交易的有利度」。
+    # 用途：(1) 落库供复盘归因；(2) 弱证据信号(composite 极低 + NEUTRAL/兜底/RSI均值回归)
+    # 降级为 NO_TRADE，根治震荡市恶劣环境下被反复扫损；(3) 作为 suggested_lot 衰减系数，
+    # composite 低→减仓，高→不衰减（与 AI 手数分档协同，不颠覆既有分档）。
+    composite_score: float = 0.0
     signal_mode: str = "indicator_scoring"
     magic: int = 0  # MT5 magic 号（手动跟单时透传主号原 magic，桥侧下单时用此值覆盖默认 123456）
     indicator_values: dict = field(default_factory=dict)
@@ -385,14 +402,12 @@ class SignalPublisher:
                         macro_snapshot_id, sentiment_snapshot_id,
                         fallback_reason, pre_score, weight_scheme,
                         position_in_range, regime,
-                        position_cycle, position_z, ma_raw,
-                        cycle_pos_blocked, extreme_reversal_blocked, threshold_passed,
                         zone_level, zone_type, zone_strength,
+                        composite_score,
                         created_at, signal_status)
                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                                $12, $13, $14, $15, $16, $17, $18,
-                               $19, $20, $21, $22, $23, $24, $25, $26,
-                               $27, $28, $29, $30, $31, $32)
+                               $19, $20, $21, $22, $23, $24, $25, $26, $27)
                        ON CONFLICT (signal_id) DO NOTHING""",
                     signal.signal_id,
                     signal.task_id if signal.task_id > 0 else None,
@@ -418,6 +433,19 @@ class SignalPublisher:
                                 "entry_trigger_wait": signal.entry_trigger_wait,
                                 "zone_tp_level": signal.zone_tp_level,
                             },
+                            # 2026-08-28 修复：C4 溯源字段(position_cycle/position_z/ma_raw/
+                            # cycle_pos_blocked/extreme_reversal_blocked/threshold_passed)
+                            # 因 PG 表 hcm_signal.signals 无对应列而无法直接落库，暂存于
+                            # indicator_values JSONB（与 _collab/_component_scores 同源），
+                            # 避免 INSERT 整体失败。后续若需独立列再做 ALTER TABLE。
+                            "_c4_trace": {
+                                "position_cycle": signal.position_cycle,
+                                "position_z": signal.position_z,
+                                "ma_raw": signal.ma_raw,
+                                "cycle_pos_blocked": signal.cycle_pos_blocked,
+                                "extreme_reversal_blocked": signal.extreme_reversal_blocked,
+                                "threshold_passed": signal.threshold_passed,
+                            },
                             "_component_scores": signal.component_scores,
                         }),
                     signal.macro_snapshot_id,
@@ -427,15 +455,10 @@ class SignalPublisher:
                     signal.weight_scheme or "",
                     signal.position_in_range,
                     signal.regime or "",
-                    signal.position_cycle,
-                    signal.position_z,
-                    signal.ma_raw,
-                    signal.cycle_pos_blocked,
-                    signal.extreme_reversal_blocked,
-                    signal.threshold_passed,
                     signal.zone_level if getattr(signal, "zone_level", 0) else None,
                     signal.zone_type or None,
                     signal.zone_strength if getattr(signal, "zone_strength", 0) else 0,
+                    signal.composite_score,
                     datetime.now(timezone.utc),
                     status,
                 )
@@ -668,14 +691,15 @@ class SignalPublisher:
                     FROM hcm_trading.orders o
                     WHERE o.signal_id IS NOT NULL
                       AND o.close_time IS NOT NULL
-                      AND o.order_status = 1
+                      AND o.order_status = $1
                     GROUP BY o.signal_id
                 ) agg ON s.signal_id = agg.sid
                 WHERE NOT EXISTS (
                     SELECT 1 FROM hcm_ai.labeled_samples ls WHERE ls.signal_id = s.signal_id
                 )
                 ON CONFLICT (symbol, timeframe, bar_time) DO NOTHING
-                """
+                """,
+                ORDER_STATUS_CLOSED,
             )
             # 2) 标定所有已平仓且尚未标定的样本
             await self._db.execute(
@@ -687,13 +711,14 @@ class SignalPublisher:
                     FROM hcm_trading.orders o
                     WHERE o.signal_id IS NOT NULL
                       AND o.close_time IS NOT NULL
-                      AND o.order_status = 1
+                      AND o.order_status = $1
                     GROUP BY o.signal_id
                 ) agg
                 WHERE ls.signal_id = agg.sid
                   AND ls.label IS NULL
                   AND agg.net_profit IS NOT NULL
-                """
+                """,
+                ORDER_STATUS_CLOSED,
             )
             total = await self._db.fetchval(
                 "SELECT COUNT(*) FROM hcm_ai.labeled_samples WHERE label IN ('win','loss')"
@@ -951,9 +976,13 @@ class SignalPublisher:
                 "【研判口径】\n"
                 "- 胜率<0.40 视为弱体制(长期亏损)，>0.55 视为强体制。\n"
                 "- 冷启动(cold_start)表示样本不足，calib 锁定 1.0，不可据此调参。\n"
-                "- 共源信号下单门槛的真实配置键为 co.gate.strong.trend / co.gate.weak.trend / "
-                "co.gate.shock.trend（0-100，越大越难下单；体制只有 strong/weak/shock 三种，"
-                "不存在 co.gate.TREND / co.gate.RANGE / co.gate.NEUTRAL 这类键）。\n"
+                # 【2026-08-28 co_source 清除】原引导引用 co.gate.strong/weak/shock.trend
+                # （双源自适应门槛键）已随双源引擎下线全部删除，继续引用会让 AI 产出
+                # 指向不存在键的无效建议。改为引用 HEXP 链路真实生效的门槛键。
+                "- 和乘幂(hexp)链路真实生效的门槛键：scoring.min_score_threshold（全局评分底，"
+                "0-1 尺度，越大越难下单）、co.gate.direction_min_score（方向裁定门槛）、"
+                "hexp.entry.theta.<状态>（入场闸门阈值，状态为 TREND_PULLBACK/TREND_ACCEL/"
+                "TREND_EXHAUST/RANGE/REVERSAL）、hexp.entry.min_rr（最小盈亏比）。\n"
                 "- 校准因子由系统每日自动写回 co.calib.<regime>（如 co.calib.trend / "
                 "co.calib.range），你无需也无法直接修改它们，仅在 narrative 中说明。\n\n"
                 "【请输出JSON】\n"
@@ -961,8 +990,9 @@ class SignalPublisher:
                 '  "narrative": "<2-4段中文自然语言诊断：概括各体制当前胜率与校准因子状态、'
                 '与近期趋势对比、指出最需关注的体制>",\n'
                 '  "recommendations": ["<针对弱体制的具体调参建议，仅可引用真实存在的键，'
-                '如 收紧 co.gate.weak.trend 至 55 抑制该体制下单；'
-                '禁止虚构 co.gate.TREND/RANGE/NEUTRAL 等不存在的键>", "..."],\n'
+                '如 调高 hexp.entry.theta.RANGE 至 0.50 收紧震荡市入场；'
+                '禁止虚构 co.gate.TREND/RANGE/NEUTRAL / co.gate.strong|weak|shock.trend '
+                '等已下线的双源键>", "..."],\n'
                 '  "needs_human_review": <bool：是否存在胜率持续<0.35 或样本充足但校准因子触及 '
                 '边界 0.6/1.4 等需人工介入的情况>,\n'
                 '  "confidence": "<high|medium|low：基于样本日数量与数据一致性>"\n'

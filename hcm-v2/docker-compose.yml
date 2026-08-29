@@ -58,6 +58,12 @@ services:
       - "8005:8005"
     networks:
       - hcm-network
+    volumes:
+      # [2026-08-28 P0-3] gateway 在未接入 MT5 桥时禁止伪造成交：原实现返回
+      # code=0 + 由 time.time() 派生的伪 ticket，调用方无从辨别，遂把信号标记为
+      # 已成交并产生 403 条 "Order timeout" 告警；一旦接入真实通道将与主机侧桥
+      # 双重开仓。绑定挂载使该修复跨容器 recreate 持久（无网环境无法 rebuild 镜像）。
+      - ./hcm-gateway/gateway/grpc_server.py:/app/gateway/grpc_server.py
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8004/health')"]
       interval: 15s
@@ -260,6 +266,13 @@ services:
       # 绑定挂载源码（无网环境无法 rebuild 镜像）：使「主号+跟单号都通知钉钉」修复跨容器 recreate 持久生效
       - ./hcm-dispatcher/dispatcher/execution_notifier.py:/app/dispatcher/execution_notifier.py
       - ./hcm-dispatcher/dispatcher/notifier.py:/app/dispatcher/notifier.py
+      # [2026-08-28 P0-2/P0-5] dispatcher 下单职责闸门：signal:risk_passed 上桥的
+      # group:{6,9,23,24,35} 与 dispatcher-group 争抢同一批信号，且 gateway 无 MT5 连接
+      # → dispatcher 下单全部落在伪成交分支。实测近 14 天全部真实成交均来自桥
+      # （mt5_ticket 无一为空/0），故 dispatcher 默认只消费通知、不下单
+      # （可经配置中心 dispatch.execution_enabled 热开）；另加信号年龄闸门，
+      # 消费组 start_id 由 "0" 改 "$"。绑定挂载跨 recreate 持久。
+      - ./hcm-dispatcher/dispatcher/stream_consumer.py:/app/dispatcher/stream_consumer.py
 
   hcm-copy-trading:
     build:
@@ -286,6 +299,15 @@ services:
       - "8009:8009"
     networks:
       - hcm-network
+    volumes:
+      # [2026-08-28 P1-13] 跟单下单幂等键修复：client_id 去掉毫秒时间戳，改为仅由
+      # (account_id, signal_id) 构成，使重试与 PUB/SUB 兜底路径复用同一幂等键，
+      # 消除"gRPC 已成交但回包超时 → 兜底再下一单"的重复开仓。
+      # 绑定挂载使该修复跨容器 recreate 持久（无网环境无法 rebuild 镜像）。
+      - ./hcm-copy-trading/copy_trading/order_executor.py:/app/copy_trading/order_executor.py
+      # 2026-08-29：默认关闭 copy-trading 真实下单（跟单开仓统一由跟单桥负责），
+      # 同目录 stream_consumer.py 加开关 COPY_TRADING_ORDER_EXECUTION_ENABLED，挂载后 recreate 持久。
+      - ./hcm-copy-trading/copy_trading/stream_consumer.py:/app/copy_trading/stream_consumer.py
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8009/health')"]
       interval: 15s
@@ -329,15 +351,18 @@ services:
       - ./hcm-web/web/api/risk.py:/app/web/api/risk.py
       # 跟单关系 API：含空串→默认值容错(消除创建 422)；绑定挂载使该修复跨 recreate 持久
       - ./hcm-web/web/api/copy.py:/app/web/api/copy.py
-      # 共源信号配置 API：经 config_provider.set 双写 PG(metadata)+Redis(hcm:config:v2)+PUB；
-      # 绑定挂载使「共源配置 PG/Redis 双写」跨 recreate 持久（否则容器重建回退镜像版丢失双写逻辑）
-      - ./hcm-web/web/api/cosource.py:/app/web/api/cosource.py
+      # [2026-08-28] 引擎模式配置 API（原 cosource.py 重命名；双源信号整体下线后
+      # 仅保留 signal.active_model 引擎切换职责）。经 config_provider.set 双写
+      # PG(metadata)+Redis(hcm:config:v2)+PUB；绑定挂载跨 recreate 持久。
+      - ./hcm-web/web/api/engine_mode.py:/app/web/api/engine_mode.py
       # [2026-08-08] 和乘幂(hexp)独立信号源配置 API：PG(metadata)+Redis(hcm:config:v2) 双写 + PUB；绑定挂载跨 recreate 持久
       - ./hcm-web/web/api/hexp.py:/app/web/api/hexp.py
       # [2026-08-14] AI 信号质量模块配置 API（ai.* 命名空间，新文件非镜像烘焙）：绑定挂载跨 recreate 持久
       - ./hcm-web/web/api/ai_config.py:/app/web/api/ai_config.py
       # [2026-08-14] AI 报表聚合 API（只读，新文件非镜像烘焙）：绑定挂载跨 recreate 持久
       - ./hcm-web/web/api/ai_report.py:/app/web/api/ai_report.py
+      # [2026-08-29] AI 中枢监控 API（三头实时运作+DeepSeek 效果，只读，新文件非镜像烘焙）：绑定挂载跨 recreate 持久
+      - ./hcm-web/web/api/ai_ops.py:/app/web/api/ai_ops.py
       # [2026-08-08] hcm-web 主入口：注册 hexp 等新增路由；绑定挂载使路由注册跨 recreate 持久（否则容器重建回退镜像版丢失 hexp 路由）
       - ./hcm-web/main.py:/app/main.py
       # 仪表盘 API：新增 live-score 端点（暴露信号塔实时评分快照：评分 vs 自适应门槛 vs 能否下单）；绑定挂载跨 recreate 持久

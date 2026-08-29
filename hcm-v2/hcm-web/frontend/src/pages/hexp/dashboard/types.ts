@@ -509,6 +509,10 @@ export function inferEntryMode(
   const pState = (snap.period_states || {})[primary] || 'RANGE';
   const isTrend = pState === 'TREND_UP' || pState === 'TREND_DOWN';
   const trendUp = pState === 'TREND_UP';
+  // 2026-08-28 修复：trendDown 此前从未定义（2026-08-27 铁律对齐改动遗漏），
+  // 导致下方 aligned 判定引用未定义标识符 → tsc 报 TS2304、前端构建失败。
+  // 补上对称定义，语义不变（下行趋势态）。
+  const trendDown = pState === 'TREND_DOWN';
 
   if (!isTrend) {
     return {

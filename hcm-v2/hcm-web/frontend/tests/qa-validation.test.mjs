@@ -42,21 +42,22 @@ describe('AREA 1 — Route Integrity (App.tsx)', () => {
     // System (6 routes)
     '/system/users', '/system/network', '/system/mt5',
     '/system/deepseek', '/system/notifications', '/system/cache',
-    // Signal Tower (5 routes)
-    '/signal-tower/mode', '/signal-tower/threshold', '/signal-tower/prompt',
-    '/signal-tower/watchdog', '/signal-tower/symbol-config',
+    // Signal Tower (3 routes) — [2026-08-28] 移除 /signal-tower/threshold（评分阈值页下线）、
+    // /signal-tower/symbol-config（品种级配置页下线）
+    '/signal-tower/mode', '/signal-tower/prompt',
+    '/signal-tower/watchdog',
     // Datasource
     '/datasource',
     // Engine
     '/engine/rules',
-    // Other config (4 routes)
-    '/dispatch', '/risk', '/close', '/copy',
-    // Dashboard (6 routes)
-    '/dashboard/realtime', '/dashboard/positions', '/dashboard/statistics',
-    '/dashboard/health', '/dashboard/factors', '/dashboard/compare',
+    // Other config (3 routes) — [2026-08-28] 移除 /dispatch（分发配置页下线）
+    '/risk', '/close', '/copy',
+    // Dashboard (3 routes) — [2026-08-28] 移除 /dashboard/realtime、
+    // /dashboard/statistics、/dashboard/compare（页面下线）
+    '/dashboard/positions', '/dashboard/health', '/dashboard/factors',
   ];
 
-  it('should contain all 24 primary routes (login + 23 protected)', () => {
+  it('should contain all 19 primary routes (login + 18 protected)', () => {
     const routeCount = (appContent.match(/path="\/[\w/-]+"/g) || []).length;
     // Expect at least 24 path= attributes (including catch-all)
     assert.ok(routeCount >= 24, `Expected >= 24 routes, found ${routeCount}`);
@@ -85,17 +86,18 @@ describe('AREA 1 — Route Integrity (App.tsx)', () => {
     assert.ok(appContent.includes('animate-spin'), 'ProtectedRoute missing loading spinner');
   });
 
-  it('should have default redirect from / to /dashboard/realtime', () => {
+  // 【2026-08-28】实时信号流页下线，默认/Catch-all 落地页改为 /hexp/dashboard
+  it('should have default redirect from / to /hexp/dashboard', () => {
     assert.ok(
-      appContent.includes('path="/"') && appContent.includes('/dashboard/realtime'),
-      'Default redirect / → /dashboard/realtime missing',
+      appContent.includes('path="/"') && appContent.includes('/hexp/dashboard'),
+      'Default redirect / → /hexp/dashboard missing',
     );
   });
 
-  it('should have catch-all redirect to /dashboard/realtime', () => {
+  it('should have catch-all redirect to /hexp/dashboard', () => {
     assert.ok(
-      appContent.includes('path="*"') && appContent.includes('/dashboard/realtime'),
-      'Catch-all redirect * → /dashboard/realtime missing',
+      appContent.includes('path="*"') && appContent.includes('/hexp/dashboard'),
+      'Catch-all redirect * → /hexp/dashboard missing',
     );
   });
 
@@ -141,9 +143,10 @@ describe('AREA 2 — Component Structure', () => {
   describe('Layout.tsx', () => {
     const layout = readSrc('components/Layout.tsx');
 
-    it('should have 9 navigation groups', () => {
+    // [2026-08-28] 9 → 8：移除「分发」组（分发配置页下线）
+    it('should have 8 navigation groups', () => {
       const navGroupCount = (layout.match(/basePath: '/g) || []).length;
-      assert.equal(navGroupCount, 9, `Expected 9 nav groups, found ${navGroupCount}`);
+      assert.equal(navGroupCount, 8, `Expected 8 nav groups, found ${navGroupCount}`);
     });
 
     it('should include SymbolSelector in sidebar', () => {
@@ -425,8 +428,9 @@ describe('AREA 4 — Symbol Linkage', () => {
 
   // Verify dashboard pages listen to symbolChanged
   describe('Dashboard pages listen to symbolChanged', () => {
+    // [2026-08-28] 移除 'Realtime.tsx'、'Statistics.tsx'（页面下线，文件已删除）
     const dashboardPages = [
-      'Realtime.tsx', 'Positions.tsx', 'Statistics.tsx',
+      'Positions.tsx',
       'Factors.tsx',
     ];
 
@@ -441,41 +445,14 @@ describe('AREA 4 — Symbol Linkage', () => {
     }
   });
 
-  it('Realtime.tsx should use useWebSocket with selectedSymbol', () => {
-    const realtime = readSrc('pages/dashboard/Realtime.tsx');
-    assert.ok(realtime.includes('useWebSocket'), 'Realtime missing useWebSocket');
-    assert.ok(realtime.includes('selectedSymbol'), 'Realtime missing selectedSymbol dependency');
-  });
+  // 【2026-08-28】移除 Realtime.tsx 断言（实时信号流页已下线）
 });
 
 // ============================================================
 // AREA 5: Dashboard Chart Libraries
 // ============================================================
 describe('AREA 5 — Dashboard Chart Libraries', () => {
-  describe('Realtime.tsx — AG Grid', () => {
-    const realtime = readSrc('pages/dashboard/Realtime.tsx');
-
-    it('should import AgGridReact from ag-grid-react', () => {
-      assert.ok(realtime.includes('ag-grid-react'), 'Realtime missing ag-grid-react import');
-      assert.ok(realtime.includes('AgGridReact'), 'Realtime missing AgGridReact usage');
-    });
-
-    it('should import AG Grid CSS styles', () => {
-      assert.ok(realtime.includes('ag-grid-community/styles/ag-grid.css'), 'Realtime missing AG Grid core CSS');
-      assert.ok(realtime.includes('ag-grid-community/styles/ag-theme-alpine.css'), 'Realtime missing AG Grid theme CSS');
-    });
-
-    it('should define column definitions with ColDef type', () => {
-      assert.ok(realtime.includes('ColDef'), 'Realtime missing ColDef type');
-      assert.ok(realtime.includes('columnDefs'), 'Realtime missing columnDefs');
-    });
-
-    it('should handle WebSocket messages for live updates', () => {
-      assert.ok(realtime.includes('handleWsMessage'), 'Realtime missing WebSocket message handler');
-      assert.ok(realtime.includes('signal_update'), 'Realtime should handle signal_update message');
-      assert.ok(realtime.includes('new_signal'), 'Realtime should handle new_signal message');
-    });
-  });
+  // 【2026-08-28】移除 Realtime.tsx — AG Grid 描述块（实时信号流页已下线）
 
   describe('Positions.tsx — ECharts', () => {
     const positions = readSrc('pages/dashboard/Positions.tsx');
@@ -496,24 +473,7 @@ describe('AREA 5 — Dashboard Chart Libraries', () => {
     });
   });
 
-  describe('Statistics.tsx — ECharts', () => {
-    const stats = readSrc('pages/dashboard/Statistics.tsx');
-
-    it('should register PieChart, BarChart, LineChart', () => {
-      assert.ok(stats.includes('PieChart'), 'Statistics missing PieChart');
-      assert.ok(stats.includes('BarChart'), 'Statistics missing BarChart');
-      assert.ok(stats.includes('LineChart'), 'Statistics missing LineChart');
-    });
-
-    it('should use KpiCard for metrics display', () => {
-      assert.ok(stats.includes('KpiCard'), 'Statistics missing KpiCard usage');
-    });
-
-    it('should display win rate pie chart and symbol comparison bar chart', () => {
-      assert.ok(stats.includes('win_rate'), 'Statistics missing win rate');
-      assert.ok(stats.includes('symbol_breakdown'), 'Statistics missing symbol breakdown');
-    });
-  });
+  // 【2026-08-28】移除 Statistics.tsx — ECharts 描述块（统计分析页已下线）
 
   describe('Health.tsx — Service Cards', () => {
     const health = readSrc('pages/dashboard/Health.tsx');
@@ -550,21 +510,7 @@ describe('AREA 5 — Dashboard Chart Libraries', () => {
     });
   });
 
-  describe('Compare.tsx — ECharts Heatmap', () => {
-    const compare = readSrc('pages/dashboard/Compare.tsx');
-
-    it('should register HeatmapChart', () => {
-      assert.ok(compare.includes('HeatmapChart'), 'Compare missing HeatmapChart');
-    });
-
-    it('should register VisualMapComponent for color scale', () => {
-      assert.ok(compare.includes('VisualMapComponent'), 'Compare missing VisualMapComponent');
-    });
-
-    it('should use heatmap for multi-symbol comparison', () => {
-      assert.ok(compare.includes("type: 'heatmap'"), 'Compare missing heatmap series type');
-    });
-  });
+  // [2026-08-28] 移除 Compare.tsx — ECharts Heatmap 用例（品种对比页下线）
 });
 
 // ============================================================
@@ -656,17 +602,21 @@ describe('AREA 7 — File Completeness & Configuration', () => {
       'pages/Login.tsx',
       'pages/system/Users.tsx', 'pages/system/Network.tsx', 'pages/system/MT5.tsx',
       'pages/system/DeepSeek.tsx', 'pages/system/Notifications.tsx', 'pages/system/Cache.tsx',
-      'pages/signaltower/Mode.tsx', 'pages/signaltower/Threshold.tsx', 'pages/signaltower/Prompt.tsx',
-      'pages/signaltower/Watchdog.tsx', 'pages/signaltower/SymbolConfig.tsx',
+      // [2026-08-28] 移除 'pages/signaltower/Threshold.tsx'（评分阈值页下线）
+      'pages/signaltower/Mode.tsx', 'pages/signaltower/Prompt.tsx',
+      // [2026-08-28] 移除 'pages/signaltower/SymbolConfig.tsx'（品种级配置页下线）
+      'pages/signaltower/Watchdog.tsx',
       'pages/datasource/DatasourceList.tsx',
       'pages/engine/EngineRules.tsx',
-      'pages/dispatch/DispatchConfig.tsx',
+      // [2026-08-28] 移除 'pages/dispatch/DispatchConfig.tsx'（分发配置页下线）
       'pages/risk/RiskConfig.tsx',
       'pages/close/CloseConfig.tsx',
-      'pages/copy/CopyConfig.tsx',
-      'pages/dashboard/Realtime.tsx', 'pages/dashboard/Positions.tsx',
-      'pages/dashboard/Statistics.tsx', 'pages/dashboard/Health.tsx',
-      'pages/dashboard/Factors.tsx', 'pages/dashboard/Compare.tsx',
+      // [2026-08-28] 'pages/copy/CopyConfig.tsx' → 'CopyLayout.tsx'（实际入口文件，原期望已过时）
+      'pages/copy/CopyLayout.tsx',
+      // [2026-08-28] 移除 'pages/dashboard/Realtime.tsx'、'pages/dashboard/Statistics.tsx'
+      // [2026-08-28] 移除 'pages/dashboard/Compare.tsx'（品种对比页下线）
+      'pages/dashboard/Positions.tsx', 'pages/dashboard/Health.tsx',
+      'pages/dashboard/Factors.tsx',
     ];
     for (const page of pages) {
       assert.ok(fileExists(page), `Missing page file: ${page}`);
@@ -719,7 +669,7 @@ describe('AREA 8 — ConfigForm Usage in Config Pages', () => {
   const configPages = [
     { file: 'pages/system/DeepSeek.tsx', title: 'DeepSeek AI' },
     { file: 'pages/system/MT5.tsx', title: 'MT5 接入' },
-    { file: 'pages/signaltower/Threshold.tsx', title: '评分阈值' },
+    // 【2026-08-28】移除 pages/signaltower/Threshold.tsx（评分阈值公用参数页已下线）
   ];
 
   for (const { file, title } of configPages) {
@@ -742,11 +692,7 @@ describe('AREA 8 — ConfigForm Usage in Config Pages', () => {
     assert.equal(fieldCount, 9, `MT5 expected 9 fields, found ${fieldCount}`);
   });
 
-  it('Threshold.tsx should use useSymbol for symbol-aware config', () => {
-    const threshold = readSrc('pages/signaltower/Threshold.tsx');
-    assert.ok(threshold.includes('useSymbol'), 'Threshold should use useSymbol hook');
-    assert.ok(threshold.includes('selectedSymbol'), 'Threshold should reference selectedSymbol');
-  });
+  // 【2026-08-28】移除 Threshold.tsx 的 useSymbol 断言（页面已下线）
 });
 
 console.log('\n✅ All test suites loaded. Run with: node --test tests/qa-validation.test.mjs\n');

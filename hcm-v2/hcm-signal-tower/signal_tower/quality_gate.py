@@ -40,6 +40,15 @@ CFG_FALLBACK: dict[str, Any] = {
     # → 融合 source="none" → 透传纯 HEXP（不误杀）。默认 60s（sidecar 每 ~5s 刷新，
     # 容 12 次刷新空窗）。仅影响"断流期"裁决，模型真在场且分低仍 VETO。
     "ai.lm.max_age_sec": 60.0,
+    # 【阶段 1·方向共振】dir_lm(方向头)与 dir_hexp(HEXP 方向)共振，仅否决/增强，
+    # 绝不独立开方向（铁律）。默认关闭：不共振（仅保留删 ai_opened 的纪律修正）。
+    "ai.lm.direction_fuse": False,
+    "ai.lm.dir_veto_prob": 0.65,      # 反向且 dir_lm 概率≥此值 → VETO(反向否决)
+    # 【阶段 2·买点共振】entry_lm(买点头)好买点概率 ai_entry(0-1) 与 hexp entry_quality 共振，
+    # 仅否决/增强入场时机质量，绝不独立开方向（铁律）。默认关闭。
+    "ai.lm.entry_fuse": False,
+    "ai.lm.entry_boost_prob": 0.60,   # ai_entry≥此值 → 增强好买点(boost_good_entry)
+    "ai.lm.entry_veto_prob": 0.35,    # ai_entry≤此值 → 否决差买点(veto_bad_entry)
     "ai.cpl.enabled": False,
     "ai.cpl.w_trend": 0.7,
     "ai.cpl.w_neutral": 0.6,
@@ -66,11 +75,17 @@ CFG_FALLBACK: dict[str, Any] = {
     # false 时保持原 none 语义(不干预手数)。coupled 模式不受此开关影响(走 total 融合)。
     "hexp.lot_tier_enabled": True,
     "hexp.coupling_pass_threshold": 50.0,
-    # tier 门槛按真实 total 分布标定(2026-08-14)：total=w·hp+(1-w)·c_ai 实测≈50~65，
-    # 原 85/70/60 全部高于分布上限 → 任何信号都 tier=none 被压制(全量不下单)。
-    "ai.cpl.tier_high": 70.0,
-    "ai.cpl.tier_mid": 58.0,
-    "ai.cpl.tier_low": 45.0,
+    # 【2026-08-28 口径修正】tier 门槛按 scorecard_total 真实分布标定（0~1 口径）。
+    # 原注释/值按 0-100 口径(85/70/60 及 70/58/45) 设定，但 lot_tier_for 实际输入
+    # 是 scorecard_total（scheduler.py:264/337 明确用 scorecard_total 而非 hp_score），
+    # 实测分布 p25=0.5/p50=0.6/p75=0.6/max=0.9（2026-08-21~28，n=1364）。
+    # 0-100 口径阈值永远高于 1.0 → 全量 tier=none → scheduler 强转 low → 风控全量
+    # 0.01 手（分档完全失效）。现统一到 0~1 口径，与风控 risk.score_tier_* 对齐：
+    #   low>=0.45 覆盖~75%  mid>=0.55 覆盖~55%  high>=0.65 覆盖~20%
+    # 此值与 DB 已热调一致（config_provider 双写），仅作代码侧兜底/文档归一。
+    "ai.cpl.tier_high": 0.65,
+    "ai.cpl.tier_mid": 0.55,
+    "ai.cpl.tier_low": 0.45,
     "ai.cpl.lot_high": 1.5,
     "ai.cpl.lot_low": 0.5,
 }
@@ -148,14 +163,14 @@ def coupling_total(hp_score: float, c_ai: float, k: float, cfg: dict) -> float:
 
 
 def lot_tier_for(total: float, cfg: dict) -> str:
-    """耦合总分 → 手数分档（low/mid/high/none）。
+    """综合分 scorecard_total（0~1 口径）→ 手数分档（low/mid/high/none）。
 
     仅当 ai.cpl.enabled=true 时启用；否则 caller 侧 fallback 为 "none"。
-    tier 分界（0-100 总分）：
-      total >= ai.cpl.tier_high(85) → "high"
-      total >= ai.cpl.tier_mid(70)  → "mid"
-      total >= ai.cpl.tier_low(60)  → "low"
-      否则                          → "none"（极弱：不发）
+    tier 分界（0~1 口径，2026-08-28 按真实分布标定）：
+      total >= ai.cpl.tier_high(0.65) → "high"
+      total >= ai.cpl.tier_mid(0.55)  → "mid"
+      total >= ai.cpl.tier_low(0.45)  → "low"
+      否则                            → "none"（极弱：不发）
     返回的是「档位语义」而非固定倍率——实际倍率由风控面板的动态手数
     配置（risk.lot_multiplier_{low|mid|high} + risk.lot_base）决定，
     实现「AI 只选档、风控定准确下单值」的链动设计（2026-08-14 需求）。
@@ -183,7 +198,7 @@ def adjust_grade(p: float, grade: str, cfg: dict, passed: bool = True):
     否决纪律（2026-08-14 修正）：
       - 仅当 p < veto_floor（极低分）才 VETO → 杜绝"中等分 38 必全杀"死锁；
       - p ∈ [veto_floor, down_threshold) → DOWNGRADE（降一级，仍放行）；
-      - p ≥ up_threshold → UPGRADE（升一级；若 hexp 原未放行则视为 AI 打开）；
+      - p ≥ up_threshold 且 hexp 已放行(passed) → UPGRADE（升一级，增强已放行信号）；
       - 其余 → HOLD（原样放行）。
     """
     veto_floor = _g(cfg, "ai.lm.veto_floor")
@@ -194,12 +209,13 @@ def adjust_grade(p: float, grade: str, cfg: dict, passed: bool = True):
         return "VETO", grade
     if p < down_th:
         return "DOWNGRADE", GRADE_ORDER[max(0, idx - 1)]
-    if p >= up_th:
+    # 【阶段 1·铁律】UPGRADE 仅当 hexp 已放行(passed=True)。passed=False（hexp 已拦）
+    # 时 AI 不得 UPGRADE 打开信号（绝不越过 HEXP 闸门独立开仓）。
+    if passed and p >= up_th:
         return "UPGRADE", GRADE_ORDER[min(len(GRADE_ORDER) - 1, idx + 1)]
-    # HOLD：hexp 未放行但 AI 中等分 → 视为 AI 赋能打开（仅当 hexp 给了明确方向，
-    # 由 decide() 上游保证 direction∈BUY/SELL 才走到这）
-    if not passed:
-        return "UPGRADE", GRADE_ORDER[min(len(GRADE_ORDER) - 1, idx + 1)]
+    # HOLD：hexp 未放行但 AI 中等分 → 【阶段 1·纪律修正】不再"UPGRADE 打开"。
+    # 铁律：AI 绝不独立开出 HEXP 没给的方向。故 hexp 未放行(passed=False)的信号，
+    # AI 再高分也只能 HOLD（不打开），绝不允许 AI 越过 HEXP 闸门开仓。
     return "HOLD", grade
 
 
@@ -208,6 +224,9 @@ def decide(
     c_ai: Optional[float],
     cfg: dict,
     c_ai_meta: Optional[dict] = None,
+    ai_direction: Optional[str] = None,
+    ai_dir_prob: Optional[float] = None,
+    ai_entry: Optional[float] = None,
 ) -> dict:
     """闸门主入口。
 
@@ -271,9 +290,52 @@ def decide(
     total = coupling_total(hp_score, c_ai, k, cfg)
 
     # 1) 等级裁决（否决/降级/保持/升级）——门槛用 0-1 归一（c_ai/100）
-    #    passed=False（hexp 拦了但给了方向）也参与裁决：AI 高分可"打开"该信号，
-    #    实现双信号融合的真正赋能（任一侧强信号都应能开仓）。
+    #    铁律：HEXP 闸门是开仓唯一总开关。passed=False（hexp 已拦）的信号，
+    #    AI 再高分也只能 HOLD（不打开）——绝不允许 AI 越过 HEXP 闸门独立开仓
+    #    （2026-08-28 阶段 1·纪律修正：删原 ai_opened 打开逻辑）。
     action, final_grade = adjust_grade(c_ai / 100.0, grade, cfg, passed=passed)
+
+    # 【阶段 1·方向共振】dir_lm(方向头) × dir_hexp(HEXP 方向)：
+    #   仅否决/增强 action，绝不改 snapshot.direction（方向永远由 HEXP 决定）。
+    #   灰度：ai.lm.direction_fuse=false 时不参与（仅保留上方删 ai_opened 纪律修正）。
+    dir_resonance = "none"
+    if _g(cfg, "ai.lm.direction_fuse") and ai_direction not in (None, "HOLD", "NO_TRADE"):
+        dir_hexp = direction
+        _p_veto = _g(cfg, "ai.lm.dir_veto_prob")
+        _opp = {"BUY": "SELL", "SELL": "BUY"}
+        if dir_hexp in ("BUY", "SELL"):
+            if ai_direction == _opp.get(dir_hexp) and (ai_dir_prob or 0.0) >= _p_veto:
+                # 反向否决：dir_lm 高置信反向 → 否决该信号（仅拒绝，不改方向，铁律友好）
+                action, final_grade, lot_tier = "VETO", grade, "none"
+                dir_resonance = "veto_reverse"
+            elif ai_direction == dir_hexp:
+                # 同向增强：hexp 已放行(passed)的已开信号升级一级增强置信；
+                # hexp 未放行(passed=False)不打开（铁律：不越过 HEXP 闸门）。
+                if passed and action in ("HOLD", "DOWNGRADE"):
+                    _idx = grade_index(grade)
+                    action = "UPGRADE"
+                    final_grade = GRADE_ORDER[min(len(GRADE_ORDER) - 1, _idx + 1)]
+                    dir_resonance = "boost_same"
+
+    # 【阶段 2·买点共振】entry_lm(买点头)好买点概率 ai_entry(0-1) × hexp 入场质量：
+    #   仅否决/增强入场时机质量，绝不改 snapshot.direction（方向永远由 HEXP 决定，铁律友好）。
+    #   灰度：ai.lm.entry_fuse=false 时不参与。与 dir_resonance 平行、独立维度，VETO 优先。
+    entry_resonance = "none"
+    if _g(cfg, "ai.lm.entry_fuse") and ai_entry is not None:
+        _e_boost = _g(cfg, "ai.lm.entry_boost_prob")
+        _e_veto = _g(cfg, "ai.lm.entry_veto_prob")
+        if ai_entry <= _e_veto:
+            # 否决差买点：点位质量差 → 否决该信号（仅拒绝入场时机，不改方向）。
+            action, final_grade, lot_tier = "VETO", grade, "none"
+            entry_resonance = "veto_bad_entry"
+        elif ai_entry >= _e_boost:
+            # 增强好买点：hexp 已放行(passed)的已开信号升级一级增强入场质量置信；
+            # hexp 未放行(passed=False)不打开（铁律：不越过 HEXP 闸门）。
+            if passed and action in ("HOLD", "DOWNGRADE"):
+                _idx = grade_index(grade)
+                action = "UPGRADE"
+                final_grade = GRADE_ORDER[min(len(GRADE_ORDER) - 1, _idx + 1)]
+                entry_resonance = "boost_good_entry"
 
     # 2) 手数分档（low/mid/high/none）：统一用 6 维综合分 scorecard_total 决定，
     #    禁止用耦合总分 total（含 hp_score 强度权重，不稳定）或 hp_score 单维。
@@ -283,8 +345,9 @@ def decide(
     # 否决 → 手数分档置 none（不发信号）
     if action == "VETO":
         lot_tier = "none"
-    # AI 打开 hexp 未放行信号 → 标记 ai_opened，供 scheduler 覆盖 threshold_passed
-    ai_opened = (action == "UPGRADE" and not passed)
+    # 【阶段 1·纪律修正】原 ai_opened（AI 打开 hexp 未放行信号）已永久删除：
+    # 铁律要求 AI 绝不独立开出 HEXP 没给的方向，故恒为 False（保留字段兼容 scheduler）。
+    ai_opened = False
 
     # 2026-08-17 方案甲：HEXP 已过闸信号的「耦合二次放行门槛」。
     # 仅在 coupled + c_ai 有效路径（即已走到此处）计算；total 低于门槛 → coupling_pass=False，
@@ -300,6 +363,8 @@ def decide(
         "c_ai": round(c_ai, 2),
         "s_hp": hp_score,
         "ai_opened": ai_opened,
+        "dir_resonance": dir_resonance,  # 阶段 1·方向共振诊断: none/boost_same/veto_reverse
+        "entry_resonance": entry_resonance,  # 阶段 2·买点共振诊断: none/boost_good_entry/veto_bad_entry
         "coupling_pass": coupling_pass,
         # caller 区分 "none=cpl 未启用(不得压制)" 与 "none=极弱压制"
         "cpl_enabled": bool(_g(cfg, "ai.cpl.enabled")),

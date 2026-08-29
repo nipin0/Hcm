@@ -67,21 +67,24 @@ class MicroStateClassifier:
         if self._config is None:
             return
         try:
+            # 【2026-08-28 co_source v2 清除】本模块虽带 co_source 血统，但已被 HEXP 入场
+            # 闸门直接依赖（scheduler.py:1961-2013）。配置键由 co.v2.* 迁至 hexp.entry.*，
+            # 消除 co_source 命名残留；值经同值双写迁移，行为零变化。
             self._pullback_atr_min = await self._config.get_float(
-                "co.v2.pullback_atr_min", 0.5)
+                "hexp.entry.pullback_atr_min", 0.5)
             self._pullback_atr_max = await self._config.get_float(
-                "co.v2.pullback_atr_max", 1.5)
+                "hexp.entry.pullback_atr_max", 1.5)
             self._accel_strict_enabled = await self._config.get_bool(
-                "co.v2.accel_strict_enabled", True)
+                "hexp.entry.accel_strict_enabled", True)
             self._accel_lookback = int(await self._config.get_float(
-                "co.v2.accel_lookback", 12))
+                "hexp.entry.accel_lookback", 12))
             self._accel_er_min = await self._config.get_float(
-                "co.v2.accel_er_min", 0.35)
+                "hexp.entry.accel_er_min", 0.35)
             self._accel_disp_atr_min = await self._config.get_float(
-                "co.v2.accel_disp_atr_min", 1.0)
+                "hexp.entry.accel_disp_atr_min", 1.0)
             for _s in MicroState:
                 self._theta[_s] = await self._config.get_float(
-                    f"co.v2.theta.{_s.value}", self._theta[_s])
+                    f"hexp.entry.theta.{_s.value}", self._theta[_s])
         except Exception as exc:  # pragma: no cover - 配置缺失时安全回退
             logger.warning("MicroState config load failed (using defaults): %s", exc)
 

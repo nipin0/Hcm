@@ -247,11 +247,14 @@ THRESHOLD_CONFIG_DEFAULTS: dict[str, Any] = {
     "regime_adx_trend": 24.0,  # [2026-08-01] 对齐部署（scheduler/前端均 24）
     "regime_adx_range": 22.0,
     "regime.trend_strong_adx_threshold": 28.0,
-    # ── ④ Score gate — scoring_engine.py _compute_threshold & co_source.py _apply_adaptive_gate ──
+    # ── ④ Score gate — scoring_engine.py _compute_threshold ──
+    # 【2026-08-28 co_source 清除】原 co_source.py _apply_adaptive_gate 已随双源下线删除；
+    # scoring.neutral_min_score_threshold 是其唯一真实消费者，属双源遗留死键，已移除
+    # （scoring_engine.py:1638 仅加载该值，全库无计算点引用）。
     "scoring.min_score_threshold": 0.15,
-    "scoring.neutral_min_score_threshold": 0.28,  # [2026-08-01] 对齐部署（NEUTRAL 体制专属评分门槛）
-    # ── ⑤ AI dispute dispatch — scheduler.py:885 ──
-    "scoring.M5.dispute_diff_threshold": 0.05,
+    # 【2026-08-28 死键清除】scoring.M5.dispute_diff_threshold 已移除：
+    # scheduler.py:484/4525 读取后仅赋值到 SymbolState（:494），全库无读取点参与判定；
+    # 前端描述声称的「scheduler.py:885 消费」不成立（该行无此逻辑）。
     # ── ⑥ Reverse-trend protection (Plan B) — scoring_engine.py gate ──
     "scoring.trend_reverse_suppress_factor": 0.40,  # [2026-08-01] 对齐部署
     "scoring.strong_trend_block_reverse": True,
@@ -276,7 +279,7 @@ THRESHOLD_CONFIG_DEFAULTS: dict[str, Any] = {
     # ── 2026-07-25: RANGE 均值回归硬闸门（震荡市逢高做空/逢低做多）──
     "scoring.range_min_pct_b": 0.15,
     "scoring.range_stoch_extreme": 25.0,
-    "scoring.range_rsi_extreme_low": 30.0,  # [2026-08-01] 对齐部署
+    "scoring.range_rsi_extreme_low": 28.0,  # [2026-08-28] 对齐 PG 生效真值 28（原 30）
     "scoring.range_rsi_extreme_high": 70.0,  # [2026-08-01] 对齐部署
     "scoring.range_breakout_mult": 1.005,
     # ── 2026-07-25: 校准硬闸门（多而准）── 低胜率(体制,分数桶)直接 NO_TRADE
@@ -285,26 +288,19 @@ THRESHOLD_CONFIG_DEFAULTS: dict[str, Any] = {
     "scoring.calibration_gate_p": 0.55,  # [2026-08-01] 对齐部署
     "scoring.calibration_min_n": 12,
 
-    # ── Phase 1/2/3 重构灰度总开关（docs/cosource_refactor_plan.md 六）──
-    # False = 关闭，生产信号链路字节级不变；True = 启用 precision_entry/micro_state
-    # 驱动的收敛决策（co_source.apply_v2）。仅灰度暴露，启用前必须经 shadow 验证。
-    "co.v2_enabled": False,
-    # ── Phase 0/1/2/3 重构可调参数（micro_state / precision_entry 消费）──
-    # 灰度关闭时这些值仅经 get_float 代码默认生效；显式暴露使面板/GET 可见、
-    # 可经 config_provider.set 持久化热调。键名须与 micro_state.load_config /
-    # precision_entry.load_config 读取完全一致。
+    # 【2026-08-28 co_source 清除】原「Phase 0/1/2/3 双源重构」块整体移除：
+    #   - co.v2_enabled        : 双源 v2 收敛决策(co_source.apply_v2)灰度开关，语义目标已删。
+    #                            注意：scoring_engine.py:1751 仍在读它并用 `not self._v2_enabled`
+    #                            守卫 :673 / :747 / :772 三段 HEXP 逻辑（overheat 豁免、
+    #                            lag_momentum 冲突处理）。当前 PG 真值为 'true' → 三段逻辑
+    #                            全部被跳过；本键从默认值表移除后，代码回退默认 False →
+    #                            HEXP 的 overheat_suppress_in_trend / lag_momentum_conflict_block
+    #                            恢复正常生效（这是双源残留对 HEXP 的持续压制，属修复）。
+    #   - co.v2_shadow_enabled : 仅 scheduler 采 shadow 样本用，非双源决策键，保留。
+    #   - co.v2.weight.* / min_rr / pullback_atr_* / theta.* : 已迁至 hexp.entry.* 命名空间
+    #                            （micro_state.py / precision_entry.py 已改读新键），
+    #                            此处 13 个旧键全库无引用 → 纯死键，一并移除。
     "co.v2_shadow_enabled": True,
-    "co.v2.weight.align": 0.40,
-    "co.v2.weight.structure": 0.40,
-    "co.v2.weight.rr": 0.20,
-    "co.v2.min_rr": 1.2,
-    "co.v2.pullback_atr_min": 0.5,
-    "co.v2.pullback_atr_max": 1.5,
-    "co.v2.theta.TREND_ACCEL": 0.45,
-    "co.v2.theta.TREND_PULLBACK": 0.30,
-    "co.v2.theta.TREND_EXHAUST": 0.55,
-    "co.v2.theta.RANGE": 0.45,
-    "co.v2.theta.REVERSAL": 0.50,
 }
 
 # Cooldown endpoint = SUBSET of THRESHOLD_CONFIG_DEFAULTS (the 6 regime
@@ -1711,11 +1707,16 @@ def create_signal_tower_router(
     async def _read_funnel_thresholds() -> dict:
         """Read live gate thresholds from ConfigProvider (PG + Redis)."""
         # [2026-08-01] 漏斗诊断回退默认对齐部署真值（与 THRESHOLD_CONFIG_DEFAULTS / Redis 一致）
+        # 【2026-08-28 co_source 清除】co.gate.strong/weak.trend、co.gate.adx_strong、
+        # co.gate.range.block 是双源自适应门槛键，已随双源引擎下线从 PG/Redis 清除；
+        # 此处保留默认值**仅供历史信号（co_source 时代产生）的漏斗归因展示**——
+        # 删掉会让历史信号的「未过门槛」归因显示为 null。
+        # 当前 HEXP 信号的真实门槛请看 scoring.min_score_threshold（下方仍在读取）。
         defaults: dict[str, Any] = {
             "co.gate.strong.trend": 40.0,
             "co.gate.weak.trend": 50.0,
             "co.gate.adx_strong": 18.0,
-            "co.gate.direction_min_score": 0.30,
+            "co.gate.direction_min_score": 0.30,   # 活键：scoring_engine.py:1648 读 → :483 方向裁定
             "co.gate.range.block": False,
             "scoring.min_adx_for_trade": 18.0,
             "scoring.trend_strong_adx_threshold": 18.0,

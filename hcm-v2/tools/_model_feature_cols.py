@@ -50,4 +50,14 @@ MODEL_FEATURE_COLS = [
     "ds_fake_prob",
     "ds_sl_coeff",
     "ds_continuity",
+    # 【阶段 2·方案 A·质量头治本】入场质量特征：质量标签="入场后先触 ±R 哪边"，
+    # 依赖入场点本身优劣（离 stop 远/离 target 近=好入场）。此前 36 维特征全是市场状态指标、
+    # 不含入场位置信息 → 质量头 AUC≈0.48（不可学）。现注入 3 维入场质量因子（推理侧可从
+    # hexp 快照 entry_price/sl_price/atr 取，训练侧从 signals 表取，口径对齐）：
+    #   r_dist_atr     : R/atr（止损距离相对波动率，越大=越难被扫、越易达标）
+    #   sl_mult_used   : 实际 SL 倍数（ai_sl_mult，越大=止损越宽）
+    #   entry_atr_ratio: entry_price/atr（价位相对波动率，量纲无关）
+    "r_dist_atr",
+    "sl_mult_used",
+    "entry_atr_ratio",
 ]

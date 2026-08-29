@@ -81,13 +81,14 @@ const HexpDashboard: React.FC = () => {
   // 真实路由键是配置中心 `signal.active_model`（scheduler._detect_active_model 用它做机制路由），
   // 与 `signal_tower.mode` 是两个不同的概念：
   //   · signal_tower.mode = ai_dynamic / manual / co_source（仅区分手动镜像 vs 自动模型路由）
-  //   · signal.active_model = default / co_source / hexp（真正决定走哪条评分链路）
-  // 因此必须读 cosource 配置端点，取 `signal.active_model`；读 `signal_tower.mode` 会误判（如返回
-  // co_source 却误以为 hexp 未激活）。
+  //   · signal.active_model = default / hexp（真正决定走哪条评分链路；
+  //     【2026-08-28】双源 co_source 已下线，不再是可选取值）
+  // 因此必须读 engine-mode 配置端点（原 cosource 端点），取 `signal.active_model`；
+  // 读 `signal_tower.mode` 会误判。
   // 参考实现：src/pages/signaltower/Mode.tsx fetchActiveMode()
   const loadActiveModel = useCallback(async (): Promise<void> => {
     try {
-      const res = await client.get(ENDPOINTS.cosource.config);
+      const res = await client.get(ENDPOINTS.engineMode.config);
       const d = res.data?.data ?? {};
       const v = d['signal.active_model'] ?? null;
       if (v === null || v === undefined) return;

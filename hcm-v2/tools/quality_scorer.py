@@ -37,8 +37,69 @@ from quality_features import enrich_klines, session_onehot  # noqa: E402
 from _model_feature_cols import MODEL_FEATURE_COLS  # noqa: E402
 
 import faulthandler  # noqa: E402
+import logging  # noqa: E402
+import logging.handlers  # noqa: E402
 
 faulthandler.enable()  # 原生 DLL 静默死时 dump 到 stderr→launch 日志
+
+
+def _setup_rolling_log():
+    """滚动日志桥接：把 stdout/stderr 全部接管到 RotatingFileHandler。
+
+    【2026-08-27 治本】此前 launcher 以追加模式 open 日志、子进程无轮转，
+    长期运行涨到 6.5GB 撑爆磁盘。现改为按大小滚动（20MB/份，保留 5 份，
+    上限 100MB），超出自动切割并备份，根治爆盘。
+    launcher 不再自己 open 文件，由 sidecar 自管日志（见 quality_scorer_launcher.py）。
+
+    桥接做法：用 logging 的 RotatingFileHandler 写文件，再以 StreamHandler 形式
+    把 root logger 接到 sys.stdout/stderr，使所有 print(..., file=sys.stderr) 也落盘滚动。
+    """
+    _log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "models", "quality_scorer.log")
+    try:
+        os.makedirs(os.path.dirname(_log_path), exist_ok=True)
+        _rh = logging.handlers.RotatingFileHandler(
+            _log_path, mode="a", maxBytes=20 * 1024 * 1024, backupCount=5,
+            encoding="utf-8", delay=False,
+        )
+        _rh.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        _root = logging.getLogger()
+        _root.setLevel(logging.INFO)
+        # 避免重复添加（模块被重复 import 时）
+        if not any(isinstance(h, logging.handlers.RotatingFileHandler) for h in _root.handlers):
+            _root.addHandler(_rh)
+        # 桥接 print：stdout/stderr 写进 logger（INFO/WARNING 级），仍保留控制台可见性由 launcher 决定
+        class _LogWriter:
+            def __init__(self, lvl):
+                self._lvl = lvl
+                self._buf = ""
+
+            def write(self, s):
+                if not s:
+                    return
+                self._buf += s
+                if "\n" in self._buf:
+                    for line in self._buf.split("\n"):
+                        if line.strip():
+                            _root.log(self._lvl, line.rstrip())
+                    self._buf = ""
+
+            def flush(self):
+                if self._buf.strip():
+                    _root.log(self._lvl, self._buf.rstrip())
+                    self._buf = ""
+
+        sys.stdout = _LogWriter(logging.INFO)
+        sys.stderr = _LogWriter(logging.WARNING)
+        # faulthandler 死时 dump 仍指向原 stderr？这里仅重定向 Python 层；
+        # 原生 dump 走实际 fd，无影响。
+    except Exception as _e:
+        # 日志桥接失败绝不能阻塞主流程：退回原生 stderr
+        sys.stderr.write(f"[warn] rolling log setup failed: {_e}\n")
+
+
+_setup_rolling_log()
 
 # 【P1·推理防御】特征基准分布（训练集统计），供 PSI 漂移/离群检测。
 # 由 train_signal_quality.py 导出 models/feature_baseline.json，与模型同目录加载。
@@ -240,11 +301,16 @@ FEATURE_COLS = MODEL_FEATURE_COLS
 
 
 def load_config(conn, redis_cli=None) -> dict:
-    """读 ai.* 配置：PG 为基准，Redis hcm:config:v2 覆盖值优先（与 scheduler 一致）。
+    """读 ai.* 配置：PG 为唯一真值，Redis hcm:config:v2 仅作缺失补位。
 
     修复(2026-08-14)：sidecar 此前只读 PG current_value，但 ai.mode/ai.enabled 等
     经 config_provider.set 双写后 Redis 覆盖值才是运行时真值 → 导致 sidecar 快照
-    展示 mode=decoupled 而 scheduler 实际以 coupled 运行，误导前端。现统一读 Redis 覆盖。
+    展示 mode=decoupled 而 scheduler 实际以 coupled 运行，误导前端。故引入 Redis 读取。
+
+    修正(2026-08-28 P1-8)：上一段修复把 Redis 设为**无条件覆盖** PG，与铁律 5.2
+    「PG current_value 为唯一真值」冲突 —— Redis 侧任何残留/手工改写的脏值都会
+    盖掉 PG。现改为 PG 为准、Redis 仅填补 PG 缺失的键：config_provider 双写正常时
+    两端一致，行为与修复(2026-08-14)完全相同；同时杜绝 Redis 脏值反向污染。
     """
     cfg = {}
     redis_override = {}
@@ -267,8 +333,15 @@ def load_config(conn, redis_cli=None) -> dict:
         )
         for k, v in cur.fetchall():
             cfg[k] = v
-    # Redis 覆盖值优先（与 scheduler 的 config_provider 双写行为对齐）
-    cfg.update(redis_override)
+    # 【2026-08-28 P1-8】真值优先级修正：铁律 5.2「配置是否真正生效以 PG
+    # current_value 为唯一真值，Redis 仅 L2 缓存」。
+    # 原 `cfg.update(redis_override)` 让 Redis 无条件覆盖 PG —— 一旦某条路径
+    # 单端直写 Redis（历史上的违规写点 / 运维手工 HSET），脏值就会盖掉 PG 正确值
+    # 并被本 sidecar 采用，产出的训练样本配置快照与真源不一致。
+    # 改为「PG 为准、Redis 仅补缺」：config_provider 双写正常时两端一致，**行为不变**；
+    # 仅当 PG 无该键时才取 Redis 值（兼容历史上只存在于 Redis 的键，不丢配置）。
+    for _k, _v in redis_override.items():
+        cfg.setdefault(_k, _v)
     return cfg
 
 
@@ -297,19 +370,73 @@ def _calib_is_degenerate(iso, min_levels: int | None = None) -> bool:
     y_thresholds_ 只有 {0.0, 0.4, 1.0} 三级 → raw prob ∈[0.256,0.615] 全被压成
     常数 0.40 → ai_score 恒 40.0，LightGBM 的 24 个有效特征增益全部被抹平。
     此处检测唯一输出档位数，过少即视为退化（改用平滑混合，见 score_one）。
+
+    【2026-08-29 扩展·阶段 1 校准裁决】原实现**只认** sklearn IsotonicRegression
+    的 ``y_thresholds_``；而方向头 / 买点头用的是 ``calib_np.NumpyCalibrator``
+    （纯 numpy、无该属性，``calib_np.py:7`` 已注明"无 y_thresholds_ → 返回
+    False"）。后果：**这两头的校准器退化检测恒为 False、完全失效** ——
+    一旦小样本过拟合退化成常数，会悄悄抹平模型增益而无人察觉。
+    现补充 NumpyCalibrator 分支：以其 ``y_fit`` 唯一值数量作为档位数判定，
+    使「退化 → 混合 raw 恢复分辨率」的自愈能力覆盖到三头。
     """
     try:
-        yt = getattr(iso, "y_thresholds_", None)
-        if yt is None:
-            return False
-        levels = {round(float(v), 4) for v in yt}
         _min = CALIB_MIN_LEVELS if min_levels is None else int(min_levels)
-        return len(levels) < _min
+        # 分支 1（原逻辑）：sklearn IsotonicRegression
+        yt = getattr(iso, "y_thresholds_", None)
+        if yt is not None:
+            levels = {round(float(v), 4) for v in yt}
+            return len(levels) < _min
+        # 分支 2（新增）：calib_np.NumpyCalibrator —— 用 y_fit 唯一值数量
+        yf = getattr(iso, "y_fit", None)
+        if yf is not None:
+            levels = {round(float(v), 4) for v in yf}
+            return len(levels) < _min
+        return False
     except Exception:
         return False
 
 
-def load_model(model_path, calib_path, state_path=None):
+def _latest_version_path(dirname: str, basename_fmt: str) -> str | None:
+    """在同目录按版本号发现最新模型文件（替代硬编码 vN 回退）。
+
+    basename_fmt 形如 ``"lgbm_direction_v{}.txt"``：扫描同目录同名模式文件，
+    返回版本号**最大者**的完整路径；无匹配返回 None。
+
+    【2026-08-29 硬编码修正】原回退分支写死 ``lgbm_direction_v54.txt`` /
+    ``lgbm_entry_v54.txt``，导致 ``auto_retrain`` 重训出 v55+ 新模型后，
+    方向头与买点头仍加载 v54 旧版 —— 重训对这两头完全失效。
+    改为版本发现后，重训产出新版本即可被自动加载，实现无干预版本演进。
+
+    配置键（``ai.lm.dir_path`` / ``ai.lm.entry_path`` 等）显式指定时优先，
+    本函数**仅作缺省回退**，不覆盖人工配置。
+    """
+    import re as _re
+    import glob as _glob
+
+    if not dirname:
+        return None
+    prefix, suffix = basename_fmt.split("{}", 1)
+    pat = _re.compile(_re.escape(prefix) + r"(\d+)" + _re.escape(suffix) + r"$")
+    best_n, best_path = -1, None
+    try:
+        for p in _glob.glob(os.path.join(dirname, prefix + "*" + suffix)):
+            m = pat.search(os.path.basename(p))
+            if m:
+                n = int(m.group(1))
+                if n > best_n:
+                    best_n, best_path = n, p
+    except Exception:
+        return None
+    return best_path
+
+
+# 【2026-08-28 校准器修复】纯 numpy 校准器（无 sklearn 依赖），与 calib_v53.pkl 共用。
+# 独立模块保证 fit 脚本与生产侧 pickle 限定名一致(calib_np.NumpyCalibrator)。
+from calib_np import NumpyCalibrator  # noqa: E402
+
+
+def load_model(model_path, calib_path, state_path=None, dir_path=None, dir_calib_path=None,
+              entry_path=None, entry_calib_path=None):
     import lightgbm as lgb
     m = lgb.Booster(model_file=model_path)
     iso = None
@@ -333,7 +460,51 @@ def load_model(model_path, calib_path, state_path=None):
                   file=sys.stderr)
         except Exception as exc:
             print(f"[warn] state head load failed: {exc}", file=sys.stderr)
-    return m, iso, state_model, state_classes
+    # 【阶段 1·方向头】独立于质量头的多类方向模型（3 类：-1 空 / 0 观望 / +1 多）。
+    # 校准器为 calib_np.NumpyCalibrator 字典{dict{-1:..,0:..,1:..}}，生产无 sklearn 可加载。
+    # 灰度：dir_path/None 由调用方（_reload_cfg 的 ai.lm.dir_enabled）控制是否加载。
+    dir_model = None
+    dir_calibs = None
+    if dir_path and os.path.exists(dir_path):
+        try:
+            dir_model = lgb.Booster(model_file=dir_path)
+            if dir_calib_path and os.path.exists(dir_calib_path):
+                with open(dir_calib_path, "rb") as f:
+                    dir_calibs = pickle.load(f)
+                # 【阶段 1·校准裁决】逐类别检测退化（NumpyCalibrator 字典）
+                if isinstance(dir_calibs, dict):
+                    _deg = sorted(
+                        str(c) for c, cal in dir_calibs.items()
+                        if cal is not None and _calib_is_degenerate(cal)
+                    )
+                    if _deg:
+                        print(f"[warn] direction calibrator degenerate for classes {_deg} "
+                              f"(too few levels, small-sample overfit) → blending with "
+                              f"raw probability to restore resolution", file=sys.stderr)
+            print(f"[info] direction head loaded: {dir_path} calib={dir_calib_path}",
+                  file=sys.stderr)
+        except Exception as exc:
+            print(f"[warn] direction head load failed: {exc}", file=sys.stderr)
+    # 【阶段 2·买点头】独立二分类模型（好买点概率），校准器为 calib_np.NumpyCalibrator
+    # （纯 numpy，生产可加载）。灰度：entry_path/None 由调用方（ai.lm.entry_enabled）控制。
+    entry_model = None
+    entry_calib = None
+    if entry_path and os.path.exists(entry_path):
+        try:
+            entry_model = lgb.Booster(model_file=entry_path)
+            if entry_calib_path and os.path.exists(entry_calib_path):
+                with open(entry_calib_path, "rb") as f:
+                    entry_calib = pickle.load(f)
+                # 【阶段 1·校准裁决】买点头校准器退化检测
+                if entry_calib is not None and _calib_is_degenerate(entry_calib):
+                    print("[warn] entry calibrator degenerate (too few levels, "
+                          "small-sample overfit) → blending with raw probability "
+                          "to restore resolution", file=sys.stderr)
+            print(f"[info] entry head loaded: {entry_path} calib={entry_calib_path}",
+                  file=sys.stderr)
+        except Exception as exc:
+            print(f"[warn] entry head load failed: {exc}", file=sys.stderr)
+    return m, iso, state_model, state_classes, dir_model, dir_calibs, entry_model, entry_calib
 
 
 def build_features(snapshot: dict, kl: pd.DataFrame,
@@ -410,9 +581,33 @@ def build_features(snapshot: dict, kl: pd.DataFrame,
             # trend_aligned: 收盘是否站上 EMA20(顺趋势)
             _ema20 = _cl.ewm(span=20, adjust=False).mean().iloc[-1]
             row["trend_aligned"] = 1.0 if float(_cl.iloc[-1]) > float(_ema20) else 0.0
-        except Exception:
+        except (TypeError, ValueError):
             row["di_ratio"] = None; row["di_net"] = None; row["spread_atr_log"] = None
             row["close_mom_atr"] = None; row["trend_aligned"] = None
+        # 【阶段 2·方案 A·质量头治本】入场质量特征（推理侧从 hexp 快照取，训练侧从 signals
+        # 表取，口径一致）。质量标签="先触 ±R 哪边"，R = atr * ai_sl_mult（build_labels.label_one
+        # 同定义）。故入场质量直接由**无量纲**信号表达，避免 entry/sl 与 atr 单位不一致陷阱：
+        #   r_dist_atr     : ai_sl_mult（实际 SL 倍数 vs 标签默认 2.0，越大=止损越宽=越易达标）
+        #   sl_mult_used   : 同上（冗余保留对齐训练侧）
+        #   entry_atr_ratio: (entry - 近期close均值)/atr（入场相对价位的 ATR 归一 z，量纲无关）
+        _atr2 = float(snapshot.get("atr") or 0.0) or 1e-9
+        _mult = snapshot.get("ai_sl_mult")
+        _entry = snapshot.get("entry_price")
+        try:
+            _mult = float(_mult) if _mult is not None else 2.0
+            # entry 相对近期收盘的 ATR 归一（推理侧 kl 可得；缺则 0.0）
+            _entry_z = 0.0
+            if _entry is not None and kl is not None and not kl.empty:
+                _entry_f = float(_entry)
+                _close_mean = float(kl["close"].astype(float).iloc[-20:].mean()) if len(kl) >= 20 else float(kl["close"].astype(float).iloc[-1])
+                _entry_z = (_entry_f - _close_mean) / (_atr2 + 1e-9)
+            row["r_dist_atr"] = _mult
+            row["sl_mult_used"] = _mult
+            row["entry_atr_ratio"] = _entry_z
+        except (TypeError, ValueError):
+            row["r_dist_atr"] = 0.0
+            row["sl_mult_used"] = 2.0
+            row["entry_atr_ratio"] = 0.0
     envf = env_feats or {}
     row["event_proximity_min"] = envf.get("event_proximity_min")
     row["macro_risk_score"] = envf.get("macro_risk_score")
@@ -515,7 +710,8 @@ def _env_features(conn) -> dict:
     return out
 
 
-def score_one(model, iso, feats: dict, state_model=None, state_classes=None):
+def score_one(model, iso, feats: dict, state_model=None, state_classes=None,
+              dir_model=None, dir_calibs=None, entry_model=None, entry_calib=None):
     """用模型的 feature_name() 对齐列（train/inference 同构，禁硬编码列序）。
 
     【路线①·状态粒度优化 2026-08-18】去离散 state one-hot，质量头纯靠连续结构
@@ -524,6 +720,8 @@ def score_one(model, iso, feats: dict, state_model=None, state_classes=None):
     边界，TREND 类内随 dz/macd_slope 连续分化(不再"见 TREND 直接给 1.0")。
     状态头(state_model)仅作诊断：预测 predicted_state 供主循环在线分位缓冲观测，
     【不再拼回特征向量】(原 state_{sc} one-hot 拼接是 TREND 无区分度的根因)。
+    【阶段 1·方向头】dir_model 加载时额外推断 ai_direction(BUY/SELL/HOLD)+ ai_dir_prob。
+    方向头仅作"同向增强/反向否决"输入（永不独立开方向，红线），灰度默认 None。
     """
     try:
         names = model.feature_name()
@@ -559,7 +757,69 @@ def score_one(model, iso, feats: dict, state_model=None, state_classes=None):
                 p = w * p_cal + (1.0 - w) * p_raw
             else:
                 p = p_cal
-        return (float(max(0.0, min(1.0, p))), predicted_state)
+        # 【阶段 1·方向头】仅在 dir_model 加载时推断方向（灰度安全：默认 None）。
+        # 类序与训练对齐：[-1, 0, 1]（空 / 观望 / 多）。校准器字典对各类概率 isotonic 校准。
+        ai_direction = None
+        ai_dir_prob = None
+        if dir_model is not None:
+            try:
+                _dnames = (dir_model.feature_name() if hasattr(dir_model, "feature_name")
+                           else dir_model.booster_.feature_name())
+                dfeats = {k: feats.get(k) for k in _dnames}
+                ddf = pd.DataFrame([dfeats])
+                for c in ddf.columns:
+                    ddf[c] = pd.to_numeric(ddf[c], errors="coerce").fillna(0.0)
+                _raw_proba = dir_model.predict(ddf)  # (1,3) 类序 [-1,0,1]
+                _classes = (-1, 0, 1)
+                if dir_calibs is not None:
+                    _cal_proba = []
+                    for _i, _c in enumerate(_classes):
+                        _raw_p = float(_raw_proba[0][_i])
+                        _cal = dir_calibs.get(_c)
+                        if _cal is not None:
+                            _cp = float(_cal.predict([_raw_p])[0])
+                            # 【阶段 1·校准裁决】该类别校准器退化 → 与 raw 混合恢复分辨率
+                            if _calib_is_degenerate(_cal):
+                                _cp = (CALIB_BLEND_W * _cp
+                                       + (1.0 - CALIB_BLEND_W) * _raw_p)
+                            _cal_proba.append(_cp)
+                        else:
+                            _cal_proba.append(_raw_p)
+                    _proba = _cal_proba
+                else:
+                    _proba = [float(x) for x in _raw_proba[0]]
+                _best = int(max(range(3), key=lambda i: _proba[i]))
+                ai_direction = ("BUY" if _classes[_best] == 1
+                                else "SELL" if _classes[_best] == -1 else "HOLD")
+                ai_dir_prob = float(_proba[_best])
+            except Exception as exc:
+                print(f"[warn] direction head predict failed: {exc}", file=sys.stderr)
+                ai_direction = None
+                ai_dir_prob = None
+        # 【阶段 2·买点头】仅在 entry_model 加载时推断好买点概率（灰度安全：默认 None）。
+        # 二分类：predict_proba[:,1] = 好买点概率，经 calib_np 校准后输出 ai_entry(0-1)。
+        ai_entry = None
+        if entry_model is not None:
+            try:
+                _enames = (entry_model.feature_name() if hasattr(entry_model, "feature_name")
+                           else entry_model.booster_.feature_name())
+                efeats = {k: feats.get(k) for k in _enames}
+                edf = pd.DataFrame([efeats])
+                for c in edf.columns:
+                    edf[c] = pd.to_numeric(edf[c], errors="coerce").fillna(0.0)
+                _e_raw = float(entry_model.predict(edf)[0])
+                if entry_calib is not None:
+                    _ep = float(entry_calib.predict([_e_raw])[0])
+                    # 【阶段 1·校准裁决】校准器退化 → 与 raw 混合恢复分辨率
+                    if _calib_is_degenerate(entry_calib):
+                        _ep = CALIB_BLEND_W * _ep + (1.0 - CALIB_BLEND_W) * _e_raw
+                    ai_entry = _ep
+                else:
+                    ai_entry = _e_raw
+            except Exception as exc:
+                print(f"[warn] entry head predict failed: {exc}", file=sys.stderr)
+                ai_entry = None
+        return (float(max(0.0, min(1.0, p))), predicted_state, ai_direction, ai_dir_prob, ai_entry)
     except Exception as exc:
         print(f"[warn] score failed (feature mismatch?): {exc}", file=sys.stderr)
         return (None, None)
@@ -656,6 +916,12 @@ def main():
         _cfg_reloaded_at = -1e9
         _period_match = "none"
         _align_m5 = False
+        # 【阶段 1·方向头】main 作用域变量，供 _reload_cfg 内 nonlocal 绑定。
+        dir_model = None
+        dir_calibs = None
+        # 【阶段 2·买点头】main 作用域变量，供 _reload_cfg 内 nonlocal 绑定。
+        entry_model = None
+        entry_calib = None
         enabled = False
         _ai_mode = "decoupled"
         _model_path = None
@@ -701,6 +967,7 @@ def main():
             nonlocal _cfg_reloaded_at, _period_match, _align_m5, enabled, _ai_mode
             nonlocal _model_path, _calib_path, model, iso, _feature_audit, _health_ttl
             nonlocal state_model, state_classes, _raw_fallback
+            nonlocal dir_model, dir_calibs, entry_model, entry_calib
             nonlocal _score_zscore, _score_smooth, _min_valid, _ds_window_sec
             now = time.time()
             if not force and (now - _cfg_reloaded_at) < _cfg_reload_sec:
@@ -714,6 +981,16 @@ def main():
             _period_match = str(cfg.get("ai.lm.period_match") or "none").strip().lower()
             _align_m5 = _period_match == "align_m5"
             _raw_fallback = _bool(cfg, "ai.lm.raw_fallback", False)
+            # 【阶段 1·方向头灰度】默认关闭：不加载方向头、不发布 ai_direction。
+            # 开启后 sidecar 发布 ai_direction(BUY/SELL/HOLD)+ ai_dir_prob，供信号塔共振。
+            _dir_enabled = _bool(cfg, "ai.lm.dir_enabled", False)
+            _dir_path = (cfg.get("ai.lm.dir_path") or "").strip() or None
+            _dir_calib_path = (cfg.get("ai.lm.dir_calib_path") or "").strip() or None
+            # 【阶段 2·买点头灰度】默认关闭：不加载买点头、不发布 ai_entry。
+            # 开启后 sidecar 发布 ai_entry(好买点概率 0-1)，供信号塔与 hexp entry_quality 共振。
+            _entry_enabled = _bool(cfg, "ai.lm.entry_enabled", False)
+            _entry_path = (cfg.get("ai.lm.entry_path") or "").strip() or None
+            _entry_calib_path = (cfg.get("ai.lm.entry_calib_path") or "").strip() or None
             # 【A 档·2026-08-18 增强配置】三键缺省=关闭/零，维持现状行为(纯分位 + 无平滑)。
             _score_zscore = _bool(cfg, "ai.lm.score_zscore", False)
             _score_smooth = _cfg_float(cfg, "ai.lm.score_smooth", 0.0)
@@ -735,13 +1012,52 @@ def main():
                 _cand = os.path.join(os.path.dirname(_new_model), "lgbm_state.pkl")
                 if os.path.exists(_cand):
                     _new_state = _cand
+            # 【阶段 1·方向头】默认同目录按版本发现最新 lgbm_direction_v{N}.txt
+            # + calib_dir_np_v{N}.pkl（2026-08-29 起不再硬编码 v54，见 _latest_version_path），
+            # 仅当 ai.lm.dir_enabled=true 才加载（灰度安全，默认不加载）。
+            # 显式配置 ai.lm.dir_path / dir_calib_path 优先于版本发现。
+            _new_dir = None
+            _new_dir_calib = None
+            if _dir_enabled and _new_model:
+                _d_cand = _dir_path or _latest_version_path(
+                    os.path.dirname(_new_model), "lgbm_direction_v{}.txt")
+                _dc_cand = _dir_calib_path or _latest_version_path(
+                    os.path.dirname(_new_model), "calib_dir_np_v{}.pkl")
+                if _d_cand and os.path.exists(_d_cand):
+                    _new_dir = _d_cand
+                    if _dc_cand and os.path.exists(_dc_cand):
+                        _new_dir_calib = _dc_cand
+            # 【阶段 2·买点头】与方向头同构：默认同目录按版本发现最新 lgbm_entry_v{N}.txt
+            # + calib_entry_np_v{N}.pkl（2026-08-29 起不再硬编码 v54，见 _latest_version_path），
+            # 仅当 ai.lm.entry_enabled=true 才加载（灰度安全，默认不加载）。
+            # 显式配置 ai.lm.entry_path / entry_calib_path 优先于版本发现。
+            _new_entry = None
+            _new_entry_calib = None
+            if _entry_enabled and _new_model:
+                _e_cand = _entry_path or _latest_version_path(
+                    os.path.dirname(_new_model), "lgbm_entry_v{}.txt")
+                _ec_cand = _entry_calib_path or _latest_version_path(
+                    os.path.dirname(_new_model), "calib_entry_np_v{}.pkl")
+                if _e_cand and os.path.exists(_e_cand):
+                    _new_entry = _e_cand
+                    if _ec_cand and os.path.exists(_ec_cand):
+                        _new_entry_calib = _ec_cand
             if ((_new_model, _new_calib) != (_model_path, _calib_path)
-                    or model is None or (_new_state != getattr(_reload_cfg, "_state_path", None))):
+                    or model is None or (_new_state != getattr(_reload_cfg, "_state_path", None))
+                    or (_new_dir, _new_dir_calib) != (getattr(_reload_cfg, "_dir_path_loaded", None),
+                                                     getattr(_reload_cfg, "_dir_calib_loaded", None))
+                    or (_new_entry, _new_entry_calib) != (getattr(_reload_cfg, "_entry_path_loaded", None),
+                                                         getattr(_reload_cfg, "_entry_calib_loaded", None))):
                 _model_path, _calib_path = _new_model, _new_calib
                 _reload_cfg._state_path = _new_state
+                _reload_cfg._dir_path_loaded = _new_dir
+                _reload_cfg._dir_calib_loaded = _new_dir_calib
+                _reload_cfg._entry_path_loaded = _new_entry
+                _reload_cfg._entry_calib_loaded = _new_entry_calib
                 if _model_path and os.path.exists(_model_path):
-                    model, iso, state_model, state_classes = load_model(
-                        _model_path, _calib_path, _new_state)
+                    model, iso, state_model, state_classes, dir_model, dir_calibs, entry_model, entry_calib = load_model(
+                        _model_path, _calib_path, _new_state, _new_dir, _new_dir_calib,
+                        _new_entry, _new_entry_calib)
                     # P1：加载同目录特征基准分布（PSI/离群检测用）
                     _bp = os.path.join(os.path.dirname(_model_path), "feature_baseline.json")
                     if os.path.exists(_bp):
@@ -762,10 +1078,13 @@ def main():
                     _model_status = "ready"
                     try:
                         _probe = {c: 0.0 for c in (model.feature_name() if hasattr(model, "feature_name") else FEATURE_COLS)}
-                        _p, _ps = score_one(model, iso, _probe, state_model, state_classes)
+                        _p, _ps, _pd, _pdp, _pe = score_one(model, iso, _probe, state_model, state_classes,
+                                                           dir_model, dir_calibs, entry_model, entry_calib)
                         if _p is None or not (float("-inf") < float(_p) < float("inf")):
                             _model_status = "degraded"
                             model, iso, state_model, state_classes = None, None, None, None
+                            dir_model, dir_calibs = None, None
+                            entry_model, entry_calib = None, None
                             print(f"[warn] model self-check FAILED (NaN/inf predict) → degraded; "
                                   f"ai_score=null（纯 HEXP 降级）", file=sys.stderr)
                         else:
@@ -848,7 +1167,9 @@ def main():
                             _ds_out = None
                         feats = build_features(snap, kl, _h1f, _envf, align_m5=_align_m5,
                                                audit=_feature_audit, ds_out=_ds_out)
-                        _raw, _pred_state = score_one(model, iso, feats, state_model, state_classes)
+                        _raw, _pred_state, _ai_dir, _ai_dir_prob, _ai_entry = score_one(
+                            model, iso, feats, state_model, state_classes, dir_model, dir_calibs,
+                            entry_model, entry_calib)
                         ai_score = None
                         if _raw is not None:
                             if _raw_fallback:
@@ -944,6 +1265,13 @@ def main():
                         # 【P0-O1 2026-08-22】记录当前模型版本 basename，供 inference_log
                         # 按版本切片归因/回滚评估（根治 model_version 恒 NULL 缺陷）。
                         "model_version": os.path.basename(_model_path) if _model_path else None,
+                        # 【阶段 1·方向头】dir_lm 输出：供信号塔与 dir_hexp 共振（同向增强/反向否决）。
+                        # 灰度过期：dir_enabled=false 时 dir_model=None → 两字段恒 None，完全不影响现有逻辑。
+                        "ai_direction": _ai_dir if (_ai_dir is not None) else None,
+                        "ai_dir_prob": round(float(_ai_dir_prob), 4) if _ai_dir_prob is not None else None,
+                        # 【阶段 2·买点头】entry_lm 输出：好买点概率(0-1)，供信号塔与 hexp entry_quality 共振
+                        # （boost_good_entry 增强好点位 / veto_bad_entry 否决差点位）。灰度过期恒 None。
+                        "ai_entry": round(float(_ai_entry), 4) if _ai_entry is not None else None,
                         # 【P1-O4 2026-08-22】特征健康统计（缺失/恒值/离群占比）→ 落库观测。
                         "feat_missing_ratio": None,
                         "feat_constant_ratio": None,

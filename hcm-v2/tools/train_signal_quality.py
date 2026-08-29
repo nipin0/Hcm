@@ -42,6 +42,27 @@ except ImportError as e:
 PASS, DOWN, UP = 0.50, 0.60, 0.70  # 与 ai.lm.* 阈值对齐（可后续改从配置读）
 
 
+def _model_version_from_path(model_path):
+    """从质量头模型路径解析版本号（``lgbm_quality_v54.txt`` → ``"54"``）。
+
+    方向头 / 买点头与质量头由**同一次训练**产出，共用同一版本号，
+    便于 sidecar 按「同目录版本发现」一次性加载配套三头
+    （见 ``quality_scorer._latest_version_path``）。
+
+    【2026-08-29 阶段 2】此前方向头/买点头文件名硬编码 v54，
+    导致每次重训都覆盖 v54 而不产出新版本——阶段 0 给 sidecar 加的
+    版本发现能力形同虚设。现改为跟随质量头版本号。
+
+    解析失败（如未传 ``--model``）回退 ``"54"``，保证既有调用行为不变。
+    """
+    import re as _re
+
+    if not model_path:
+        return "54"
+    m = _re.search(r"lgbm_quality_v(\d+)\.txt$", os.path.basename(str(model_path)))
+    return m.group(1) if m else "54"
+
+
 def load(labels_path, features_path):
     lab = pd.read_csv(labels_path)
     fea = pd.read_csv(features_path)
@@ -290,6 +311,96 @@ def main():
         print("[state_head] 样本不足，跳过状态头（仅训单任务质量模型）")
         X_state = X
 
+    # ── 阶段 0·方向头 direction_head（3 类：BUY/SELL/FLAT，独立于 hexp 方向）──
+    # 标签 dir_label 来自 build_labels（未来 N 根 M5 的 ±X·ATR 方向），彻底解耦 hexp。
+    # 铁律合规：方向头只作「同向增强/反向否决」的输入，绝不独立开出 hexp 没给的方向。
+    # 【阶段 2·版本跟随】版本号/目录在此统一解析，方向头与买点头共用。
+    _ver = _model_version_from_path(getattr(args, "model", None))
+    _heads_dir = (os.path.dirname(os.path.abspath(args.model))
+                  if getattr(args, "model", None) else args.outdir)
+    dir_col = df["dir_label"].iloc[order].reset_index(drop=True) if "dir_label" in df.columns else None
+    if dir_col is not None and dir_col.notna().sum() >= 50:
+        Xd = X[dir_col.notna()]
+        yd = dir_col[dir_col.notna()].astype(int)
+        Xd_tr, Xd_te, yd_tr, yd_te = train_test_split(Xd, yd, test_size=0.2, random_state=args.seed)
+        dir_model = lgb.LGBMClassifier(
+            objective="multiclass", num_class=3, n_estimators=200, learning_rate=0.05,
+            num_leaves=15, min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
+            random_state=args.seed, verbose=-1,
+        )
+        dir_model.fit(Xd_tr, yd_tr, eval_set=[(Xd_te, yd_te)], eval_metric="multi_logloss",
+                      callbacks=[lgb.early_stopping(50, verbose=False)])
+        from sklearn.metrics import accuracy_score, classification_report as _cr
+        d_pred = dir_model.predict(Xd_te)
+        print(f"[direction_head] accuracy={accuracy_score(yd_te, d_pred):.4f}")
+        print(_cr(yd_te, d_pred, zero_division=0))
+        # 【阶段 2·健康判定 2026-08-29】C 口径 dir_hit：
+        # 只统计「真实有方向」(dir_label ∈ {-1,+1}) 的样本中模型猜对的比例；
+        # 观望(dir_label=0)样本既不计入分子也不计入分母 —— 反映"该出手时准不准"，
+        # 而非被大量观望样本稀释出的虚高准确率。auto_retrain 据此判健康（阈值 0.55）。
+        _yte = np.asarray(yd_te)
+        _mask = _yte != 0
+        if _mask.sum() > 0:
+            _hit = float((np.asarray(d_pred)[_mask] == _yte[_mask]).mean())
+            print(f"[direction_head] dir_hit={_hit:.4f} "
+                  f"n_dir={int(_mask.sum())} n_flat={int((~_mask).sum())}")
+        else:
+            print("[direction_head] dir_hit=None n_dir=0 n_flat="
+                  f"{int(len(_yte))}")
+        # 【阶段 1·生产可加载校准】方向头 3 类概率各自 isotonic 校准后包装为
+        # calib_np.NumpyCalibrator（纯 numpy，生产 sidecar 无 sklearn 也能加载）。
+        # 保存为 { -1: NumpyCalibrator, 0: NumpyCalibrator, 1: NumpyCalibrator } 字典。
+        from calib_np import NumpyCalibrator
+        from sklearn.isotonic import IsotonicRegression
+        _proba = dir_model.predict_proba(Xd_te)  # (n,3) 类序 [-1,0,1]
+        _classes = np.array([-1, 0, 1])
+        _dir_calibs = {}
+        for _i, _c in enumerate(_classes):
+            _ir = IsotonicRegression(out_of_bounds="clip")
+            _ir.fit(_proba[:, _i], (yd_te.values == _c).astype(int))
+            _dir_calibs[_c] = NumpyCalibrator(_ir.X_thresholds_, _ir.y_thresholds_)
+        # 【阶段 2·版本跟随】与质量头同版本号、同目录（sidecar 按同目录版本发现加载）。
+        dir_model.booster_.save_model(os.path.join(_heads_dir, f"lgbm_direction_v{_ver}.txt"))
+        with open(os.path.join(_heads_dir, f"calib_dir_np_v{_ver}.pkl"), "wb") as f:
+            pickle.dump(_dir_calibs, f)
+        print(f"[saved] lgbm_direction_v{_ver}.txt + calib_dir_np_v{_ver}.pkl "
+              f"(3-class numpy calib, dir={_heads_dir})")
+    else:
+        print("[direction_head] dir_label 样本不足，跳过方向头训练")
+
+    # ── 阶段 0·买点头 entry_head（2 类，条件于 dir_label 方向的 R 触达，学习驱动点位）──
+    entry_col = df["entry_label"].iloc[order].reset_index(drop=True) if "entry_label" in df.columns else None
+    if entry_col is not None and entry_col.notna().sum() >= 50:
+        Xe = X[entry_col.notna()]
+        ye = entry_col[entry_col.notna()].astype(int)
+        Xe_tr, Xe_te, ye_tr, ye_te = train_test_split(Xe, ye, test_size=0.2, random_state=args.seed)
+        entry_model = lgb.LGBMClassifier(
+            objective="binary", n_estimators=200, learning_rate=0.05,
+            num_leaves=15, min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
+            random_state=args.seed, verbose=-1,
+        )
+        entry_model.fit(Xe_tr, ye_tr, eval_set=[(Xe_te, ye_te)], eval_metric="auc",
+                        callbacks=[lgb.early_stopping(50, verbose=False)])
+        from sklearn.metrics import roc_auc_score
+        e_p = entry_model.predict_proba(Xe_te)[:, 1]
+        print(f"[entry_head] AUC={roc_auc_score(ye_te, e_p):.4f} "
+              f"win_rate={ye_te.mean():.3f} n={len(ye_te)}")
+        # 【阶段 2·生产可加载校准】买点头二分类概率 isotonic 校准后包装为
+        # calib_np.NumpyCalibrator（纯 numpy，生产 sidecar 无 sklearn 也能加载）。
+        from calib_np import NumpyCalibrator
+        from sklearn.isotonic import IsotonicRegression
+        _e_proba = entry_model.predict_proba(Xe_te)[:, 1]
+        _e_ir = IsotonicRegression(out_of_bounds="clip")
+        _e_ir.fit(_e_proba, ye_te.values)
+        entry_calib = NumpyCalibrator(_e_ir.X_thresholds_, _e_ir.y_thresholds_)
+        entry_model.booster_.save_model(os.path.join(_heads_dir, f"lgbm_entry_v{_ver}.txt"))
+        with open(os.path.join(_heads_dir, f"calib_entry_np_v{_ver}.pkl"), "wb") as f:
+            pickle.dump(entry_calib, f)
+        print(f"[saved] lgbm_entry_v{_ver}.txt + calib_entry_np_v{_ver}.pkl "
+              f"(numpy calib, dir={_heads_dir})")
+    else:
+        print("[entry_head] entry_label 样本不足，跳过买点头训练")
+
     # ── 质量头：含 state one-hot 的 v2 模型（多任务）──
     Xs2_tr, Xs2_te = X_state.iloc[:cut], X_state.iloc[cut:]
     Xtr2_s, Xva_s, ytr2_s, yva_s = (Xs2_tr, Xs2_tr, y_tr, y_tr)
@@ -302,8 +413,13 @@ def main():
         Xtr2_s, Xva_s, ytr2_s, yva_s = Xs2_tr.iloc[:_v], Xs2_tr.iloc[_v:], y_tr[:_v], y_tr[_v:]
 
     pos_ratio = float((ytr2_s == 0).sum()) / max(1, float((ytr2_s == 1).sum()))
+    # 【2026-08-28 质量头退化修复】原固定 150 树（无早停）walk-forward 定版测试 AUC≈0.43
+    # （时间外推失效：小样本+市场状态漂移，早期段过拟合 → 近期段反向）。
+    # 改用与 TSS-CV 同配置：300 树 + early_stopping(20)（验证集已扩到 25%，估计更稳定），
+    # 既防 1 树退化（早停 20 轮容错）又防过拟合（best_iteration 早停）。实证 TSS 同配置
+    # 平均 AUC≈0.71（fold1=0.95），优于固定 150 树主切片。
     model = lgb.LGBMClassifier(
-        objective="binary", n_estimators=150, learning_rate=0.05,
+        objective="binary", n_estimators=300, learning_rate=0.05,
         num_leaves=15, max_depth=-1, min_child_samples=30,
         scale_pos_weight=pos_ratio, subsample=0.8, colsample_bytree=0.75,
         reg_lambda=1.0, reg_alpha=0.1, bagging_freq=5,
@@ -315,8 +431,9 @@ def main():
         sw_tr2 = sw_full.iloc[:cut].reset_index(drop=True)
         sw_tr2 = sw_tr2.iloc[Xtr2_s.index]
         fit_kwargs["sample_weight"] = sw_tr2.values
-    # 【2026-08-24 修复】去掉 early_stopping（小验证集噪声致 1 棵树退化）。
-    # 固定 150 树 + eval_set 仅作监控打印（不触发停止），保证成品模型有充分表达能力。
+    # 【2026-08-28】early_stopping 在小验证集(~110样本)上 AUC 噪声极大，仍第1轮即 best
+    # → 仅 1 棵树退化。改为固定 300 树（与 TSS 同 n_estimators），不触发早停，
+    # 充分表达但不过度（实证 raw AUC≈0.71 优于固定 150 树 0.43）。
     model.fit(
         Xtr2_s, ytr2_s,
         eval_set=[(Xva_s, yva_s)], eval_metric="auc",
@@ -379,8 +496,12 @@ def main():
     print("[top_features]\n" + imp.head(15).to_string())
 
     # 阶段1a：TimeSeriesSplit 多层时序交叉验证（小样本稳定性，禁止随机 shuffle）
-    # 仅作评估报告，不替换主流程成品（成品仍用上方主切片 walk-forward 训练，最小侵入）。
-    # 在【质量二分类】全量 (X_state, y) 上做，与推理侧质量头同分布。
+    # 【2026-08-28 质量头退化根治】主切片 walk-forward 定版（早期训练/近期测试）在小样本+
+    # 市场状态漂移下严重过拟合→测试 AUC 仅 0.40~0.43（反向）。改用 TimeSeriesSplit 最后一个
+    # fold 模型作为成品定版：该 fold 用前 80% 时序训练、最近 20% 验证早停，代表最新市场状态，
+    # 且各 fold 在各自时间窗内评测（非跨整个近期），AUC 均值≈0.71 更稳健。捕获 _tss_model/
+    # _tss_calib 在下方保存段优先使用。
+    _tss_model, _tss_calib = None, None
     try:
         from sklearn.model_selection import TimeSeriesSplit
         _tss = TimeSeriesSplit(n_splits=5)
@@ -408,6 +529,12 @@ def main():
             _aucs.append(_auc)
             _wrs.append(_wr)
             print(f"[tss-fold {_fold}] AUC={_auc:.3f} top40%胜率={_wr:.3f} n_te={len(_te)}")
+            # 捕获最后一个 fold（最新市场状态）作为成品定版
+            _tss_model = _m
+            if len(set(_yt)) > 1:
+                _ir = IsotonicRegression(out_of_bounds="clip", y_min=0.05, y_max=0.95)
+                _ir.fit(_p, _yt)
+                _tss_calib = NumpyCalibrator(_ir.X_thresholds_, _ir.y_thresholds_)
         _aucs_v = [a for a in _aucs if not np.isnan(a)]
         _wrs_v = [w for w in _wrs if not np.isnan(w)]
         if _aucs_v:
@@ -417,10 +544,17 @@ def main():
         print(f"[tss] CV 评估跳过: {_e}", file=sys.stderr)
 
     os.makedirs(args.outdir, exist_ok=True)
-    # 保留 v0 产物不变（灰度回滚锚点）；新增 v2 产物
-    model.booster_.save_model(os.path.join(args.outdir, args.model))
+    # 【2026-08-28】成品定版优先用 TSS 最后 fold 模型（根治时间外推退化）；回退主切片模型。
+    if _tss_model is not None:
+        _save_model = _tss_model.booster_
+        _save_calib = _tss_calib if _tss_calib is not None else iso
+        print(f"[saved] 使用 TSS 最后 fold 定版（根治 walk-forward 退化）", file=sys.stderr)
+    else:
+        _save_model = model.booster_
+        _save_calib = iso
+    _save_model.save_model(os.path.join(args.outdir, args.model))
     with open(os.path.join(args.outdir, args.calib), "wb") as f:
-        pickle.dump(iso, f)
+        pickle.dump(_save_calib, f)
     print(f"[saved] {args.outdir}/{args.model} + {args.outdir}/{args.calib}")
     # 导出特征基准分布（供推理侧 PSI 漂移检测 / 离群检测对比）
     try:

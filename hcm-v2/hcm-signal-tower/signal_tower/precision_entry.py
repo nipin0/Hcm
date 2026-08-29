@@ -35,10 +35,13 @@ class PrecisionEntryScorer:
         if self._config is None:
             return
         try:
-            self._w1 = await self._config.get_float("co.v2.weight.align", 0.40)
-            self._w2 = await self._config.get_float("co.v2.weight.structure", 0.40)
-            self._w3 = await self._config.get_float("co.v2.weight.rr", 0.20)
-            self._min_rr = await self._config.get_float("co.v2.min_rr", 1.2)
+            # 【2026-08-28 co_source v2 清除】本模块被 HEXP 入场闸门直接依赖
+            # （scheduler.py:1997/2000），配置键由 co.v2.* 迁至 hexp.entry.*，消除
+            # co_source 命名残留；值经同值双写迁移，行为零变化。
+            self._w1 = await self._config.get_float("hexp.entry.weight.align", 0.40)
+            self._w2 = await self._config.get_float("hexp.entry.weight.structure", 0.40)
+            self._w3 = await self._config.get_float("hexp.entry.weight.rr", 0.20)
+            self._min_rr = await self._config.get_float("hexp.entry.min_rr", 1.2)
         except Exception as exc:  # pragma: no cover
             logger.warning("PrecisionEntry config load failed (using defaults): %s", exc)
 

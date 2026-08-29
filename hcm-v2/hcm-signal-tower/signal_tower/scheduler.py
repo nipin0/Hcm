@@ -134,7 +134,8 @@ from signal_tower.indicator_calculator import (
 from signal_tower.regime_classifier import Regime, RegimeClassifier, RegimeConfig, RegimeResult
 from signal_tower.h1_regime_classifier import H1RegimeClassifier, H1Context
 from signal_tower.scoring_engine import ScoreResult, ScoringEngine
-from signal_tower.co_source import CoSourceEngine
+# 【2026-08-28 co_source 清除】双源信号模式(CoSourceEngine v1/v2)整体下线，只保留 HEXP。
+# 原 import: from signal_tower.co_source import CoSourceEngine —— 已随 co_source.py 删除。
 from signal_tower.hexp_engine import HexpEngine
 from signal_tower.range_bonus import RangeBonus
 from signal_tower.risk_state_sync import sync_risk_state
@@ -157,11 +158,13 @@ from shared.signal_tower_defaults import (
 # ── 信号生产机制配置表（根治“机制切换硬编码分支”）──
 # 全链路路由只依赖本表 + 配置中心(signal.active_model / signal_tower.mode)，
 # 机制登记表：新增/切换机制只需在此登记 + 注册评分引擎，无需改热路径分支。
-# 五维共识模型(five_dim) 及其 ai_dynamic 机制已弃用（2026-07-24）；默认回退到双源 co_source。
+# 五维共识模型(five_dim) 及其 ai_dynamic 机制已弃用（2026-07-24）。
+# 【2026-08-28 co_source 清除】双源信号模式(co_source)整体下线，其登记表条目已移除；
+# 未登记的 active_model 经 .get(..., "default") 兜底，此处 default 语义对齐 hexp
+# （与 _detect_active_model 只返 hexp/manual 保持一致，杜绝落入已删除分支）。
 MECHANISM_PROFILES = {
-    "co_source":   {"engine": "_scoring_engine", "uses_co": True},
     "manual":      {"engine": "_scoring_engine", "uses_co": False},
-    "default":     {"engine": "_scoring_engine", "uses_co": True},
+    "default":     {"engine": "_hexp_engine", "uses_co": True},
     # 和乘幂（hexp）：独立信号源；engine 字段登记实例属性名（_hexp_engine），
     # 但因其为异步多周期管线，实际调用走 _produce_signal/_live_score_publisher 的
     # hexp 显式分支（produce() 需 await 拉取 H1/H4/D1/M1 K 线，无法复用同步
@@ -331,8 +334,8 @@ class Scheduler:
         self._indicator_calc = IndicatorCalculator()
         self._regime_classifier = RegimeClassifier()
         self._scoring_engine = ScoringEngine(config_provider=config_provider)
-        # ── 共源信号增强引擎（Phase 1a；signal.active_model=co_source 时生效）──
-        self._co_source = CoSourceEngine(config_provider=config_provider)
+        # 【2026-08-28 co_source 清除】原共源信号增强引擎 CoSourceEngine 初始化已移除
+        # （双源模式整体下线，只保留 HEXP；co_source.py 已删除）。
         # ── 和乘幂引擎（hexp；signal.active_model=hexp 时生效）──
         # 独立信号源：HP-Score 广义均值 + k 自适应 + 多周期共振 + 微结构动量。
         # kline_fetcher 复用 _fetch_klines（PG + Redis 实时 bar 合并），
@@ -763,6 +766,9 @@ class Scheduler:
         #   → calibrate_lm_score 返回 source="none" → quality_gate 透传纯 HEXP（不误杀）。
         #   模型真在场且分低（fresh lm_score < veto_floor）→ 仍 VETO（保留 AI 否决权）。
         lm_score = None
+        ai_direction = None
+        ai_dir_prob = None
+        ai_entry = None
         try:
             if self._redis is not None:
                 raw = await self._redis.get(f"hcm:live:hexp:ai:{symbol.upper()}")
@@ -773,6 +779,30 @@ class Scheduler:
                     obj = _json.loads(raw) if isinstance(raw, str) else raw
                     if isinstance(obj, dict):
                         _ai = obj.get("ai_score")
+                        # 【阶段 1·方向共振】从 sidecar 快照读 dir_lm(方向头)输出，
+                        # 供 ai_quality_decide 与 dir_hexp(HEXP 方向)共振(同向增强/反向否决)。
+                        # 字段缺失/异常 → 保持 None（不共振，向后兼容）。
+                        _ad = obj.get("ai_direction")
+                        _adp = obj.get("ai_dir_prob")
+                        ai_direction = _ad if _ad in ("BUY", "SELL", "HOLD") else None
+                        ai_dir_prob = None
+                        if _adp is not None:
+                            try:
+                                ai_dir_prob = float(_adp)
+                            except (TypeError, ValueError):
+                                ai_dir_prob = None
+                        # 【阶段 2·买点共振】从 sidecar 快照读 entry_lm(买点头)好买点概率，
+                        # 供 ai_quality_decide 与 hexp entry_quality 共振(增强好点位/否决差点位)。
+                        # 字段缺失/异常 → 保持 None（不共振，向后兼容）。
+                        _ae = obj.get("ai_entry")
+                        ai_entry = None
+                        if _ae is not None:
+                            try:
+                                _ae_f = float(_ae)
+                                if 0.0 <= _ae_f <= 1.0:
+                                    ai_entry = _ae_f
+                            except (TypeError, ValueError):
+                                ai_entry = None
                         if _ai is not None:
                             try:
                                 lm_score = float(_ai)
@@ -913,6 +943,14 @@ class Scheduler:
         else:
             fusion["ds_sl_coeff_obs"] = 1.0
             fusion["ds_continuity_obs"] = 0
+
+        # 5) 【阶段 1/2 方向头/买点头】把 sidecar 三头输出随 ai_q 返回给 _produce_signal。
+        #    此前这三个变量是本方法局部变量，而 _produce_signal 直接按同名引用 →
+        #    NameError「name 'ai_direction' is not defined」（实时评分快照路径持续告警）。
+        #    现显式挂到返回 dict 上，由调用方通过 ai_q.get(...) 取值（字段缺失 → None）。
+        fusion["ai_direction"] = ai_direction
+        fusion["ai_dir_prob"] = ai_dir_prob
+        fusion["ai_entry"] = ai_entry
 
         return fusion
 
@@ -1304,20 +1342,10 @@ class Scheduler:
                     score_result = self._scoring_engine.compute_pre_score(
                         indicators, regime_result, live_adx=indicators.adx_14,
                     )
-                    # 与 _produce_signal Step4b 同源：用 co_source.apply 施加 F1–F5 过滤 +
-                    # 校准因子 + 自适应评分门槛，使面板实时评分的 threshold / threshold_passed
-                    # 与真实下单闸门一致（否则停留在 scoring_engine 0.15 全局地板，误导"已过门槛"）
-                    risk_level, event_window, consec_loss = await self._read_co_risk_state()
-                    _last_k = klines[-1] if klines else {}
-                    score_result = await self._co_source.apply(
-                        score_result, indicators, regime_result,
-                        h1_context=None,
-                        risk_level=risk_level,
-                        event_window=event_window,
-                        consecutive_losses=consec_loss,
-                        bar_quality=float(_last_k.get("quality", 1.0)),
-                        spread_q=float(_last_k.get("spread_q", 1.0)),
-                    )
+                    # 【2026-08-28 co_source 清除】此处原为 co_source.apply(v1) 施加
+                    # F1–F5 过滤 + 校准因子 + 自适应门槛；双源模式整体下线后，
+                    # 实时评分快照直接沿用 scoring_engine 结论（co_source 模式已不存在，
+                    # 面板口径与真实下单闸门天然一致——唯一闸门就是 HEXP）。
                 # 发布实时评分快照（面板实时跳动）
                 if self._redis is not None and self._redis.is_initialized:
                     import json as _json
@@ -1874,50 +1902,15 @@ class Scheduler:
         _bar_quality = float(last_k.get("quality", 1.0))
         _spread_q = float(last_k.get("spread_q", 1.0))
 
-        # ── Phase 1/2/3 收敛决策（co.v2_enabled 灰度总开关，默认 False）──
-        # legacy 决策(co_source.apply v1) 永远照常计算，并作为 shadow 落样的 "old" 端；
-        # 启用时再叠加 apply_v2（precision_entry/micro_state 驱动）作为权威决策覆盖
-        # score_result。co.v2_enabled=False → 行为与原生产完全一致（零改动）。
-        _v2_enabled = await self._is_v2_enabled()
+        # 【2026-08-28 co_source 清除】双源信号模式(co_source v1 apply / v2 apply_v2
+        # 收敛决策)整体下线，系统只保留 HEXP 引擎。此处原为 co_source.apply(v1) +
+        # apply_v2(v2) 两段调用，现整体移除；score_result 直接沿用上游结论
+        # （active_model="hexp" 时为 HexpEngine.produce() 产出，否则为默认评分引擎）。
+        # 注意：_compute_v2_inputs 必须保留 —— 其产出的 _ms/_eq/_theta 被下方 HEXP
+        # 入场闸门(1961-2013)直接使用，与 co_source 本体无关（micro_state/precision_entry
+        # 是独立模块，仅配置键曾复用 co.v2.* 命名，已迁至 hexp.entry.*）。
         _ms, _eq, _theta, _brk = await self._compute_v2_inputs(
             state, indicators, regime_result, h1_context, score_result)
-        _legacy: Optional[Any] = None
-        if self._co_source is not None:
-            _legacy = await self._co_source.apply(
-                score_result, indicators, regime_result,
-                h1_context=h1_context,
-                risk_level=risk_level,
-                event_window=event_window,
-                consecutive_losses=consec_loss,
-                bar_quality=_bar_quality,
-                spread_q=_spread_q,
-            )
-            # BUG-2 修复：apply_v2 是 co_source 专属权威覆盖路径(v2 收敛决策)，
-            # 必须加 active_model == "co_source" 守卫。hexp 激活时 Step4 已改用
-            # HexpEngine.produce() 产出 score_result；此处若不守卫，apply_v2 会无条件
-            # 用共源 v2 决策覆盖掉 hexp 的 HP-Score 决策(双重覆盖)。
-            # 注意：co_source.apply(v1) 内部已按 active_model 透传(非 co_source 原样返回)，
-            # 但 apply_v2 无此自守卫，故必须在此显式加 active_model 判定。
-            if active_model == "co_source" and _v2_enabled and _ms is not None:
-                score_result = await self._co_source.apply_v2(
-                    _legacy, indicators, regime_result, h1_context,
-                    _ms, _eq, _theta,
-                    risk_level=risk_level, event_window=event_window,
-                    consecutive_losses=consec_loss,
-                    bar_quality=_bar_quality, spread_q=_spread_q,
-                )
-            else:
-                score_result = _legacy
-                if active_model != "co_source":
-                    logger.debug(
-                        "active_model=%s (not co_source) → skip co_source v2 override (BUG-2 guard)",
-                        active_model,
-                    )
-                elif not _v2_enabled:
-                    logger.debug("v2 disabled (co.v2_enabled=false) → legacy path")
-        else:
-            # 共源引擎未初始化：退回默认评分引擎结论（与原行为一致）
-            logger.warning("co_source engine not initialized; skip co-source gate")
         # 2026-08-05 (D9-1): 阶段标记——共源闸门已施加(F1–F5/校准因子/自适应门槛)。
         logger.info(
             "Stage co_gate_applied: %s dir=%s pre=%.3f thr=%.3f passed=%s band=%s",
@@ -1970,7 +1963,27 @@ class Scheduler:
                     _new_dir = _ms_dir_map[_ms_dir]
                     if float(_eq) >= float(_theta):
                         score_result.direction = _new_dir
-                        score_result.threshold_passed = True
+                        # 【2026-08-28 P1-6】"补方向后强制过闸"改为可热关（默认 True =
+                        # 保持现有生产行为，不擅自改变信号输出）。
+                        #
+                        # 风险说明：本分支由 micro_state 单维状态 + 买点分 _eq>=θ
+                        # 造出方向，并直接置 threshold_passed=True，绕过了 hexp 的
+                        # 6 维综合分（scorecard_total）闸门；且本段**先于** AI 闸门
+                        # 执行，AI 随后看到 passed=True 即可合法 UPGRADE，形成
+                        # "micro_state 造方向 + AI 升级"的非 hexp 放行链，与铁律 5.1
+                        # 「辅助模块无独立开仓权」的精神冲突。
+                        #
+                        # 保持默认 True 以不动既有策略；运维可经配置中心把
+                        # hexp.entry_gate_force_pass 置为 false 止血：届时仅补方向、
+                        # 不再强制过闸，交由 6 维综合分正常裁决。
+                        _force_pass = True
+                        if self._config is not None:
+                            try:
+                                _force_pass = bool(await self._config.get_bool(
+                                    "hexp.entry_gate_force_pass", True))
+                            except Exception:
+                                _force_pass = True
+                        score_result.threshold_passed = _force_pass
                         score_result.pre_score = round(float(_eq), 4)
                         if not score_result.fallback_reason:
                             score_result.fallback_reason = (
@@ -1992,15 +2005,11 @@ class Scheduler:
         # P0: 发布 H1 上下文到 Redis 供面板观察 HMTS 状态判定层
         await self._publish_h1_context(state, h1_context)
 
-        # ── Phase 0 (2026-08-05): 微观状态机 + 精准买点分 shadow 对比 ──
-        # 仅计算并落库/日志，与现有评分并行，不改变交易行为。
-        await self._run_shadow_v2(
-            state, indicators, regime_result, h1_context, score_result,
-            zone_level=zone_level,
-            legacy_passed=(_legacy.threshold_passed if _legacy is not None else None),
-            legacy_reason=(getattr(_legacy, "fallback_reason", "") if _legacy is not None else ""),
-            ms_pre=_ms, eq_pre=_eq, theta_pre=_theta,
-        )
+        # 【2026-08-28 co_source 清除】原「Phase 0 微观状态机 + 精准买点分 shadow 对比」
+        # （_run_shadow_v2）是 co_source v2 的影子采集通道，依赖 co_source.apply 产出的
+        # _legacy 作为 "old" 端对照。双源模式整体下线后该对照无意义，整体移除。
+        # 注意：micro_state/precision_entry 本身保留（HEXP 入场闸门仍直接使用，见上方
+        # hexp entry gate 段），此处删除的只是 v2 影子落样通道。
 
         # ── Hexp 影子模式：双跑和乘幂、落库不下单（验证准确率，零实盘影响）──
         await self._run_shadow_hexp(
@@ -2039,7 +2048,17 @@ class Scheduler:
                 "direction": _direction,
             }
             _ai_cfg = await self._ai_cfg_dict()
-            _decision = ai_quality_decide(_snap, ai_q["c_ai"], _ai_cfg, c_ai_meta=ai_q)
+            # 【阶段 1·方向共振】把 sidecar 的 dir_lm 传给 gate，与 _snap.direction(dir_hexp)共振。
+            # 【阶段 2·买点共振】把 sidecar 的 entry_lm(ai_entry 好买点概率)传给 gate，
+            # 与 hexp entry_quality 共振(增强好点位/否决差点位)。两者默认 None → 不共振。
+            # 取值来自 ai_q（_read_ai_quality 随 fusion 返回），不可用同名局部变量
+            # （那是另一方法的局部作用域 → NameError）。
+            _decision = ai_quality_decide(
+                _snap, ai_q["c_ai"], _ai_cfg, c_ai_meta=ai_q,
+                ai_direction=ai_q.get("ai_direction"),
+                ai_dir_prob=ai_q.get("ai_dir_prob"),
+                ai_entry=ai_q.get("ai_entry"),
+            )
             self._ai_quality_last[state.symbol] = _decision
             # 2026-08-18 变更：AI 闸门决策暂存，待 signal_id 生成后（L2314 之后）补记真实
             # signal_id 落库 hcm_ai.gate_decision。VETO/被拦信号在下方 return 不再发布，
@@ -2062,29 +2081,21 @@ class Scheduler:
                     state.symbol, _direction, ai_q["c_ai"],
                 )
                 return
-            # AI 赋能打开 hexp 未放行信号 → 覆盖 threshold_passed 继续发布
-            if _decision.get("ai_opened"):
-                logger.info(
-                    "AI quality gate OPEN: %s %s c_ai=%.2f — hexp-blocked signal AI-overridden",
-                    state.symbol, _direction, ai_q["c_ai"],
-                )
-                score_result.threshold_passed = True
-                score_result.fallback_reason = (
-                    score_result.fallback_reason or ""
-                ) + f" | ai_opened(c_ai={ai_q['c_ai']:.1f})"
+            # 【阶段 1·纪律修正】原 ai_opened 覆盖逻辑已删除：铁律要求 AI 绝不独立开出
+            # HEXP 没给的方向。hexp 已拦(passed=False)的信号，AI 不得覆盖 threshold_passed
+            # 继续发布。AI 仅能 VETO（反向否决）/ UPGRADE（增强已放行信号，见 quality_gate）。
             # 升级/降级 → 覆盖 hexp grade（下游语义/展示）
             if _decision.get("final_grade"):
                 score_result.grade = _decision["final_grade"]
             # 手数分档透传：AI 只选档(low/mid/high)，实际倍率由风控面板动态手数决定
             # （不再在 signal_tower 侧乘固定倍率，避免双重倍率叠加）。
             ai_lot_tier = _q_tier
-            # 【2026-08-27 修订】链动风控侧动态手数规则：解耦/独立模式下 lot_tier_for(hp_score)
-            # 可能返回 none（hp_score<tier_low），若原样透传会让风控 _apply_dynamic_lot 回退到
-            # confidence(pre_score,0-1 口径) 分档，与「解耦只计 hp_score(0-100)」口径不一致。
-            # 故将 none 归一为 "low"（最小档），保证风控永远走 ai_tier 分支、由风控面板
-            # risk.lot_multiplier_low 驱动最小倍率，且耦合/解耦选档口径统一、手数链动不断。
-            # cpl 未启用时 decide 恒返回 none（=不干预手数），此处同样归一 low 不影响（风控 low
-            # 档等价原 none 回退的最小档语义），仅让行为显式化。
+            # 【2026-08-28 口径修正】lot_tier_for 输入已是 scorecard_total(0~1 口径)，阈值
+            # 已对齐为 0.65/0.55/0.45（见 quality_gate.py 默认值与 DB 热调）。若返回 none，
+            # 表示 scorecard_total < 0.45（真实极弱信号），此处归一为 "low"（最小档）作为
+            # 回退兜底：风控 _apply_dynamic_lot 走 ai_tier="low" 分支 → risk.lot_multiplier_low
+            # （0.5）→ 最小手数 0.01，避免回退到 confidence 分档造成口径漂移。
+            # 注：这是有意的兜底（弱信号最小档），非掩盖 bug——阈值已正确，none 即真弱。
             if ai_lot_tier == "none":
                 ai_lot_tier = "low"
             # 【2026-08-27 修订】放行严格回到 6 维综合(scorecard_total)：lot_tier=none 仅当
@@ -2197,6 +2208,47 @@ class Scheduler:
         # ── Step 8: Final Direction ──
         # 直接采用评分方向（原 AI 对称否决分支已随 five_dim 弃用而删除）。
         final_direction = score_result.direction
+
+        # ── 2026-08-28 修复：外部市场多因子分(composite)参与方向/仓位 ──
+        # composite 来自 hcm-market-intel 的宏观+情绪+事件+流动性 4 维聚合(0~1，Redis
+        # hcm:market:composite:score，每 30s 刷新)，代表外部市场环境对本品种交易的有利度。
+        # 此前该分从未被读取→composite_score 列全 NULL，多因子评分形同虚设。
+        # 设计（不颠覆 HEXP 6 维综合闸门，仅作外部因子协同）：
+        #   (a) 方向门控：当 composite 极低(<0.35) 且 本信号属「弱证据」——
+        #       即 NEUTRAL regime / 均值回归确认单(neutral_rsi_confirmed) / 盲点兜底单(h1_fallback)
+        #       ——降级为 NO_TRADE。强趋势单(HEXP 已 passed + ADX 高)不受影响，避免矫枉过正。
+        #       这正是昨日(08-27) SELL 在震荡市+恶劣外部环境下被反复扫损的根因。
+        #   (b) 仓位衰减：composite 低→suggested_lot 乘衰减系数(0.5~1.0)，高→不衰减；
+        #       与 AI 手数分档(ai_lot_tier)协同，不颠覆既有分档语义。
+        _market_composite = 0.5  # 缺省中性（缺失时既不杀也不加成）
+        if self._redis is not None:
+            try:
+                _mc_raw = await self._redis.get("hcm:market:composite:score")
+                if _mc_raw is not None:
+                    _market_composite = float(_mc_raw)
+            except Exception:
+                pass
+        _composite_atten = 0.5 + 0.5 * max(0.0, min(1.0, _market_composite))  # 0.5~1.0
+        # 弱证据信号判定（注意 _is_fb 在本段之后才定义，此处直接用 score_result.co_exec_fb）
+        _weak_signal = (
+            regime_result.regime.value == "NEUTRAL"
+            or getattr(score_result, "neutral_rsi_confirmed", False)
+            or bool(getattr(score_result, "co_exec_fb", 0))
+        )
+        if (final_direction in ("BUY", "SELL")
+                and _market_composite < 0.35
+                and _weak_signal
+                and score_result.threshold_passed):
+            # 仅在「弱证据 + 外部市场极端不利」时降级，强趋势单(threshold 强证据)保留。
+            logger.info(
+                "Composite gate NO_TRADE %s/%s %s: market_composite=%.2f<0.35 & weak_signal "
+                "(regime=%s rsi_conf=%s fb=%s) → suppress (keep HEXP passed, external env bad)",
+                state.symbol, state.timeframe, final_direction,
+                _market_composite, regime_result.regime.value,
+                getattr(score_result, "neutral_rsi_confirmed", False), _is_fb,
+            )
+            final_direction = "NO_TRADE"
+
         # 2026-08-27 修复：confidence 必须 0–100 制，与风控 risk_min_confidence
         # （0–100）及手数分档(score_tier_low/mid)口径对齐。pre_score 是 0–1 制，
         # 原样填入会让满分(A类100分)信号被风控误判 confidence=1.00<60 → REJECT。
@@ -2749,7 +2801,11 @@ class Scheduler:
             # ── P1a/P1c collaboration fields (consumed by mt5_bridge) ──
             ai_sl_mult=ai_sl_mult,
             ai_tp_mult=ai_tp_mult,
-            suggested_lot_ratio=suggested_lot,
+            # 2026-08-28 修复：外部市场 composite 参与仓位——弱环境衰减(0.5~1.0)，
+            # 与 AI 手数分档协同（衰减作用在基底 suggested_lot 上，不颠覆 ai_lot_tier 分档）。
+            suggested_lot_ratio=round(suggested_lot * _composite_atten, 4),
+            # 2026-08-28 修复：composite 落库（此前该列全 NULL，多因子评分未接线）。
+            composite_score=round(_market_composite, 4),
             # AI 手数分档（low/mid/high/none）→ 风控引擎选档用（链动动态手数）
             ai_lot_tier=ai_lot_tier,
             entry_trigger_wait=entry_trigger_wait,
@@ -3064,7 +3120,9 @@ class Scheduler:
         _shadow_v2_loaded 加载标志，避免重复 load_config）。当 co.v2_shadow_enabled
         与 co.v2_enabled 均关闭时返回 (None,0,0)（零开销）。
         """
-        if self._co_source is None or self._micro_state is None or self._precision_entry is None:
+        # 【2026-08-28 co_source 清除】去掉 _co_source 依赖检查；本方法只依赖
+        # micro_state / precision_entry（二者已被 HEXP 入场闸门直接使用）。
+        if self._micro_state is None or self._precision_entry is None:
             return None, 0.0, 0.0, None
         _want_compute = True
         if self._config is not None:
@@ -3950,26 +4008,26 @@ class Scheduler:
     async def _detect_active_model(self) -> str:
         """Detect which signal model is currently active for prompt routing.
 
-        Returns one of ``"co_source"``, ``"manual"``, ``"hexp"``:
-          - manual:    signal_tower.mode == "manual"
-          - hexp:      signal.active_model == "hexp" (and not manual)
-          - co_source: signal.active_model == "co_source" (and not manual)
-          - 其他情况默认回退 co_source（五维 ai_dynamic 机制已于 2026-07-24 弃用）
+        Returns one of ``"hexp"``, ``"manual"``:
+          - manual: signal_tower.mode == "manual"
+          - hexp:   其余全部情况（含 signal.active_model == "hexp"）
+
+        【2026-08-28 co_source 清除】双源信号模式整体下线，信号源只剩 HEXP 与 manual。
+        原逻辑在 active_model 既非 hexp 也非 co_source（含异常）时回退 co_source；
+        现统一回退 **hexp**（生产唯一引擎），避免任何路径再落入已删除的 co_source 分支。
         """
         try:
-            mode = (await self._config.get("signal_tower.mode", "co_source")) or "co_source"
+            mode = (await self._config.get("signal_tower.mode", "hexp")) or "hexp"
             mode = mode.strip().lower()
             if mode == "manual":
                 return "manual"
-            active = (await self._config.get("signal.active_model", "default")) or "default"
-            active = active.strip()
-            if active == "hexp":
-                return "hexp"
-            if active == "co_source":
-                return "co_source"
+            active = (await self._config.get("signal.active_model", "hexp")) or "hexp"
+            active = active.strip().lower()
+            if active == "manual":
+                return "manual"
         except Exception as exc:
-            logger.warning("Active model detection failed: %s → co_source (default)", exc)
-        return "co_source"
+            logger.warning("Active model detection failed: %s → hexp (default)", exc)
+        return "hexp"
 
     async def _resolve_account_id(self) -> Optional[int]:
         """Resolve the active master account_id from broker accounts.
@@ -4076,8 +4134,8 @@ class Scheduler:
         await _safe_load("scoring_engine.load_config", self._scoring_engine.load_config())
         if hasattr(self, "_h1_classifier"):
             await _safe_load("h1_classifier.load_config", self._h1_classifier.load_config())
-        if hasattr(self, "_co_source"):
-            await _safe_load("co_source.load_config", self._co_source.load_config())
+        # 【2026-08-28 co_source 清除】原 co_source.load_config 热重载已移除
+        # （双源模式下线，实例不再存在）。
         # BUG-16 修复：和乘幂引擎接入 30s 热重载链（此前唯一未注册的引擎，
         # 改 hexp.* 参数须重启信号塔才生效，违背"保存即热生效"）。
         if hasattr(self, "_hexp_engine"):
@@ -4560,7 +4618,9 @@ class Scheduler:
             # Per-model overrides
             self._prompt_templates = {}
             self._system_prompts = {}
-            for m in ("co_source", "manual"):
+            # 【2026-08-28 co_source 清除】原 ("co_source", "manual") → 双源模式下线后
+            # 只保留 hexp / manual 两套 per-model 提示词覆盖。
+            for m in ("hexp", "manual"):
                 u = await self._config.get(f"signal_tower.prompt.{m}.user_prompt_template", "")
                 if u and u.strip():
                     self._prompt_templates[m] = u.strip()

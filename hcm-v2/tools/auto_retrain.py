@@ -67,6 +67,22 @@ REDIS_PORT = 6379
 
 # 本地决策阈值（fail-open 护栏）：测试集 AUC 低于此值视为退化，不切模型
 LOCAL_AUC_ADOPT_MIN = 0.55
+
+# 【阶段 2·健康判定 2026-08-29】方向头 / 买点头本地采纳阈值（用户决策 1：0.55）。
+# 与质量头同阈值，但**独立判定、独立处置**（用户决策 2 / 4）：
+#   - 决策 2：单头不达标 → **立即校准**，而非禁用该头（避免一损俱损）
+#   - 决策 4：方向/买点头走**本地阈值**，不交 DeepSeek 裁判（省调用、降外部依赖）
+#   - 指标口径：dir_hit 为 C 口径（仅真实有方向样本的正确率），entry 为测试集 AUC
+# 可用环境变量覆盖，便于灰度调参而不改代码。
+HEAD_METRIC_MIN = float(os.environ.get("HEAD_METRIC_MIN", "0.55"))
+
+# 【阶段 3·自愈闭环 2026-08-29】
+# 决策 5：连续 N 轮复活失败才告警人工（Redis 计数 hcm:ai:retrain:fail_streak）。
+#   判定口径：切换成功(switched=True)=本轮复活成功 → 清零；未切换/训练失败=+1。
+FAIL_STREAK_KEY = "hcm:ai:retrain:fail_streak"
+FAIL_STREAK_ALERT = int(os.environ.get("RETRAIN_FAIL_ALERT", "3"))
+# 决策 6：模型版本保留最近 N 版，更老的连同配套三头文件一并清理。
+KEEP_MODEL_VERSIONS = int(os.environ.get("RETRAIN_KEEP_VERSIONS", "3"))
 # 样本量下限：少于此数训练结果不可靠，仅产模型不切（避免用噪声数据覆盖好模型）
 # 支持环境变量 RETRAIN_MIN_SAMPLES 覆盖（验证时可临时调大，避免误切线上模型）
 MIN_SAMPLES_FOR_SWITCH = int(os.environ.get("RETRAIN_MIN_SAMPLES", "200"))
@@ -222,6 +238,109 @@ def ds_nonzero_ratio(stdout: str) -> float | None:
     return None
 
 
+def _bump_fail_streak(r, ok: bool) -> int:
+    """更新「连续复活失败」计数（Redis）；成功清零。返回当前连续失败轮数。
+
+    【阶段 3·自愈闭环 2026-08-29】用户决策 5：连续 3 轮复活失败才告警人工。
+    判定口径：切换成功(switched=True) = 复活成功 → 清零；
+    未切换 / 训练失败 = 本轮未复活 → 计数 +1。
+    仅记录，绝不因计数失败影响重训主流程（try/except 兜底）。
+    """
+    try:
+        if ok:
+            if r is not None:
+                r.delete(FAIL_STREAK_KEY)
+            return 0
+        n = 0
+        if r is not None:
+            raw = r.get(FAIL_STREAK_KEY)
+            n = int(raw or 0) + 1
+            r.set(FAIL_STREAK_KEY, str(n))
+        return n
+    except Exception:
+        return 0
+
+
+def cleanup_old_versions(keep: int | None = None) -> None:
+    """清理 models 目录旧版本（用户决策 6：保留最近 3 版）。
+
+    按 ``lgbm_quality_vN.txt`` 解析版本号，保留最近 ``keep`` 个版本，
+    更老版本连同配套文件（calib_vN.pkl / lgbm_direction_vN.txt /
+    calib_dir_np_vN.pkl / lgbm_entry_vN.txt / calib_entry_np_vN.pkl）
+    一并删除——方向头/买点头与质量头同版本同目录（阶段 2 已保证），
+    按版本**整组**清理，绝不半组残留。
+
+    仅当保留数超过 keep 时才动手；且只删有 quality 主文件的版本，
+    避免误删 sidecar 正在加载的模型。调用时机：仅在切换成功后
+    （此时新版本已上线，清理更老版本不会影响 sidecar 的版本发现）。
+    """
+    import re as _re
+    import glob as _glob
+    import os as _os
+
+    keep = KEEP_MODEL_VERSIONS if keep is None else int(keep)
+    versions = []
+    for p in _glob.glob(_os.path.join(MODELS_DIR, "lgbm_quality_v*.txt")):
+        m = _re.search(r"lgbm_quality_v(\d+)\.txt$", _os.path.basename(p))
+        if m:
+            versions.append(int(m.group(1)))
+    if len(versions) <= keep:
+        return
+    versions.sort(reverse=True)
+    for v in versions[keep:]:
+        for name in (
+            f"lgbm_quality_v{v}.txt",
+            f"calib_v{v}.pkl",
+            f"lgbm_direction_v{v}.txt",
+            f"calib_dir_np_v{v}.pkl",
+            f"lgbm_entry_v{v}.txt",
+            f"calib_entry_np_v{v}.pkl",
+        ):
+            p = _os.path.join(MODELS_DIR, name)
+            if _os.path.exists(p):
+                try:
+                    _os.remove(p)
+                    log(f"[cleanup] 删除旧版本文件 {name}")
+                except Exception as e:
+                    log(f"[cleanup] 删除失败 {name}: {e}")
+        log(f"[cleanup] 版本 v{v} 已清理（保留最近 {keep} 版）")
+
+
+def parse_dir_hit(stdout: str) -> float | None:
+    """【阶段 2·健康判定 2026-08-29】解析方向头 C 口径命中率。
+
+    训练侧输出形如::
+
+        [direction_head] dir_hit=0.6123 n_dir=1234 n_flat=567
+
+    **C 口径**（用户 2026-08-29 选定）：只统计「真实有方向」
+    (``dir_label ∈ {-1,+1}``) 的样本中模型猜对的比例；观望样本
+    (``dir_label=0``) 既不计入分子也不计入分母 —— 衡量"该出手时准不准"，
+    避免被大量观望样本稀释出虚高准确率。
+
+    ``dir_hit=None``（无真实有方向样本）返回 None，调用方按"不阻塞"处理。
+    """
+    import re
+    m = re.search(r"\[direction_head\]\s+dir_hit=(\d+\.\d+)", stdout)
+    return float(m.group(1)) if m else None
+
+
+def parse_entry_auc(stdout: str) -> float | None:
+    """【阶段 2·健康判定 2026-08-29】解析买点头测试集 AUC。
+
+    训练侧输出形如::
+
+        [entry_head] AUC=0.6789 win_rate=0.512 n=1234
+
+    ⚠️ 必须用 ``[entry_head]`` 前缀精确定位：既有 ``parse_auc`` 用的是通用
+    正则 ``AUC=(\\d+\\.\\d+)``，**会一并匹配到本行**。若不加前缀区分，
+    质量头 AUC 可能被买点头数值污染（反之亦然）。
+    """
+    import re
+    m = re.search(r"\[entry_head\]\s+AUC=(\d+\.\d+)", stdout)
+    return float(m.group(1)) if m else None
+
+
 # ── 路径 B：DeepSeek 裁判 ─────────────────────────────────────────────────
 def deepseek_judge(api_base: str, api_key: str, payload: dict, timeout: int = 60,
                    model: str = "deepseek-chat") -> dict:
@@ -281,14 +400,13 @@ def switch_model(model_path: str, calib_path: str) -> bool:
         import redis
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5, decode_responses=True)
 
-        # 1) Redis 直写（hcm:config:v2 哈希字段）
-        r.hset("hcm:config:v2", "ai.lm.model_path", model_path)
-        r.hset("hcm:config:v2", "ai.lm.calib_path", calib_path)
-        r.publish("hcm:config:invalidate", "ai.lm.model_path")
-        r.publish("hcm:config:invalidate", "ai.lm.calib_path")
-        log("[switch] Redis hcm:config:v2 updated + PUB")
-
-        # 2) PG 直写（hcm_config.metadata 真源）
+        # 【2026-08-28 P1-8】写序修正（原：先 Redis 后 PG）。
+        # 原实现一旦 PG 写入失败/抛异常，Redis 已被改写且**无回滚** → 产生不可自愈的
+        # split-brain：引擎读 Redis 拿到新模型路径，而 PG 真值仍是旧路径；此后任何
+        # 回填或校准都会用 PG 旧值覆盖回来，表现为"模型切换后又复原"。
+        # 铁律 5.2：PG 为真源 —— 必须先写 PG 且提交成功后，才写 Redis 并广播失效。
+        #
+        # 1) PG 直写（hcm_config.metadata 真源）—— 失败即整体失败，Redis 保持原样
         conn = psycopg2.connect(DB_URL_DEFAULT, connect_timeout=5)
         try:
             with conn.cursor() as cur:
@@ -306,6 +424,13 @@ def switch_model(model_path: str, calib_path: str) -> bool:
             log("[switch] PG hcm_config.metadata updated")
         finally:
             conn.close()
+
+        # 2) Redis 直写 + PUB（仅在 PG 提交成功后执行）
+        r.hset("hcm:config:v2", "ai.lm.model_path", model_path)
+        r.hset("hcm:config:v2", "ai.lm.calib_path", calib_path)
+        r.publish("hcm:config:invalidate", "ai.lm.model_path")
+        r.publish("hcm:config:invalidate", "ai.lm.calib_path")
+        log("[switch] Redis hcm:config:v2 updated + PUB")
         return True
     except Exception as e:
         log(f"[switch] FAILED: {e}")
@@ -733,12 +858,40 @@ def retrain_once(use_deepseek: bool = True) -> dict:
     ds_ratio = ds_nonzero_ratio(_all_out)
     log(f"[train] done: auc={auc} samples={samples} ds_nonzero_ratio={ds_ratio}")
 
+    # 【阶段 2·健康判定 2026-08-29】方向头 / 买点头**独立**健康判定（用户决策 1/2/4）：
+    #   - 阈值 0.55（HEAD_METRIC_MIN）
+    #   - 不达标 → 立即校准，不禁用该头（决策 2）
+    #   - 走本地阈值，不交 DeepSeek 裁判（决策 4）
+    # 判定与质量头**解耦**：单头不达标**不阻塞**质量头采纳（避免一损俱损），
+    # 仅记录 + 标记 recalib_required，供调用方触发立即重训/校准。
+    # 指标缺失（None，如样本不足未训练该头）按"不阻塞"处理。
+    dir_hit = parse_dir_hit(_all_out)
+    entry_auc = parse_entry_auc(_all_out)
+    dir_ok = (dir_hit is None) or (dir_hit >= HEAD_METRIC_MIN)
+    entry_ok = (entry_auc is None) or (entry_auc >= HEAD_METRIC_MIN)
+    recalib_required = not (dir_ok and entry_ok)
+    head_health = {
+        "dir_hit": dir_hit,
+        "dir_ok": dir_ok,
+        "entry_auc": entry_auc,
+        "entry_ok": entry_ok,
+        "threshold": HEAD_METRIC_MIN,
+        "recalib_required": recalib_required,
+    }
+    log(f"[head-health] dir_hit={dir_hit} ok={dir_ok} | entry_auc={entry_auc} "
+        f"ok={entry_ok} | threshold={HEAD_METRIC_MIN}")
+    if recalib_required:
+        log("[head-health] 单头不达标 → 按用户决策 2 立即校准（不禁用该头，"
+            "不阻塞质量头采纳）")
+
     payload = {
         "model_version": f"v{v}",
         "auc": auc,
         "samples": samples,
         "ds_nonzero_ratio": ds_ratio,
         "baseline_win_rate": None,  # train 输出含，按需扩展解析
+        # 阶段 2：三头健康指标（供 DeepSeek 裁判参考 + 本地决策 + 落库追溯）
+        "head_health": head_health,
     }
 
     # 4) 决策：DeepSeek 裁判（路径 B）或本地 AUC 护栏
@@ -817,8 +970,29 @@ def retrain_once(use_deepseek: bool = True) -> dict:
             log(f"[live-baseline] re-pin failed (non-fatal): {e}")
 
     payload.update({"adopted": decided_adopt, "switched": switched, "judge": judge})
+
+    # 【阶段 3·自愈闭环 2026-08-29】
+    # 决策 5：连续失败告警（switched=True = 复活成功 → 清零；否则 +1；≥3 告警人工）
+    # 决策 6：版本保留 3 版（仅切换成功后清理，避免误删 sidecar 在用的旧版）
+    _redis_url = os.environ.get("REDIS_URL", "") or "redis://localhost:6379"
+    _rc = None
+    try:
+        import redis as _r
+        _rc = _r.Redis.from_url(_redis_url, socket_timeout=3)
+    except Exception:
+        _rc = None
+    _streak = _bump_fail_streak(_rc, ok=bool(switched))
+    payload["fail_streak"] = _streak
+    if _streak >= FAIL_STREAK_ALERT:
+        log(f"[ALERT][需人工介入] 连续 {_streak} 轮复活失败（阈值 {FAIL_STREAK_ALERT}）："
+            f"stage={payload.get('stage', '-')} "
+            f"judge={judge.get('decision')} reason={str(judge.get('reason'))[:160]}")
+    if switched:
+        cleanup_old_versions()
+
     record_retrain_run(payload)
-    log(f"=== round done: adopted={decided_adopt} switched={switched} ===")
+    log(f"=== round done: adopted={decided_adopt} switched={switched} "
+        f"fail_streak={_streak} ===")
     return payload
 
 

@@ -115,6 +115,9 @@ _DEFAULTS: dict[str, Any] = {
     "hexp.mtf.weight_H4": 0.35,
     "hexp.mtf.weight_H1": 0.25,
     "hexp.mtf.weight_M30": 0.15,
+    # 2026-08-28 闸门清除：G1 MTF 多周期共识否决已移除（不再翻转/降级方向）。
+    # verdict 仍用于共振调分与观测(sr.mtf_dir/flat_band)，仅取消"否决动作"。
+    "hexp.mtf.flat_band": 0.15,              # |verdict|<此值视为无共识（观测用）
     # 方案 B 对称降分（2026-08-10）：原"顺风无脑加成(bonus) + 逆风硬封成 NO_TRADE"已改为
     # "顺/逆风同尺降分"。tailwind_bonus=顺风加成系数(默认0=完全对称，不再虚涨推闸)；
     # penalty=逆风折扣系数(硬封已移除，仅降分)。请勿再用 hexp.resonance.bonus。
@@ -168,17 +171,15 @@ _DEFAULTS: dict[str, Any] = {
     # 计入会让减仓常驻（等价于直接把 lot_mult 砍半），且共振矩阵同样排除主周期。
     "hexp.exec.reversal_include_primary": False,
     "hexp.exec.transition_lot_mult": 0.5,
+    # 【2026-08-28 趋势单保护】transition 减仓仅看主周期：原 transition=any(周期==TRANSITION)
+    # 只要任意一个周期(哪怕 D1 日线)在犹豫带就整体减半仓，误伤"主周期明确趋势"的顺势趋势单
+    # （实锤 state=TREND_DOWN 趋势单因辅助周期 TRANSITION 被 lot×0.50）。开启后仅当主执行
+    # 周期(primary)处于 TRANSITION(真正犹豫带)才触发 transition 减仓；辅助周期犹豫不影响。
+    "hexp.exec.transition_primary_only": True,   # True→transition 减仓只看主周期(趋势单保护)
     # 极值区手数递减（2026-08-21 方案2）：处于 Donchian 极值区(_in_extreme)且未被护栏封单的
     # 放行单，按此折扣降仓（与 transition/reversal 用 min() 聚合，不叠加重复打折）。
     # 解决「高位动量减弱反转仍满档手数」——没拦住也减半仓。
-    "hexp.exec.extreme_lot_mult": 0.5,
-    # 行情波动率缩放手数（2026-08-21 方案2·链动风控面板基础手数按行情调整）：
-    # co_exec_lot_mult 经 suggested_lot_ratio 透传到风控 final_lot = risk.lot_base × 档位 × co_ai_mult，
-    # 故在此把 ATR 相对常态的缩放编入 co_exec_lot_mult，即可让「风控面板基础手数」随行情缩放。
-    "hexp.exec.vol_scale_enabled": True,      # 总开关；False→不缩放(恒1.0)，向后兼容
-    "hexp.exec.vol_scale_atr_ref": 7.0,       # 常态 ATR 基准（波动率中性点）
-    "hexp.exec.vol_scale_min": 0.5,           # 波动放大时最低缩到 0.5（防满仓接大波动）
-    "hexp.exec.vol_scale_max": 1.0,           # 波动收窄时最高 1.0（绝不超配基础手数）
+    # 2026-08-28 闸门清除：D3 极值区降仓(extreme_lot_mult)、D4 波动率缩放(vol_scale_*) 已移除。
     # 方向判定
     "hexp.direction_min_score": 0.20,
     # 2026-08-27 方向迟滞死区：dir_sum 在 0 附近微动会跨阈值翻转 → direction 闪烁。
@@ -269,13 +270,18 @@ _DEFAULTS: dict[str, Any] = {
     "hexp.momentum_flip_ma_threshold": 90.0,   # 高位分界：BUY 时 _ma_raw≥此视为极高多头位
     "hexp.momentum_flip_ma_low": 10.0,          # 低位分界：SELL 时 _ma_raw≤此视为极高空头位
     "hexp.momentum_flip_ma_mm": 0.005,          # 极端位下更严的反向阈值（|mm|≥此即拦逆动量单）
-    # 【2026-08-26 P0-1 高位微正枯竭加固】momentum_flip 只拦"mm 反向(负)"，漏掉
-    # ma 极高位 + mm 微正枯竭(0<mm<弱阈值)的顶部追多（实证 sig=388640598 BUY@4666.08
-    # ma=100 pos=0.846 mm=+0.0124 regime=NEUTRAL 高位追多被止损）。现扩展：多头度≥高位
-    # 分界且 mm 为正但 <weak_mm（动能枯竭未反转）时同样拦 BUY 追高（SELL 低位对称）。
-    # 仅拦"高位+微正枯竭"，正常位置/动量明显同向不拦，防误杀。
-    "hexp.momentum_hi_weak_enabled": True,     # 高位微正枯竭拦截总开关；False→退回旧行为(仅拦反向)
-    "hexp.momentum_hi_weak_mm": 0.02,          # 高位微正枯竭阈值：BUY 时 0<mm<此 / SELL 时 0>mm>-此 → 拦
+    # 【2026-08-28 闸门清除】G5b 高位微正枯竭加固(momentum_hi_weak_*) 已移除。
+    # 【2026-08-28 趋势单保护】momentum_flip 纯动量(M1 f_mm_s)否决不辨趋势结构，会把
+    # 趋势单在正常回撤/换手中的 M1 动量短暂反向(mm=-0.01~-0.18)误判为"动量反转"而拦掉
+    # （实锤 388642131-163 连续 BUY 被拦、388642161 BUY mm=-0.4445 趋势单被拦）。
+    # 趋势单推进中动量回撤是常态，不应等同"真反转"。优化：仅放行"顺势趋势单"
+    # （主周期 period_states 处于 TREND_UP/DOWN 且方向与趋势同向；或 ADX≥trend_adx
+    # 且 ma 方向与信号一致）时，改用更宽的反向阈值 flip_trend_mm（需剧烈反向才拦），
+    # 放行趋势单正常回调；逆势单/弱趋势/震荡仍用基础 flip_mm（敏捷拦逆动量）。
+    # 仅调阈值不动拦截路径，保留 momentum_flip 对"真反转"的防护。开关默认开，可热回退旧行为。
+    "hexp.momentum_flip_trend_enabled": True,   # 趋势单保护总开关；False→退回纯动量否决(旧行为)
+    "hexp.momentum_flip_trend_adx": 25.0,       # 辅助判据：主周期 ADX≥此视为强趋势(ADX>25 标准强趋势线)
+    "hexp.momentum_flip_trend_mm": 0.15,        # 顺势趋势单放宽反向阈值：|mm|≥此(剧烈反向)才拦
     # 【2026-08-26 P0-2 震荡市均值回归校验】NEUTRAL/RANGE 市(hurst<0.5 均值回归态)中，
     # 高位(Donchian 分位接近极值)顺势追单易被均值回归反打（实证 sig=388640598 BUY@4666.08
     # pos=0.846 hurst=0.449 regime=NEUTRAL 高位追多被止损）。震荡市应等回撤/极值反向，
@@ -1293,6 +1299,8 @@ class HexpEngine:
         direction = cand
 
         # 6) 多周期共振裁决（M5 主执行周期权重=0，不自我裁决）
+        # 2026-08-28：MTF 加权共识直接进方向裁决（不止于调分，见下方方向闸）。
+        # 先算 verdict（含 M30/H1/H4/D1 按 weight_* 加权），供方向闸与评分段共用。
         verdict = 0.0
         wsum_r = 0.0
         n_eff = 0  # 有效（非RANGE）周期计数
@@ -1348,6 +1356,20 @@ class HexpEngine:
         if _min_periods > 0 and n_eff > 0:
             _conf = min(1.0, n_eff / _min_periods)
             verdict *= _conf
+
+        # ── 2026-08-28：MTF 加权共识直接进方向裁决（不止于调分）──
+        # verdict 现为含 M30/H1/H4/D1 按 weight_* 加权的多周期共识 ∈[-1,1]。
+        # 主周期候选方向(direction)若与加权共识相反，按共识强度递减处置：
+        #   |verdict|>=veto_reverse 且反向 → 翻向共识方向（多周期合力否决主周期）
+        #   |verdict|>=veto_notrade 且反向 → 降级 NO_TRADE（中强反向，不贸然反向也不强推）
+        #   |verdict|<flat_band → 无共识，不干涉主周期方向
+        # 单一周期(如 M30)权重仅 0.15，无法独断；需 H1/H4/D1 多数同向才能越过阈值，
+        # 即"多周期共振"本意。veto_enabled=False 时完全退回旧行为(verdict 只调分)。
+        sr.mtf_verdict = float(verdict)
+        _flat = float(cfg.get("hexp.mtf.flat_band", 0.15))
+        sr.mtf_dir = "BUY" if verdict > _flat else ("SELL" if verdict < -_flat else "")
+        # 【2026-08-28 闸门清除】G1 MTF 多周期共识否决已移除：主周期方向不再被
+        # 多周期加权共识翻转/降级。verdict 仍保留观测(sr.mtf_dir)与共振调分，仅取消"否决"动作。
         # 共振加成/惩罚
         # 方案 B 对称降分（2026-08-10）：顺/逆风用同一把"主线偏置"折扣尺
         #  - 顺风：温和加成(系数 hexp.resonance.tailwind_bonus，默认0=完全对称，不虚涨)
@@ -1465,8 +1487,8 @@ class HexpEngine:
         # 现 hp_floor 仅作观测标注（is_hp_red 透传面板），不再改变 grade/passed；
         # 放行严格由 6 维综合 total 经 _resolve_grade_hyst 决定。
         _hp_floor = float(cfg.get("hexp.scorecard.hp_floor", 30.0))
-        score_result.is_hp_red = bool(hp_100 < _hp_floor)
-        if score_result.is_hp_red:
+        sr.is_hp_red = bool(hp_100 < _hp_floor)
+        if sr.is_hp_red:
             logger.info(
                 "HP below floor (observational only, not blocking): %s hp=%.2f < %.2f "
                 "(grade kept at %s by 6-dim total)",
@@ -1476,7 +1498,13 @@ class HexpEngine:
         # 减仓触发聚合：_TRANSITION（犹豫带）与 _REVERSAL（趋势态翻转窗口）
         # 二者互补：犹豫带是"方向没想好"，反转态是"方向刚掉头"。干净反转直接
         # UP→DOWN 不经犹豫带，只靠 transition 判据会完全漏掉 → 反转越果断手数越大。
+        # 【2026-08-28 趋势单保护】transition 减仓语义收紧：观测标签 transition 保留
+        # "任意周期在犹豫带"(any，供诊断)；但减仓判定 transition_primary 仅当主执行周期
+        # (primary)本身处于 TRANSITION 才触发。原 any 判据会让"主周期明确趋势、仅辅助周期
+        # (如 D1)在犹豫带"的顺势趋势单被误减半仓（实锤 state=TREND_DOWN 趋势单 lot×0.50）。
         transition = any(s == _TRANSITION for s in period_states.values())
+        _trans_primary_only = bool(cfg.get("hexp.exec.transition_primary_only", True))
+        transition_primary = (period_states.get(primary, _RANGE) == _TRANSITION)
         reversal = bool(reversal_periods)
 
         # 9) 汇总输出（ScoreResult 契约 + hexp 元数据）
@@ -1546,6 +1574,39 @@ class HexpEngine:
         # 与 pos_pct/k/rsi 触发的极值护栏区分开统计。
         _cycle_blocked = (direction == "BUY" and (_pos_cycle > _extreme_high or _pos_z > _z_extreme)) or \
                          (direction == "SELL" and (_pos_cycle < _extreme_low or _pos_z < -_z_extreme))
+        # ── 2026-08-27 周期价格位置硬守护（接刀/摸顶拦截，优先级最高）──
+        # _cycle_blocked 仅由 pos_cycle/pos_z 极值触发（与 _in_extreme 的 pos_pct/k/rsi 解耦，
+        # 不被趋势中 Donchian 拉宽稀释）。命中即代表「周期绝对低位开空 / 高位开多」。
+        # 此前该标志只落库(sr.cycle_pos_blocked)不参与裁决 → 174 条/周 低位空、241 条/周 高位多漏拦。
+        # 现升级为硬闸门：无保本持仓 → 直接 NO_TRADE；有保本持仓 → 放行交风控(不硬封，防卡死)。
+        # 注：_sym_be_ok 在此提前读取（下方极值护栏段复用，避免重复 IO）。
+        _sym_be_ok = False
+        if direction in ("BUY", "SELL") and self._redis is not None:
+            try:
+                _be_flag = await self._redis.get(f"hcm:pos:be:sym:{symbol}:{direction}")
+                _sym_be_ok = (_be_flag is not None and str(_be_flag).strip() == "1")
+            except Exception:
+                _sym_be_ok = False
+        if _cycle_blocked:
+            if _sym_be_ok:
+                sr.extreme_pending = True
+                logger.info(
+                    "hexp %s %s | CYCLE_POS PENDING(保本追单) dir=%s "
+                    "pos_cycle=%.2f pos_z=%.2f (sym be=1 → risk BE-gate 裁决)",
+                    symbol, primary, direction, _pos_cycle, _pos_z)
+            else:
+                _cycle_block = (f"hexp_cycle_pos_guard(pos_cycle={_pos_cycle:.2f} "
+                                f"pos_z={_pos_z:.2f} dir={direction})")
+                logger.info("hexp %s %s | BLOCK %s dir=%s (cycle extreme position: "
+                            "bottom-short/top-long guarded)", symbol, primary,
+                            _cycle_block, direction)
+                direction = "NO_TRADE"
+                passed = False
+                sr.threshold_passed = False
+                sr.direction = "NO_TRADE"
+                sr.cycle_pos_blocked = True
+                if not sr.fallback_reason:
+                    sr.fallback_reason = _cycle_block
         # ── 极值反转护栏（2026-08-18 增强）──
         # 触发需三条件同时成立，且仅拦「原趋势延续单」（顶拦 BUY / 底拦 SELL）：
         #   ① 价位处于极值区（_in_extreme 已判定）
@@ -1594,16 +1655,10 @@ class HexpEngine:
             # 顶部长上影 / 底部长下影
             _long_wick = (_dir_sign > 0 and _upper_wick >= _wick_min) or \
                          (_dir_sign < 0 and _lower_wick >= _wick_min)
-            # 【2026-08-25 极值分层裁决】读 symbol 级保本标志 hcm:pos:be:sym:{symbol}:{dir}：
+            # 【2026-08-25 极值分层裁决】symbol 级保本标志 hcm:pos:be:sym:{symbol}:{dir} 已在
+            # 上方「周期价格位置硬守护」段提前读取(_sym_be_ok)，此处直接复用：
             # 该 symbol 已有同向保本持仓（风险已锁）→ 不硬封方向，标记 extreme_pending
             # 交由风控保本闸门最终裁决（放行+轻仓/拦截）；无保本 → 照常硬封（防接刀）。
-            _sym_be_ok = False
-            if direction in ("BUY", "SELL") and self._redis is not None:
-                try:
-                    _be_flag = await self._redis.get(f"hcm:pos:be:sym:{symbol}:{direction}")
-                    _sym_be_ok = (_be_flag is not None and str(_be_flag).strip() == "1")
-                except Exception:
-                    _sym_be_ok = False
             if _rev_enabled and _mm_retreat_enabled and \
                     _mm_aligned < _mm_retreat_min and _momentum_reversed and _long_wick:
                 if _sym_be_ok:
@@ -1628,43 +1683,15 @@ class HexpEngine:
                     sr.extreme_reversal_blocked = True
                     if not sr.fallback_reason:
                         sr.fallback_reason = _extreme_block
-            # 【2026-08-26 冲突①修复】原 elif 在"极值区 + mm 微弱回撤(无长影线) "即硬封顺势单，
-            # 不区分"顺畅趋势中顺势追单"与"底部接刀"。改为：仅当动量【明确反向】
-            # (_momentum_reversed) 才拦原趋势延续单；mm 微弱/平但不反向 → 视为顺势延续 →
-            # 放行 extreme_chase（与原"mm 仍朝原方向才放行"对称，补上"mm 微弱"也放行顺势）。
-            # 长影线(_long_wick) 仍作为反向判定的强佐证，但不再是唯一封单条件。
-            elif _mm_retreat_enabled and _mm_aligned < _mm_retreat_min and _momentum_reversed:
-                if _sym_be_ok:
-                    # 已有同向保本持仓：不硬封，标记交风控（轻仓追单）
-                    sr.extreme_pending = True
-                    logger.info(
-                        "hexp %s %s | EXTREME PENDING(保本追单) dir=%s pos=%.2f mm=%.2f "
-                        "(sym be=1 → risk BE-gate 裁决)",
-                        symbol, primary, direction, _pos_pct, _mm_aligned)
-                else:
-                    # 极值区 + 动量明确反向：拦原趋势延续单（顶部追多/底部追空接刀）
-                    _extreme_block = (f"hexp_extreme_guard(retreat mm={_mm_aligned:.2f} "
-                                       f"pos={_pos_pct:.2f})")
-                    logger.info("hexp %s %s | BLOCK %s dir=%s (extreme + mm reversed)",
-                                symbol, primary, _extreme_block, direction)
-                    direction = "NO_TRADE"
-                    passed = False
-                    sr.threshold_passed = False
-                    sr.direction = "NO_TRADE"
-                    if not sr.fallback_reason:
-                        sr.fallback_reason = _extreme_block
-            elif _mm_retreat_enabled and _mm_aligned < _mm_retreat_min:
-                # 【2026-08-26 冲突①修复】极值区但动量仅微弱回撤、未明确反向 → 顺势延续单放行
+            # 【2026-08-28 闸门清除】G3c 极值动量反向档已移除：极值区内不再因"mm 明确反向
+            # (无长影线)"拦截原趋势延续单。仅保留 G3b 长影线档(顶部上影/底部下影 ≥ wick_min
+            # 且 mm 反向才拦，强佐证防接刀)。未命中长影线档一律放行 extreme_chase(顺势追单)。
+            if not (_rev_enabled and _mm_retreat_enabled and
+                    _mm_aligned < _mm_retreat_min and _momentum_reversed and _long_wick):
                 sr.extreme_chase = True
                 logger.info(
                     "hexp %s %s | EXTREME CHASE allowed dir=%s mm_aligned=%.2f pos=%.2f "
-                    "(mm weak retreat, not reversed → chase at extreme)",
-                    symbol, primary, direction, _mm_aligned, _pos_pct)
-            else:
-                sr.extreme_chase = True
-                logger.info(
-                    "hexp %s %s | EXTREME CHASE allowed dir=%s mm_aligned=%.2f pos=%.2f "
-                    "(mm still aligned, chase at extreme)",
+                    "(extreme, no long-wick reversal → chase allowed)",
                     symbol, primary, direction, _mm_aligned, _pos_pct)
         # A-2) 动量枯竭保护（2026-08-21）：极值盲区补充——不依赖 _in_extreme（k 未超阈、
         # pos 未到 0.85 的宽通道高位追单会被极值护栏漏判）。当 pos 高位 + 趋势质量差(er 低)
@@ -1711,30 +1738,57 @@ class HexpEngine:
             # 0~100 多头度：BUY 高=多头高位(顶部追多需拦)；SELL 低=空头低位(底部追空需拦)。
             _ma_deg = float(pf.get("_ma_raw", 50.0))
             _eff_th = _flip_mm  # 默认基础阈值（明确反向才拦，防误杀）
+            # 高位分级收紧：顶部/底部追单需严格拦截（微动量反向即拦）。命中此区时
+            # 后续趋势单保护不得放宽（追单风险优先），故记录标记供下方跳过保护。
+            _at_extreme_ma = False
             if direction == "BUY" and _ma_deg >= _flip_ma_th:
                 _eff_th = _flip_ma_mm  # 多头高位：微负即拦顶部追多
+                _at_extreme_ma = True
             elif direction == "SELL" and _ma_deg <= _flip_ma_lo:
                 _eff_th = _flip_ma_mm  # 空头低位：微正即拦底部追空
+                _at_extreme_ma = True
+            # ── 【2026-08-28 趋势单保护】顺势趋势单不因 M1 正常回撤/换手误杀 ──
+            # momentum_flip 纯动量(仅 M1 f_mm_s)否决不辨趋势结构，趋势单推进中 M1 动量短暂
+            # 反向（洗盘/换手）会被误判为"动量反转"而拦掉（实锤 388642131-163 连续 BUY 被
+            # mm=-0.01~-0.18 拦、388642161 BUY mm=-0.4445 趋势单被拦）。修复：当信号是
+            # 顺势趋势单（主周期 TREND_UP/DOWN 且方向同向，或 ADX 强+ma 方向一致）时，
+            # 改用更宽的 flip_trend_mm（需剧烈反向才拦），放行趋势单正常回调；
+            # 逆势单/弱趋势/震荡仍用基础 flip_mm 敏捷拦逆动量。仅调阈值不动拦截路径。
+            _trend_prot = bool(cfg.get("hexp.momentum_flip_trend_enabled", True))
+            if _trend_prot:
+                _trend_adx = float(cfg.get("hexp.momentum_flip_trend_adx", 25.0))
+                _trend_mm = float(cfg.get("hexp.momentum_flip_trend_mm", 0.15))
+                # 趋势单判据：仅放行「顺势趋势单」，绝不因 ADX 高而放宽逆势单。
+                #  · 主判据（与 range_hurst._in_trend_dir 同口径）：主周期处于 TREND_UP/DOWN
+                #    且方向与趋势同向 → 真趋势单，M1 短暂反向不视为反转。
+                #  · 辅助判据（主周期状态机未及时切 TREND 但趋势已强的顺势场景）：
+                #    ADX≥trend_adx 且 ma 多头度方向与信号一致（BUY 需 _ma_raw>50 多头占优、
+                #    SELL 需 _ma_raw<50 空头占优）→ 强趋势顺势单。
+                #  逆势单（BUY 而 TREND_DOWN / ma<50）即使 ADX 高也绝不放宽，保持敏捷拦截。
+                _pstate = period_states.get(primary, _RANGE)
+                _in_trend_dir = (_pstate in (_TREND_UP, _TREND_DOWN)) and (
+                    (direction == "BUY" and _pstate == _TREND_UP) or
+                    (direction == "SELL" and _pstate == _TREND_DOWN))
+                _adx_now = float(pf.get("_adx_raw", 0.0))
+                _ma_deg_ok = (direction == "BUY" and _ma_deg > 50.0) or \
+                             (direction == "SELL" and _ma_deg < 50.0)
+                _is_trend = _in_trend_dir or (_adx_now >= _trend_adx and _ma_deg_ok)
+                # 高位分级收紧区(顶部/底部追单)优先：即使趋势单也绝不放宽，保持严格拦截
+                if _is_trend and not _at_extreme_ma:
+                    # 仅当趋势保护阈值更宽(更不敏感)时才覆盖，绝不收紧(高位分级收紧优先)
+                    if _trend_mm > _eff_th:
+                        _eff_th = _trend_mm
+                    logger.info(
+                        "hexp %s | trend-protect flip threshold: pstate=%s adx=%.1f "
+                        "trend_single=%s → th %.3f (放行顺势趋势单正常回调)",
+                        symbol, _pstate, _adx_now, _in_trend_dir, _eff_th,
+                    )
             if direction == "BUY" and f_mm_s < -_eff_th:
                 _flip_block = f"hexp_momentum_flip(BUY but mm={f_mm_s:.4f} ma={_ma_deg:.0f} th={_eff_th:.3f})"
             elif direction == "SELL" and f_mm_s > _eff_th:
                 _flip_block = f"hexp_momentum_flip(SELL but mm={f_mm_s:.4f} ma={_ma_deg:.0f} th={_eff_th:.3f})"
-            # ── 【2026-08-26 P0-1】高位微正枯竭加固 ──
-            # momentum_flip 只拦"mm 反向(负)"，漏掉 ma 极高位 + mm 微正枯竭(0<mm<弱阈值)
-            # 的顶部追多（实证 sig=388640598 BUY@4666.08 ma=100 pos=0.846 mm=+0.0124
-            # regime=NEUTRAL 高位追多被止损）。此处拦「高位 + 动能未反转但已枯竭」：
-            #   BUY : ma≥高位分界 且 0<mm<weak_mm        → 顶部微动量枯竭追多
-            #   SELL: ma≤低位分界 且 0>mm>-weak_mm        → 底部微动量枯竭追空
-            # 仅拦"高位+微正枯竭"；正常位置/动量明显同向(mm≥weak_mm)不拦，防误杀。
-            _hi_weak_enabled = bool(cfg.get("hexp.momentum_hi_weak_enabled", True))
-            if _hi_weak_enabled and _flip_block is None:
-                _hi_weak_mm = float(cfg.get("hexp.momentum_hi_weak_mm", 0.02))
-                if direction == "BUY" and _ma_deg >= _flip_ma_th and 0.0 < f_mm_s < _hi_weak_mm:
-                    _flip_block = (f"hexp_momentum_hi_weak(BUY but mm={f_mm_s:.4f} ma={_ma_deg:.0f} "
-                                   f"pos={_pos_pct:.2f} weak<{_hi_weak_mm:.3f})")
-                elif direction == "SELL" and _ma_deg <= _flip_ma_lo and -_hi_weak_mm < f_mm_s < 0.0:
-                    _flip_block = (f"hexp_momentum_hi_weak(SELL but mm={f_mm_s:.4f} ma={_ma_deg:.0f} "
-                                   f"pos={_pos_pct:.2f} weak<{_hi_weak_mm:.3f})")
+            # 【2026-08-28 闸门清除】G5b 高位微正枯竭加固已移除（原"ma 极高位+mm 微正枯竭"
+            # 拦顶部追多/追空）。_flip_block 现仅由 momentum_flip(动量明确反向)产生。
             if _flip_block:
                 logger.info("hexp %s %s | BLOCK %s dir=%s (momentum against direction)",
                             symbol, primary, _flip_block, direction)
@@ -1937,37 +1991,24 @@ class HexpEngine:
         lot = cfg["hexp.exec.lot_mult"] * grade_lot
         # 减仓聚合：transition（犹豫带）与 reversal（反转态）独立识别，
         # 取两者系数中更谨慎者（min）一次性减仓，避免二者同时命中时重复打折（×0.25）。
+        # 【2026-08-28 趋势单保护】transition 减仓用 transition_primary(仅主周期犹豫)，
+        # 避免"辅助周期 TRANSITION"误伤顺势趋势单；transition_primary_only=False 时回退
+        # 旧行为(任意周期犹豫即减)。reversal 减仓逻辑不变。
         red_mult = 1.0
-        if transition:
+        _trans_trigger = transition_primary if _trans_primary_only else transition
+        if _trans_trigger:
             red_mult = min(red_mult, float(cfg["hexp.exec.transition_lot_mult"]))
         if reversal:
             red_mult = min(red_mult, float(cfg["hexp.exec.reversal_lot_mult"]))
-        # 方案2（2026-08-21）：极值区手数递减——高位接刀/抄底风险随 Donchian 分位递增，
-        # 未被护栏封单的放行单也降仓（与 transition/reversal 用 min 聚合，不叠加打折）。
-        if _in_extreme and passed:
-            _extreme_lot_mult = float(cfg.get("hexp.exec.extreme_lot_mult", 0.5))
-            red_mult = min(red_mult, _extreme_lot_mult)
-            logger.info("hexp %s lot reduction extreme ×%.2f | pos_pct=%.2f dir=%s",
-                        symbol, _extreme_lot_mult, _pos_pct, direction)
-        # 方案2（2026-08-21）：行情波动率缩放手数——让「风控面板基础手数」随波动连续调整。
-        # co_exec_lot_mult 经 suggested_lot_ratio 透传到风控 final_lot = risk.lot_base × 档位 × co_ai_mult，
-        # 故在此把 ATR 相对常态的缩放编入 lot，波动大→基础手数降（防满仓接大波动），波动小→不超配。
-        vol_scale = 1.0
-        if bool(cfg.get("hexp.exec.vol_scale_enabled", True)) and atr and atr > 0:
-            _atr_ref = float(cfg.get("hexp.exec.vol_scale_atr_ref", 7.0))
-            _vol_min = float(cfg.get("hexp.exec.vol_scale_min", 0.5))
-            _vol_max = float(cfg.get("hexp.exec.vol_scale_max", 1.0))
-            # 缩放 = 参考ATR / 实际ATR：实际波动>常态 → 比<1 降仓；实际波动<常态 → 比>1 但封顶 vol_max。
-            _raw = _atr_ref / atr
-            vol_scale = max(_vol_min, min(_vol_max, _raw))
-            if vol_scale < 1.0:
-                logger.info("hexp %s vol-scale ×%.2f | atr=%.2f ref=%.2f (base lot scaled by market)",
-                            symbol, vol_scale, atr, _atr_ref)
-        if red_mult < 1.0 or vol_scale < 1.0:
-            lot *= red_mult * vol_scale
+        # 【2026-08-28 闸门清除】D3 极值区降仓、D4 波动率缩放均已移除：
+        #  - 极值区不再按 extreme_lot_mult 降仓（防高位接刀抄底，由护栏自行决定拦/放）；
+        #  - ATR 波动率不再缩放手数（vol_scale 恒 1.0，基础手数不随行情波动缩放）。
+        # 仅保留 transition/reversal 减仓(red_mult)。lot 只乘 red_mult。
+        if red_mult < 1.0:
+            lot *= red_mult
             logger.info(
-                "hexp %s lot mult ×%.2f (red=%.2f vol=%.2f) | transition=%s reversal=%s%s",
-                symbol, red_mult * vol_scale, red_mult, vol_scale, transition, reversal,
+                "hexp %s lot mult ×%.2f (red=%.2f) | transition=%s reversal=%s%s",
+                symbol, red_mult, red_mult, transition, reversal,
                 f" periods={','.join(reversal_periods)}" if reversal_periods else "")
         # G3a（2026-08-18）极值区 SL 收紧：处于极值区(_in_extreme)但未被护栏封单的单，
         # 用更紧的止损倍数 hexp.extreme.reversal_sl_atr_mult（默认0.5 < 常规 sl_atr_mult），

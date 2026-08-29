@@ -21,7 +21,9 @@ export const ENDPOINTS = {
     realtime: '/api/dashboard/realtime',
     signalGauges: '/api/dashboard/signal-gauges',
     statistics: '/api/v1/dashboard/statistics',
-    symbolsCompare: '/api/v1/dashboard/symbols-compare',
+    // 【2026-08-28】移除 symbolsCompare 端点常量（品种对比页已下线，前端无消费方）。
+    // 注意：后端 /api/dashboard/compare → /api/v1/dashboard/symbols-compare
+    // （dashboard.py:1222）**保留**，脚本/外部调用仍可访问。
     externalFactors: '/api/v1/dashboard/external-factors',
     /** equity-curve stub — backend returns empty data until full implementation */
     equityCurve: '/api/v1/dashboard/equity-curve',
@@ -53,9 +55,9 @@ export const ENDPOINTS = {
   close: {
     config: '/api/close/config',
   },
-  dispatch: {
-    config: '/api/dispatch/config',
-  },
+  // 【2026-08-28】移除 dispatch 端点常量（分发配置页已下线，前端无消费方）。
+  // 注意：后端 GET/PUT /api/dispatch/config（dispatch.py:174/181）**保留**，
+  // 运维/脚本仍可读写 dispatch.* 配置。
   datasource: {
     config: '/api/datasource/config',
   },
@@ -69,15 +71,21 @@ export const ENDPOINTS = {
     brokers: '/api/v1/copy/brokers',
   },
   signalTower: {
-    threshold: '/api/signal-tower/threshold',
+    // 【2026-08-28】移除 threshold 端点常量（评分阈值页已下线，前端无消费方）。
+    // 注意：后端 GET/PUT /api/signal-tower/threshold（signal_tower.py:1621/1630）**保留**——
+    // 它是那 35 个活键（scoring.* / regime.*）唯一的配置读写通道，运维/脚本仍可调参。
     mode: '/api/signal-tower/mode',
-    symbolConfig: '/api/signal-tower/symbol-config',
+    // 【2026-08-28】移除 symbolConfig 端点常量（品种级配置页已下线，前端无消费方）。
+    // 注意：后端 GET/PUT /api/signal-tower/symbol-config（signal_tower.py:1655/1664）**保留**，
+    // 品种级信号塔参数仍可通过该接口调参。
     prompt: '/api/signal-tower/prompt',
     watchdog: '/api/signal-tower/watchdog',
     retrainSummary: '/api/v1/signal-tower/retrain/summary',
   },
-  cosource: {
-    config: '/api/cosource/config',
+  // 【2026-08-28】原 cosource 端点重命名为 engineMode（双源信号下线，
+  // 该端点现仅承载 signal.active_model 引擎切换）。
+  engineMode: {
+    config: '/api/engine-mode/config',
   },
   ai: {
     config: '/api/v1/ai/config',
@@ -88,6 +96,13 @@ export const ENDPOINTS = {
       snapshot: '/api/v1/ai/report/snapshot',
       daily: '/api/v1/ai/report/daily',
       monitor: '/api/v1/ai/report/monitor',
+    },
+    // [2026-08-29] AI 中枢监控（只读）：三头实时运作 + DeepSeek 工作效果 + 自愈中心
+    ops: {
+      live: '/api/v1/ai/ops/live',
+      decisions: '/api/v1/ai/ops/decisions',
+      dsStats: '/api/v1/ai/ops/ds-stats',
+      selfHeal: '/api/v1/ai/ops/selfheal',
     },
   },
   hexp: {

@@ -152,7 +152,21 @@ async def startup():
         config=consumer_config,
         db_pool=db_pool,
     )
-    await stream_consumer.start()
+    # 【2026-08-28 P1-11】检查消费循环是否真的启动。
+    # 此前 start() 无返回值，自检失败时静默 return，本函数照常打印
+    # "fully initialized" → 风控实际停摆，而容器健康检查与日志都显示正常。
+    # 现 start() 返回 bool，失败时 fail-fast：抛错使健康检查失败并触发重启，
+    # 让"风控未运行"立刻可见，而不是带着失效的风控继续放行/累积信号。
+    started = await stream_consumer.start()
+    if not started:
+        log.critical(
+            "%s startup ABORTED: risk stream consumer failed to start "
+            "(safety config validation failed) — see CRITICAL logs above",
+            SERVICE_NAME,
+        )
+        raise RuntimeError(
+            "RiskStreamConsumer failed to start: safety config validation failed"
+        )
 
     # Hot-reload risk config every 60s (no restart needed when PG config changes)
     global _rule_config_refresh_task

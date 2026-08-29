@@ -34,6 +34,48 @@ DEFAULT_BLOCK_MS = 5000
 DEFAULT_RETRY_MAX = 3
 DEFAULT_RETRY_DELAY = 0.5
 
+# ── 【2026-08-28 P0-2】下单职责唯一归属主机侧 MT5 桥 ──
+# signal:risk_passed 上实测 7 个消费组并存：桥按账户建的 group:{6,9,23,24,35}
+# 与 dispatcher-group 争抢同一批信号；而 gateway 无 MT5 连接（main.py:75-76 传
+# mt5_bridge=None / order_manager=None），dispatcher 的下单全部落在 Stub 伪成交分支，
+# 实测产生 403 条 "Order timeout" 告警。近 14 天 orders 中 mt5_ticket 为空/0 的
+# 记录为 0 笔 → 全部真实成交均来自桥，dispatcher 从未成功成交。
+# 故 dispatcher 默认**不下单**，仅保留消费/通知职责；signal_status=3 由桥在真实
+# 成交后写入（mt5_bridge.py:1744）。此开关可经配置中心热开（PG+Redis）。
+DISPATCH_EXECUTION_ENABLED_KEY = "dispatch.execution_enabled"
+
+# ── 【2026-08-28 P0-5】信号年龄闸门 ──
+# 消费组若以 start_id="0" 重建，会把 stream 内全部历史信号当新单重放。桥侧已有
+# 同名闸门（mt5_bridge.py 的 bridge.max_signal_age_seconds，默认 180s），
+# dispatcher 复用同一配置键，超龄信号直接 ACK 丢弃，杜绝重放开仓。
+SIGNAL_MAX_AGE_KEY = "bridge.max_signal_age_seconds"
+DEFAULT_MAX_SIGNAL_AGE_SECONDS = 180.0
+
+
+def _signal_age_seconds(raw: Any) -> Optional[float]:
+    """解析信号生成时刻（UTC ISO）并返回年龄秒数。
+
+    解析失败或字段缺失时返回 None —— 表示"无法判定年龄"，调用方按**不拦截**
+    处理（宁可放行给下游闸门，也不因时间字段格式问题静默吞掉真实信号）。
+
+    Args:
+        raw: signal_generated_at 字段值（ISO 8601 字符串）。
+
+    Returns:
+        年龄秒数；无法判定时 None。
+    """
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        text = str(raw).strip().replace("Z", "+00:00")
+        gen_at = datetime.fromisoformat(text)
+        if gen_at.tzinfo is None:
+            gen_at = gen_at.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - gen_at).total_seconds()
+    except (TypeError, ValueError) as exc:
+        logger.debug("unparsable signal_generated_at=%r: %s", raw, exc)
+        return None
+
 
 @dataclass
 class DispatcherConsumerConfig:
@@ -45,6 +87,10 @@ class DispatcherConsumerConfig:
     block_ms: int = DEFAULT_BLOCK_MS
     retry_max: int = DEFAULT_RETRY_MAX
     retry_delay: float = DEFAULT_RETRY_DELAY
+    # P0-2：默认关闭下单（职责归桥）。可经配置中心 dispatch.execution_enabled 热开。
+    execution_enabled: bool = False
+    # P0-5：信号年龄上限（秒）。<=0 表示不做年龄限制。
+    max_signal_age_seconds: float = DEFAULT_MAX_SIGNAL_AGE_SECONDS
 
 
 class DispatcherStreamConsumer:
@@ -95,6 +141,9 @@ class DispatcherStreamConsumer:
             "orders_placed": 0,
             "orders_failed": 0,
             "orders_dead_letter": 0,
+            # 【2026-08-28 P0-2/P0-5】新增跳过计数，供 /health 观测闸门命中情况
+            "skipped_execution_disabled": 0,
+            "skipped_stale": 0,
         }
 
     # ── Lifecycle ───────────────────────────────
@@ -109,11 +158,15 @@ class DispatcherStreamConsumer:
         # time, start consuming from the very first message in the stream.
         # This guarantees no risk-passed signal is missed even if published
         # before the dispatcher came online.
+        # 【2026-08-28 P0-5】start_id 由 "0" 改为 "$"。
+        # 原值 "0" 表示首次建组从流首消费：一旦消费组不存在（Redis 重建/RDB 回滚/
+        # 运维 XGROUP DESTROY），会把 maxlen=10000 内的历史信号全量重放并当新单下发。
+        # 改为 "$" 后仅消费启动之后的新信号；历史补单应由桥按年龄闸门处理。
         await self._redis.xgroup_create(
             self._config.risk_passed_stream,
             self._config.group_name,
             mkstream=True,
-            start_id="0",
+            start_id="$",
         )
 
         self._running = True
@@ -137,6 +190,35 @@ class DispatcherStreamConsumer:
 
     # ── Main Loop ───────────────────────────────
 
+    async def _refresh_control_flags(self) -> None:
+        """热读中控开关（P0-2 执行开关 / P0-5 信号年龄闸门）。
+
+        配置中心：PG(hcm_config.metadata) → Redis(hcm:config:v2)。此处只读 Redis
+        侧 L2 缓存（config_provider.set 写入时会同步刷新），每轮循环一次，开销可忽略。
+        读取失败或值非法时保持当前值不变，不因配置抖动放大故障。
+        """
+        try:
+            raw = await self._redis.hget(
+                "hcm:config:v2", DISPATCH_EXECUTION_ENABLED_KEY)
+            if raw is not None and str(raw).strip() != "":
+                self._config.execution_enabled = str(raw).strip().lower() in (
+                    "1", "true", "yes", "on",
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("read %s failed, keep %s: %s",
+                         DISPATCH_EXECUTION_ENABLED_KEY,
+                         self._config.execution_enabled, exc)
+
+        try:
+            raw = await self._redis.hget("hcm:config:v2", SIGNAL_MAX_AGE_KEY)
+            if raw is not None and str(raw).strip() != "":
+                self._config.max_signal_age_seconds = float(str(raw).strip())
+        except (TypeError, ValueError) as exc:
+            logger.warning("invalid %s value ignored: %s", SIGNAL_MAX_AGE_KEY, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("read %s failed, keep %s: %s", SIGNAL_MAX_AGE_KEY,
+                         self._config.max_signal_age_seconds, exc)
+
     async def _consume_loop(self) -> None:
         """Main consumption loop: XREADGROUP → place order → track → ACK."""
         logger.info(
@@ -150,6 +232,8 @@ class DispatcherStreamConsumer:
         # 2. Main consumption loop
         while self._running:
             try:
+                # P0-2/P0-5：每轮热读中控开关，改配置即生效（无需重启容器）
+                await self._refresh_control_flags()
                 messages = await self._redis.xreadgroup(
                     group=self._config.group_name,
                     consumer=self._config.consumer_name,
@@ -212,6 +296,44 @@ class DispatcherStreamConsumer:
                         msg.message_id,
                     )
                     return
+
+                # ── P0-5 信号年龄闸门：超龄信号直接 ACK 丢弃 ──
+                # 防止消费组以 start_id="0" 重建（Redis 重建/RDB 回滚/XGROUP DESTROY）
+                # 时把 maxlen=10000 内的历史信号全量重放并当新单下发。
+                if self._config.max_signal_age_seconds > 0:
+                    _age = _signal_age_seconds(msg.data.get("signal_generated_at"))
+                    if _age is not None and _age > self._config.max_signal_age_seconds:
+                        self._stats["skipped_stale"] += 1
+                        logger.warning(
+                            "Signal too old, skipped (age=%.1fs > %.1fs): "
+                            "signal_id=%s, symbol=%s",
+                            _age, self._config.max_signal_age_seconds,
+                            signal_id, symbol,
+                        )
+                        await self._redis.xack(
+                            self._config.risk_passed_stream,
+                            self._config.group_name,
+                            msg.message_id,
+                        )
+                        return
+
+                # ── P0-2 下单执行闸门：下单职责唯一归属主机侧 MT5 桥 ──
+                # 关闭时 dispatcher 仅消费并 ACK，不下单、不写 signal_status
+                # （signal_status=3 由桥在真实成交后写入，见 mt5_bridge.py:1744）。
+                if not self._config.execution_enabled:
+                    self._stats["skipped_execution_disabled"] += 1
+                    logger.info(
+                        "Dispatch skipped (execution disabled — handled by MT5 bridge): "
+                        "signal_id=%s, symbol=%s, direction=%s",
+                        signal_id, symbol, direction,
+                    )
+                    await self._redis.xack(
+                        self._config.risk_passed_stream,
+                        self._config.group_name,
+                        msg.message_id,
+                    )
+                    return
+
                 lot = float(msg.data.get("lot", 0.0))
                 if lot <= 0.0:
                     lot = 0.01

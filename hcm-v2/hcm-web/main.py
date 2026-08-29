@@ -45,10 +45,11 @@ from web.api.close import create_close_router           # T04
 from web.api.datasource import create_datasource_router # T04
 from web.api.engine import create_engine_router         # T04
 from web.api.system import create_system_router         # T05
-from web.api.cosource import create_cosource_router    # P1a/P1b co-source config
+from web.api.engine_mode import create_engine_mode_router  # 引擎模式切换(signal.active_model)
 from web.api.hexp import create_hexp_router            # 和乘幂(hexp) 独立信号源 config + live signal
 from web.api.ai_config import create_ai_config_router  # AI 信号质量模块 ai.* 配置
 from web.api.ai_report import create_ai_report_router  # AI 报表聚合（只读）
+from web.api.ai_ops import create_ai_ops_router        # [2026-08-29] AI 中枢监控（三头实时+DeepSeek 效果，只读）
 
 # ── Configuration ──────────────────────────────
 
@@ -56,10 +57,38 @@ SERVICE_NAME = "hcm-web"
 SERVICE_PORT = int(os.getenv("SERVICE_PORT", "8000"))
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 DB_URL = os.getenv("DB_URL", "postgresql://hcm:hcm_dev_pwd@localhost:5432/hcm_v2")
-JWT_SECRET = os.getenv("JWT_SECRET", "hcm-v2-dev-secret-change-in-production")
+# 【2026-08-28 P1-12】JWT 签名密钥安全加固。
+# 原实现 os.getenv("JWT_SECRET", "hcm-v2-dev-secret-change-in-production")：
+# 只要部署时未注入环境变量（docker-compose.yml 里同样是弱占位默认值），任何拿到
+# 源码的人都能用这个公开字符串离线伪造任意 user/角色的 JWT，进而调用全部写接口
+# （用户增删改、引擎启停、风控/平仓/跟单配置 PUT）。
+# 现：未配置或命中已知占位值时**自动生成一次性随机密钥**，使伪造不可行；
+# 同时打 CRITICAL 提示运维显式注入（否则每次重启后已登录会话需重新登录）。
+import secrets as _secrets
+
+_JWT_ENV_RAW = os.getenv("JWT_SECRET", "")
+_JWT_INSECURE_PLACEHOLDERS = {
+    "",
+    "hcm-v2-dev-secret-change-in-production",
+    "dev-jwt-secret-change-in-production",
+    "changeme",
+    "secret",
+}
+JWT_SECRET_EPHEMERAL = _JWT_ENV_RAW.strip() in _JWT_INSECURE_PLACEHOLDERS
+JWT_SECRET = (
+    _secrets.token_urlsafe(48) if JWT_SECRET_EPHEMERAL else _JWT_ENV_RAW.strip()
+)
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend")
 
 log = setup_logging(service_name=SERVICE_NAME, level="INFO")
+
+if JWT_SECRET_EPHEMERAL:
+    log.critical(
+        "JWT_SECRET is NOT configured (or still the placeholder default) — "
+        "an ephemeral random secret has been generated for this process. "
+        "Sessions will NOT survive a restart. Set JWT_SECRET in .env / "
+        "docker-compose.yml to a strong random value (e.g. `openssl rand -base64 48`)."
+    )
 
 # ── Dependencies ───────────────────────────────
 
@@ -94,9 +123,20 @@ app = FastAPI(
 )
 
 # CORS
+# 【2026-08-28 P1-12】收窄为显式白名单。前端由本服务同源提供（hcm-web 挂载
+# frontend/dist），不存在合法的跨域调用方；原 allow_origins=["*"] 叠加
+# allow_credentials=True 允许任意站点携带凭证读写全部接口。
+# 注意：同源请求不带 Origin 头，CORSMiddleware 直接放行，因此收紧不影响正常访问；
+# 仅当确有跨域调用方时，用 CORS_ALLOW_ORIGINS（逗号分隔）显式放开。
+_CORS_ORIGINS_RAW = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
+CORS_ALLOW_ORIGINS = (
+    [o.strip() for o in _CORS_ORIGINS_RAW.split(",") if o.strip()]
+    if _CORS_ORIGINS_RAW
+    else ["http://localhost:8000", "http://127.0.0.1:8000"]
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -176,13 +216,15 @@ async def startup():
     # T05: System management — users CRUD + MT5/DeepSeek/Network/Notifications/Cache (+ redis for cache)
     app.include_router(create_system_router(db_pool, config_provider, auth_handler, redis_client))
     # P1a/P1b: Co-source signal enhancement — calibration + filters + adaptive gates config CRUD
-    app.include_router(create_cosource_router(db_pool, config_provider, auth_handler))
+    app.include_router(create_engine_mode_router(db_pool, config_provider, auth_handler))
     # 和乘幂(hexp) 独立信号源 — config CRUD + 实时信号快照(需 redis 读 hcm:live:hexp:*)
     app.include_router(create_hexp_router(db_pool, config_provider, auth_handler, redis_client))
     # AI 信号质量模块 — ai.* 配置 CRUD（LightGBM/DeepSeek/耦合/持仓调仓）
     app.include_router(create_ai_config_router(db_pool, config_provider, auth_handler))
     # AI 报表聚合 — 系统健康/信号分层/绩效对比/快照明细（只读）
     app.include_router(create_ai_report_router(db_pool, auth_handler))
+    # [2026-08-29] AI 中枢监控 — LightGBM 三头实时运作 + hexp 方向共振对照 + DeepSeek 效果（只读）
+    app.include_router(create_ai_ops_router(db_pool, config_provider, auth_handler, redis_client))
 
     # Mount frontend static files at root, BUT keep /docs /openapi.json for backend
     if FRONTEND_DIST and os.path.isdir(FRONTEND_DIST):

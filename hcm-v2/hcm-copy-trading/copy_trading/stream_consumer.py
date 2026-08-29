@@ -36,6 +36,11 @@ DEFAULT_BLOCK_MS = 5000
 DEFAULT_RETRY_MAX = 3
 DEFAULT_RETRY_DELAY = 0.5
 
+# 2026-08-29：跟单下单统一由跟单桥（FOLLOW_MASTERS 广播信号独立开仓 + master_stream 镜像
+# 平仓/改仓/加减仓）负责；copy-trading 服务仅保留信号扇出/兜底消费者（消费 + ACK，不下真实单），
+# 避免与跟单桥重复开仓（2× 敞口）。如需临时恢复 copy-trading 真实下单，置为 True。
+COPY_TRADING_ORDER_EXECUTION_ENABLED = False
+
 # Deduplication: track recently processed signal IDs
 DEDUP_TTL = 3600  # 1 hour
 DEDUP_KEY_PREFIX = "hcm:copytrade:dedup"
@@ -294,7 +299,16 @@ class CopyTradingStreamConsumer:
                         break
 
                     # 3. Order execution
-                    if self._order_executor is not None:
+                    # 2026-08-29：默认关闭真实下单（COPY_TRADING_ORDER_EXECUTION_ENABLED=False），
+                    # 跟单开仓统一由跟单桥负责，避免重复开仓；copy-trading 仍消费+ACK（扇出/兜底）。
+                    if not COPY_TRADING_ORDER_EXECUTION_ENABLED:
+                        success = True
+                        logger.info(
+                            "Copy-trading execution disabled (ack-only): signal_id=%s account=%d",
+                            signal_id, follower_account_id,
+                        )
+                        break
+                    elif self._order_executor is not None:
                         exec_result = await self._order_executor.execute(
                             account_id=follower_account_id,
                             symbol=follower_symbol,

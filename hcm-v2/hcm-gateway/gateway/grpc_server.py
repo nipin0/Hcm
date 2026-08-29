@@ -327,13 +327,22 @@ class GatewayGrpcServer:
             logger.error("PlaceOrder error: %s", exc)
             return PlaceOrderResponse(code=99, message=f"Internal error: {exc}")
 
-        # Stub mode
+        # ── 无 MT5 桥接：必须显式失败，禁止伪造成交 ──
+        # 【2026-08-28 P0-3】此处原返回 code=0 + 由 time.time() 派生的伪 ticket，
+        # 调用方(dispatcher)无法辨别真假，遂把 signal_status 置 3（已成交）并
+        # track_order，实测产生 403 条 "Order timeout" 告警；一旦 gateway 接入真实
+        # MT5 通道，将与主机侧桥（消费组 group:{account_id}）形成双重开仓。
+        # 现改为返回明确失败码，使调用方走拒单分支而非伪成交分支。
         latency_ms = int((time.time() - t0) * 1000)
-        stub_ticket = int(time.time() * 1000) % 1000000000
+        logger.error(
+            "PlaceOrder REJECTED: no MT5 bridge configured "
+            "(mt5_bridge=%s, order_manager=%s) — refusing to fake a fill",
+            self._mt5 is not None, self._order_mgr is not None,
+        )
         return PlaceOrderResponse(
-            code=0,
-            message="ok (stub)",
-            mt5_ticket=stub_ticket,
+            code=99,
+            message="no mt5 bridge configured (refusing stub fill)",
+            mt5_ticket=0,
             filled_price=0.0,
             commission=0.0,
             latency_ms=latency_ms,

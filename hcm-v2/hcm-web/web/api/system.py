@@ -3200,7 +3200,15 @@ def create_system_router(
                 for r in pg_rows:
                     key = r["config_key"]
                     if key not in redis_keys:
-                        await rc.raw.hsetnx("hcm:config:v2", key, str(r["v"]))
+                        # 【2026-08-28 P1-8】COALESCE(NULLIF(current_value,''), default_value)
+                        # 在两列都为 NULL 时返回 None，原 str(None) 会把字面字符串
+                        # "None" 写进 Redis → PG 侧为 NULL 而 Redis 侧是 "None"，
+                        # 桥侧 float("None") 必失败并静默回落硬编码默认（配置漂移放大器）。
+                        # 铁律 5.2「空值即未设置」：值为 None/空串时跳过回填，不写脏值。
+                        _v = r["v"]
+                        if _v is None or str(_v).strip() == "":
+                            continue
+                        await rc.raw.hsetnx("hcm:config:v2", key, str(_v))
                         cnt += 1
                 applied.append(f"backfill_config: 回填 {cnt} 个缺失配置键")
                 succeeded.add("backfill_config")
@@ -3219,7 +3227,12 @@ def create_system_router(
                 if pg_row and pg_row["v"] is not None:
                     await rc.raw.hset("hcm:config:v2", "signal.active_model", str(pg_row["v"]))
                     try:
-                        await rc.raw.publish("hcm:config:v2:updated", "signal.active_model")
+                        # 【2026-08-28 P1-8】失效频道修正：hcm:config:v2:updated 全库
+                        # **零订阅者**（config_provider.INVALIDATION_CHANNEL 才是
+                        # "hcm:config:invalidate"）。原写法导致改完配置后其它进程的
+                        # ConfigProviderV3 L1 本地缓存（TTL 30s）不失效 → 运维点击
+                        # "已修复"后最长 30s 仍读旧值，误判自愈失败并重复操作。
+                        await rc.raw.publish("hcm:config:invalidate", "signal.active_model")
                     except Exception:
                         pass
                     applied.append(f"resync_active_model: PG='{pg_row['v']}' 已覆盖写回 Redis")
@@ -3256,7 +3269,9 @@ def create_system_router(
                         resync_count += 1
                 if resync_count > 0:
                     try:
-                        await rc.raw.publish("hcm:config:v2:updated", "resync_config_drift")
+                        # 【2026-08-28 P1-8】同 resync_active_model：修正为真正有订阅者的
+                        # 失效频道 hcm:config:invalidate（原 hcm:config:v2:updated 无人订阅）。
+                        await rc.raw.publish("hcm:config:invalidate", "resync_config_drift")
                     except Exception:
                         pass
                 applied.append(f"resync_config_drift: {resync_count}/{len(DRIFT_KEYS_HEAL)} 键已从 PG 覆盖写回 Redis")
@@ -3292,10 +3307,17 @@ def create_system_router(
                         _mg_target = str(_pg_i["v"]).strip().upper()
                 if not _mg_target:
                     _mg_target = _MG_INTENDED_DEFAULT
-                # 1) 写 PG hcm_config.metadata（current_value 优先，缺则补 default_value）
+                # 1) 写 PG hcm_config.metadata
+                # 【2026-08-28 P1-8】原为裸 UPDATE：键不存在时静默影响 0 行且不报错，
+                # 而下方 Redis 照写 → 形成 PG 无值 / Redis 有值的分裂，后续任何回填
+                # 或失效都会用 PG 旧值覆盖本次锚定（正是"调参被复原"的复现路径）。
+                # 改为 UPSERT（与 config_provider.set 一致），保证键一定存在。
                 await db_pool.execute(
-                    "UPDATE hcm_config.metadata "
-                    "SET current_value=$2 WHERE config_key=$1",
+                    "INSERT INTO hcm_config.metadata "
+                    "(config_key, default_value, current_value, value_type, category) "
+                    "VALUES ($1, $2, $2, 'string', 'hexp') "
+                    "ON CONFLICT (config_key) DO UPDATE "
+                    "SET current_value=EXCLUDED.current_value, updated_at=now()",
                     "hexp.min_grade", _mg_target,
                 )
                 # 2) 写 Redis hcm:config:v2（引擎热读源）

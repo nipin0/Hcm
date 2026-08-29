@@ -19,6 +19,23 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+# ── 【2026-08-28 P0-4】订单状态枚举 ──────────────────────────────────────
+# 铁律 4.6：禁止在 SQL/代码里裸写 1/2 等状态字面量（裸写 order_status=1 曾导致
+# 1015 笔订单假 open、风控冷却全面失效，见铁律 10.1）。
+# 语义经 PG 实测确认（2026-08-28）：OPEN(1)=492 行且 close_time 全部为 NULL；
+# CLOSED(2)=1157 行且 close_time 全部非空。
+ORDER_STATUS_OPEN = 1
+ORDER_STATUS_CLOSED = 2
+
+# ── 【2026-08-28 P0-4】DB 故障失败模式：fail-closed（故障安全）──────────
+# 铁律 10.2：风控闸门不得单一依赖滞后表，且故障时不得"放行"。原实现在 DB 异常时
+# 返回 0（fail-open），等于瞬间放开限仓与亏损熔断 —— DB 抖动即可打满仓位。
+# 改为返回超出阈值的哨兵值，使闸门拒绝交易（表现为短暂拒单，属故障安全侧）。
+# 如需临时恢复 fail-open，把这三个常量改回 0 / 0.0 / 0.0 即可，无需改逻辑。
+DB_FAIL_CLOSED_COUNT = 9999      # 持仓数 → 触发限仓拒绝
+DB_FAIL_CLOSED_LOT = 99999.0     # 总手数 → 触发限仓拒绝
+DB_FAIL_CLOSED_LOSS = -99999.0   # 日亏   → 触发熔断
+
 # ── Rule result types ──────────────────────────
 
 
@@ -632,6 +649,16 @@ class RuleChain:
         sl = None
         if self._db is not None and self._db.is_initialized and account_id > 0:
             try:
+                # 【2026-08-28 P0-4 已回退】此处曾尝试 UNION hcm_trading.orders 的
+                # 未平记录做双源校验，实测不成立并已回退，原因留档：
+                # position_sync.py 平仓时是 **INSERT 一条 order_status=2 的新行**，
+                # 而非 UPDATE 原开仓行 → orders 中 order_status=1 的开仓行 close_time
+                # 永远为 NULL（累积 492 条僵尸记录）。故 `order_status=OPEN AND
+                # close_time IS NULL` 返回的是"全部历史开仓"而非"当前未平"，
+                # 直接 UNION 会把持仓数放大到 92~239 → 限仓闸门永久拒单。
+                # 结论：当前未平持仓的唯一可靠真值源仍是 positions 表；
+                # 若要真正满足铁律 10.2 的双源，第二源应取 MT5 实时持仓快照
+                # （桥写入的 Redis 键），而非 orders。见待办 P0-4'。
                 row = await self._db.fetchrow(
                     "SELECT open_price, sl FROM hcm_trading.positions "
                     "WHERE account_id=$1 AND direction=$2 "
@@ -861,8 +888,14 @@ class RuleChain:
             Total lot size.
         """
         if self._db is None:
-            return 0.0
+            logger.critical(
+                "DB NOT READY in _get_account_total_lot(account=%s) — fail-closed",
+                account_id)
+            return DB_FAIL_CLOSED_LOT
         try:
+            # 【2026-08-28 P0-4 已回退】曾 UNION orders 未平记录做双源，实测不成立
+            # （orders 开仓行 close_time 永为 NULL，原因见 _check_cooldown 处说明），
+            # 会把在途手数放大数十倍 → 限仓永久拒单。维持 positions 单源。
             row = await self._db.fetchval(
                 "SELECT COALESCE(SUM(lot), 0) FROM hcm_trading.positions "
                 "WHERE account_id=$1 AND status='open'",
@@ -870,11 +903,12 @@ class RuleChain:
             )
             return float(row) if row else 0.0
         except Exception as exc:
-            # 【D 组】DB 故障 fail-open 必须可观测：四道库依赖闸门失效时留 CRITICAL 痕迹
+            # 【P0-4】fail-open → fail-closed：DB 故障时拒绝交易（故障安全），
+            # 而非返回 0.0 放开限仓。铁律 10.2。
             logger.critical(
-                "DB FAILED in _get_account_total_lot(account=%s): %s — fail-open 0.0, risk gate DEGRADED",
+                "DB FAILED in _get_account_total_lot(account=%s): %s — fail-closed, trading BLOCKED",
                 account_id, exc)
-            return 0.0
+            return DB_FAIL_CLOSED_LOT
 
     async def _get_open_positions_count(self, account_id: int, symbol: str, direction: str = "") -> int:
         """Get number of open positions for an account/symbol(/direction).
@@ -888,12 +922,20 @@ class RuleChain:
             Count of open positions.
         """
         if self._db is None:
-            return 0
+            logger.critical(
+                "DB NOT READY in _get_open_positions_count(account=%s) — fail-closed",
+                account_id)
+            return DB_FAIL_CLOSED_COUNT
         try:
             # Count only real MT5 positions — exclude phantom rows:
             # - NO_TRADE direction
             # - missing mt5_ticket (not synced from MT5)
             # - zero lot (signal records saved as positions)
+            #
+            # 【2026-08-28 P0-4 已回退】曾 UNION orders 未平记录做双源，实测不成立：
+            # orders 的 order_status=1 开仓行 close_time 永远为 NULL（平仓是 INSERT
+            # 新行而非 UPDATE），UNION 后持仓数虚高至 92~239（阈值仅 5）→ 永久拒单。
+            # 维持 positions 单源，详见 _check_cooldown 处的完整说明与待办 P0-4'。
             where_real = (
                 "status='open' AND direction IN ('BUY','SELL') "
                 "AND mt5_ticket IS NOT NULL AND mt5_ticket > 0 "
@@ -910,11 +952,12 @@ class RuleChain:
             row = await self._db.fetchval(sql, *args)
             return int(row) if row else 0
         except Exception as exc:
-            # 【D 组】DB 故障 fail-open 必须可观测
+            # 【P0-4】fail-open → fail-closed：DB 故障时限仓闸门必须拒绝交易，
+            # 而非返回 0 放开限仓（原实现 DB 抖动即可打满仓位）。铁律 10.2。
             logger.critical(
-                "DB FAILED in _get_open_positions_count(account=%s, symbol=%s, dir=%s): %s — fail-open 0, risk gate DEGRADED",
+                "DB FAILED in _get_open_positions_count(account=%s, symbol=%s, dir=%s): %s — fail-closed, trading BLOCKED",
                 account_id, symbol, direction, exc)
-            return 0
+            return DB_FAIL_CLOSED_COUNT
 
     async def _get_daily_loss(self, account_id: int) -> float:
         """Get realized daily loss for an account.
@@ -926,20 +969,37 @@ class RuleChain:
             Realized loss for today (negative = loss).
         """
         if self._db is None:
-            return 0.0
+            logger.critical(
+                "DB NOT READY in _get_daily_loss(account=%s) — fail-closed",
+                account_id)
+            return DB_FAIL_CLOSED_LOSS
         try:
+            # 【2026-08-28 P0-4/P0-6】真值源修正 —— 原实现只查
+            # hcm_trade.closed_positions，而该表实测为**空表（0 行）**
+            # （对比 hcm_trading.orders order_status=CLOSED 有 1157 行，最新 08-28）
+            # → 当日亏损恒为 0 → **每日亏损熔断从未生效**。
+            # 改为以 orders 已平记录为主真值源；closed_positions 作为归档补充保留
+            # （当前为空，UNION ALL 不产生重复计数；若将来启用归档写入，须复核
+            # 两表是否会 double count 同一笔平仓）。
             row = await self._db.fetchval(
-                "SELECT COALESCE(SUM(realized_pnl), 0) FROM hcm_trade.closed_positions "
-                "WHERE account_id=$1 AND close_time >= CURRENT_DATE",
-                account_id,
+                "SELECT COALESCE(SUM(pnl), 0) FROM ( "
+                "  SELECT profit AS pnl FROM hcm_trading.orders "
+                "  WHERE account_id=$1 AND order_status=$2 AND close_time IS NOT NULL "
+                "    AND close_time >= CURRENT_DATE "
+                "  UNION ALL "
+                "  SELECT realized_pnl AS pnl FROM hcm_trade.closed_positions "
+                "  WHERE account_id=$1 AND close_time >= CURRENT_DATE "
+                ") t",
+                account_id, ORDER_STATUS_CLOSED,
             )
             return float(row) if row else 0.0
         except Exception as exc:
-            # 【D 组】DB 故障 fail-open 必须可观测
+            # 【P0-4】fail-open → fail-closed：DB 故障时必须触发熔断（拒绝交易），
+            # 而非返回 0.0 让亏损闸门静默失效。铁律 10.2。
             logger.critical(
-                "DB FAILED in _get_daily_loss(account=%s): %s — fail-open 0.0, risk gate DEGRADED",
+                "DB FAILED in _get_daily_loss(account=%s): %s — fail-closed, trading BLOCKED",
                 account_id, exc)
-            return 0.0
+            return DB_FAIL_CLOSED_LOSS
 
     async def _get_free_margin(self, account_id: int) -> float:
         """Get free margin for an account.

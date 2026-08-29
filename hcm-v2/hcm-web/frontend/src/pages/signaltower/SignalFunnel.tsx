@@ -30,7 +30,10 @@ interface Thresholds {
   'co.gate.direction_min_score': number; 'co.gate.range.block': boolean;
   'scoring.min_adx_for_trade': number; 'scoring.trend_strong_adx_threshold': number;
   'scoring.trend_reverse_suppress_factor': number; 'scoring.min_score_threshold': number;
-  'scoring.trend_min_score_threshold': number; strong_score: number; weak_score: number;
+  // 【2026-08-28 死键清除】移除 'scoring.trend_min_score_threshold'（无引用死键）；
+  // strong_score / weak_score 由后端 co.gate.strong/weak.trend 折算，保留仅供
+  // 历史信号（co_source 时代）漏斗归因展示。
+  strong_score: number; weak_score: number;
 }
 interface FunnelData {
   window_hours: number; symbol: string | null; symbols: string[]; candidates: number;
@@ -240,9 +243,8 @@ const SignalFunnel: React.FC = () => {
           {data?.model === 'hexp' && (
             <Chip size="small" label="主路径: HEXP 和乘幂" sx={{ color: '#a855f7', borderColor: '#a855f7' }} variant="outlined" />
           )}
-          {data?.model === 'co_source' && (
-            <Chip size="small" label="主路径: co_source 共源" sx={{ color: '#38bdf8', borderColor: '#38bdf8' }} variant="outlined" />
-          )}
+          {/* 【2026-08-28 co_source 清除】原「主路径: co_source 共源」Chip 移除；
+              后端 _detect_active_model 已不再返回 'co_source'，该分支恒不触发。 */}
         </Box>
         <Box className="flex items-center gap-3">
           <FormControl size="small" sx={{ minWidth: 140 }}>

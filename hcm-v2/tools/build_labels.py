@@ -41,6 +41,16 @@ CFG_FALLBACK = {
     "ai.lm.label_r_loss": 1.0,
     "ai.lm.label_horizon_bars": 12,
     "ai.lm.label_sl_atr_fallback": 2.0,
+    # 【2026-08-28·质量头治本·标签口径统一】质量标签的 R（风险距离）来源。
+    # 根因：引擎在 AI 未生效时故意不写 sl_price（scheduler.py:2377-2378，桥依赖 0=回退会话 SL），
+    # 导致历史信号 sl_price=0 → 标签走 atr×2.0 fallback；而近期 AI 生效的信号 sl_price>0 →
+    # 标签走真实 SL 距离 R=|entry-sl|。同一训练集混了两种语义的 R → 质量头 AUC≈0.5 不可学。
+    #   atr_fallback(默认·向后兼容): 全部用 atr×label_sl_atr_fallback，标签口径统一
+    #   real(推荐): 仅保留 sl_price>0 的信号（R=真实 SL 距离），标签口径统一且与入场质量挂钩
+    "ai.lm.label_sl_source": "atr_fallback",
+    # 【阶段 0·方向头/买点头标签】独立于 hexp 方向，由未来 K 线方向驱动。
+    "ai.lm.dir_atr_mult": 0.8,        # 方向幅度阈值(ATR 倍数)：未来 N 根 close 相对 entry 涨/跌 ≥ ±0.8·ATR → 有方向
+    "ai.lm.dir_horizon_bars": 24,     # 方向展望期(根 M5)，长于质量头 12 以稳方向
 }
 
 
@@ -136,13 +146,21 @@ def label_one(sig_row, kl: pd.DataFrame, cfg: dict, events=None):
     sl_price = sig_row.get("sl_price")
     atr = sig_row.get("atr_14")
     ai_sl_mult = sig_row.get("ai_sl_mult")
-    if sl_price is not None and float(sl_price) > 0 and abs(float(sl_price) - entry) > 1e-9:
+    # 【2026-08-28·标签口径统一】按 ai.lm.label_sl_source 决定 R 来源，杜绝同集混语义。
+    _sl_source = str(cfg.get("ai.lm.label_sl_source", "atr_fallback") or "atr_fallback").lower()
+    if _sl_source == "real":
+        # 真实 SL 口径：无有效 sl_price 的信号直接排除（保证全库标签=真实 SL 距离 R，
+        # 与入场质量挂钩，使入场质量特征对标签有预测力）。
+        if sl_price is None or not (float(sl_price) > 0) or abs(float(sl_price) - entry) <= 1e-9:
+            return None, "no_real_sl", 0.0, None
         R = abs(entry - float(sl_price))
-    elif atr and float(atr) > 0:
+    else:
+        # 统一 ATR fallback 口径：忽略 sl_price（即便有真实 SL 也不用），全库 R=atr×mult。
+        # 保证标签口径一致（修复历史与近期混用两种 R 定义导致质量头不可学）。
+        if not (atr and float(atr) > 0):
+            return None, "no_sl_atr", 0.0, None
         mult = float(ai_sl_mult) if ai_sl_mult and float(ai_sl_mult) > 0 else cfg["ai.lm.label_sl_atr_fallback"]
         R = mult * float(atr)
-    else:
-        return None, "no_sl_atr", 0.0, None
     if R <= 0:
         return None, "zero_R", 0.0, None
 
@@ -197,6 +215,111 @@ def label_one(sig_row, kl: pd.DataFrame, cfg: dict, events=None):
         if hit_stop:
             return 0, "stop_first", R, i
     return None, "no_touch_in_horizon", R, horizon
+
+
+# ── 阶段 0·方向头标签：独立于 hexp 方向，纯看未来 K 线走向 ──
+def dir_label_one(sig_row, kl: pd.DataFrame, cfg: dict):
+    """对单条信号构造「市场方向」标签（不看 signal_dir，彻底解耦 hexp）。
+
+    未来 ``dir_horizon_bars`` 根 M5 收盘相对 entry 的标准化收益：
+        fut_ret = (close_N - entry) / atr
+        fut_ret >= +dir_atr_mult  -> +1 (BUY 方向)
+        fut_ret <= -dir_atr_mult  -> -1 (SELL 方向)
+        否则                      ->  0 (FLAT 横盘)
+    纪律红线：标签仅用未来 K 线（监督学习标准），推理侧只用当前特征，无泄露。
+    排除：atr 缺失 / 前向 K 线不足。
+    """
+    entry = float(sig_row["entry_price"])
+    atr = sig_row.get("atr_14")
+    if atr is None or float(atr) <= 0:
+        return None
+    atr = float(atr)
+    x_dir = float(cfg.get("ai.lm.dir_atr_mult", 0.8))
+    n = int(cfg.get("ai.lm.dir_horizon_bars", 24))
+    created = sig_row["created_at"]
+    if pd.isna(created) or kl is None or kl.empty:
+        return None
+    idx = kl["open_time"].searchsorted(created, side="left")
+    window = kl.iloc[idx: idx + n]
+    if len(window) < n:
+        return None
+    fut_ret = (float(window.iloc[-1]["close"]) - entry) / atr
+    if fut_ret >= x_dir:
+        return 1
+    if fut_ret <= -x_dir:
+        return -1
+    return 0
+
+
+# ── 阶段 0·买点头标签：条件于方向头预测方向(训练时用真实 dir_label)的 R 触达 ──
+def entry_label_one(sig_row, kl: pd.DataFrame, cfg: dict, dir_val, events=None):
+    """在 ``dir_val`` 方向上构造「买点质量」标签（学习驱动精准点位）。
+
+    与 label_one 同构（复用 R 触达逻辑），唯一区别：方向来源从 signal_dir 换成 dir_val。
+        dir_val==+1(做多)：未来 horizon 根内先触 +1R -> 1(好买点)，先触 -1R -> 0
+        dir_val==-1(做空)：对称
+        dir_val 为 None/0(FLAT) -> None（无方向不评买点）
+    排除规则同 label_one（跳空/事件/同根双触/前向不足）。
+    """
+    if dir_val is None or dir_val == 0:
+        return None
+    entry = float(sig_row["entry_price"])
+    sl_price = sig_row.get("sl_price")
+    atr = sig_row.get("atr_14")
+    ai_sl_mult = sig_row.get("ai_sl_mult")
+    if sl_price is not None and float(sl_price) > 0 and abs(float(sl_price) - entry) > 1e-9:
+        R = abs(entry - float(sl_price))
+    elif atr and float(atr) > 0:
+        mult = float(ai_sl_mult) if ai_sl_mult and float(ai_sl_mult) > 0 else cfg["ai.lm.label_sl_atr_fallback"]
+        R = mult * float(atr)
+    else:
+        return None
+    if R <= 0:
+        return None
+    r_win = cfg["ai.lm.label_r_win"] * R
+    r_loss = cfg["ai.lm.label_r_loss"] * R
+    horizon = int(cfg["ai.lm.label_horizon_bars"])
+    created = sig_row["created_at"]
+    if pd.isna(created) or kl is None or kl.empty:
+        return None
+    idx = kl["open_time"].searchsorted(created, side="left")
+    window = kl.iloc[idx: idx + horizon]
+    if len(window) < horizon:
+        return None
+    _atr = float(atr) if (atr and float(atr) > 0) else None
+    for i in range(1, len(window)):
+        _ph, _pl = float(window.iloc[i-1]["high"]), float(window.iloc[i-1]["low"])
+        _ch, _cl = float(window.iloc[i]["high"]), float(window.iloc[i]["low"])
+        if _atr and _atr > 0:
+            _gap = 2.0 * _atr
+            if _cl - _ph > _gap or _pl - _ch > _gap:
+                return None
+        else:
+            if _cl > _ph * 1.002 or _ch < _pl * 0.998:
+                return None
+    if events:
+        _w0 = window.iloc[0]["open_time"]
+        _w1 = window.iloc[-1]["open_time"]
+        for _ev in events:
+            _s, _e, _imp = _ev
+            if _imp >= 2 and not (_w1 < _s or _w0 > _e):
+                return None
+    is_buy = dir_val == 1
+    for i, (_, bar) in enumerate(window.iterrows()):
+        hi = float(bar["high"]); lo = float(bar["low"])
+        if is_buy:
+            hit_target = hi >= entry + r_win
+            hit_stop = lo <= entry - r_loss
+        else:
+            hit_target = lo <= entry - r_win
+            hit_stop = hi >= entry + r_loss
+        if hit_target and hit_stop:
+            return None
+        if hit_target:
+            return 1
+        if hit_stop:
+            return 0
+    return None
 
 
 # ── 多任务状态标签：数据自动聚类（无人工阈值，B 决策=自动聚类）──
@@ -284,6 +407,9 @@ def main():
     ap.add_argument("--horizon", type=int, default=None, help="覆盖 ai.lm.label_horizon_bars")
     ap.add_argument("--ds-calibrate", action="store_true",
                     help="设计文档 1.3：用 DeepSeek 票为样本加权 ds_calib_weight（不改 label）")
+    ap.add_argument("--sl-source", choices=["real", "atr_fallback"], default=None,
+                    help="【2026-08-28 标签口径统一】R(风险距离)来源：real=仅保留真实 sl_price 的信号"
+                         "（标签与入场质量挂钩）；atr_fallback=统一用 atr×倍数（默认，向后兼容）")
     args = ap.parse_args()
 
     conn = psycopg2.connect(args.db_url)
@@ -314,6 +440,8 @@ def main():
             cfg["ai.lm.label_r_loss"] = args.r_loss
         if args.horizon is not None:
             cfg["ai.lm.label_horizon_bars"] = args.horizon
+        if args.sl_source is not None:
+            cfg["ai.lm.label_sl_source"] = args.sl_source
         print(f"[cfg] {cfg}", file=sys.stderr)
 
         with conn.cursor() as cur:
@@ -368,6 +496,9 @@ def main():
         for i, r in signals.iterrows():
             kl = klines.get(r["symbol"])
             label, reason, R, hit_idx = label_one(r, kl, cfg, events)
+            # 【阶段 0·方向头/买点头标签】独立于 hexp 方向，影子输出不破红线。
+            dir_val = dir_label_one(r, kl, cfg)
+            entry_lbl = entry_label_one(r, kl, cfg, dir_val, events)
             # 设计文档 1.3：DeepSeek 视角样本权重（默认 1.0，仅 --ds-calibrate 时计算）
             # 【2026-08-21 增强】原规则只加权"DS看真+价格赢"(1.5)与"DS看假+价格输"(0.5)，
             # 且 label==0 且 fp<0.4 因 DS 实测 fp≥0.42 永不触发 → DS 高置信但价格输的
@@ -409,6 +540,7 @@ def main():
                 "created_at": r["created_at"].isoformat(), "R": round(R, 6),
                 "label": label, "reason": reason, "hit_bar_idx": hit_idx,
                 "state_label": state_series.iloc[i],
+                "dir_label": dir_val, "entry_label": entry_lbl,
                 "ds_calib_weight": ds_w,
             })
 

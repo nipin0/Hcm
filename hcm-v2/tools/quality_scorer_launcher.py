@@ -92,17 +92,20 @@ def main():
     # 模型/校准路径由 sidecar 自读配置中心（ai.lm.model_path / ai.lm.calib_path）
     cmd = [PY, "quality_scorer.py", "--symbol", "XAUUSD", "--interval", "5"]
 
-    logf = open(LOG, "a")
+    # 【2026-08-27 修复】launcher 不再自己 open 日志文件 —— 此前以追加模式持有
+    # quality_scorer.log 文件句柄，且 sidecar 自身无轮转，长期运行涨到 6.5GB 撑爆磁盘。
+    # 现日志改由 sidecar 内部 RotatingFileHandler 自管（见 quality_scorer.py
+    # _setup_rolling_log：20MB/份，保留 5 份，上限 100MB）。launcher 仅负责拉起，
+    # 子进程 stdout/stderr 定向到 DEVNULL（已落盘滚动日志，无需再经父进程）。
     p = subprocess.Popen(
         cmd,
         cwd=TOOLS,
         env=env,
         creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-        stdout=logf,
-        stderr=subprocess.STDOUT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         close_fds=True,
     )
-    logf.close()  # 释放文件句柄，避免父进程因持有子进程 stdout 而不退出
     print(f"[launcher] sidecar launched pid={p.pid}, log={LOG}")
     print(f"[launcher] cmd={' '.join(cmd)} (model path from config center)")
     sys.exit(0)  # 拉起即退出，单实例由互斥体 + _sidecar_running 保证

@@ -1,9 +1,9 @@
 /** 信号模式与市况判定 — 三种信号模式独立配置面板，带激活状态指示 + 切换确认.
  *
  * Tab 0: 手动模式 — 镜像主账户所有动作
- * Tab 1: 双源信号 — 共源信号增强方案（co_source 引擎）
- * Tab 2: 和乘幂 — 独立信号源（hexp 引擎：HP-Score 广义均值 + k 自适应 + 多周期共振 + M1 微结构动量）
+ * Tab 1: 和乘幂 — 独立信号源（hexp 引擎：HP-Score 广义均值 + k 自适应 + 多周期共振 + M1 微结构动量）
  * （五维 AI 动态判定 ai_dynamic 已于 2026-07-24 弃用）
+ * （双源信号 co_source 已于 2026-08-28 整体下线，原 Tab 1 移除，和乘幂由 2 降为 1）
  */
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
@@ -16,7 +16,6 @@ import { ENDPOINTS } from '../../api/endpoints';
 import { useSymbol } from '../../contexts/SymbolContext';
 import { useAuth } from '../../contexts/AuthContext';
 import SaveGuardDialog, { SaveChange } from '../../components/SaveGuardDialog';
-import CoSourceConfig from '../cosource/CoSourceConfig';
 import HexpConfig from '../hexp/HexpConfig';
 
 interface RegimeInfo {
@@ -28,8 +27,10 @@ interface RegimeInfo {
   indicators: Record<string, number>;
 }
 
-const MODE_LABELS = ['手动模式', '双源信号', '和乘幂'];
-const MODE_ICONS = [Tune, Hub, Psychology];
+// 【2026-08-28 co_source 清除】双源信号模式整体下线，只保留「手动模式 / 和乘幂」。
+// 原 MODE_LABELS = ['手动模式', '双源信号', '和乘幂']（索引 1 = 双源，对应 CoSourceConfig）。
+const MODE_LABELS = ['手动模式', '和乘幂'];
+const MODE_ICONS = [Tune, Psychology];
 
 const Mode: React.FC = () => {
   const { selectedSymbol } = useSymbol();
@@ -55,20 +56,23 @@ const Mode: React.FC = () => {
   // ── 从后端读取当前激活的模式 ──
   const fetchActiveMode = useCallback(async (): Promise<number> => {
     try {
-      const [{ data: cosourceResp }, { data: modeResp }] = await Promise.all([
-        client.get('/api/cosource/config'),
+      const [{ data: engineModeResp }, { data: modeResp }] = await Promise.all([
+        client.get(ENDPOINTS.engineMode.config),
         client.get('/api/signal-tower/mode?symbol=' + (selectedSymbol?.symbol || 'XAUUSD')),
       ]);
-      const cosourceData = cosourceResp.data || cosourceResp;
+      const engineModeData = engineModeResp.data || engineModeResp;
       const modeData = modeResp.data || modeResp;
 
-      const coModel = String(cosourceData['signal.active_model'] || 'default');
+      const coModel = String(engineModeData['signal.active_model'] || 'default');
       const stMode = String(modeData.mode || 'manual');
 
-      if (coModel === 'hexp') return 2;
-      if (coModel === 'co_source') return 1;
+      // 【2026-08-28 co_source 清除】Tab 索引重映射：0=manual, 1=hexp
+      // （原 0=manual, 1=co_source, 2=hexp；双源下线后 hexp 由 2 降为 1）。
       if (stMode === 'manual') return 0;
-      return 0;
+      if (coModel === 'hexp') return 1;
+      // 后端已无 co_source 分支（_detect_active_model 只返 hexp/manual），
+      // 其余一律按 hexp 呈现（索引 1），避免 MODE_LABELS[2] 越界为 undefined。
+      return 1;
     } catch {
       return 0;
     }
@@ -119,17 +123,20 @@ const Mode: React.FC = () => {
   const performSwitch = async (target: number): Promise<void> => {
     setSwitching(true);
     try {
-      // 写 signal_tower.mode（Tab 0 手动 / Tab 1 双源 / Tab 2 和乘幂）
-      // 注：signal_tower.mode 仅区分手动镜像与自动模型路由，和乘幂与双源同属自动路由
-      const stMode = target === 0 ? 'manual' : 'co_source';
+      // 【2026-08-28 co_source 清除】索引重映射：0=manual, 1=hexp（原 1=双源、2=和乘幂）。
+      // 修复：此前 target!==0 一律写 'co_source'，导致用户点「和乘幂」时把
+      // signal.active_model 写成已删除的引擎名 → 后端找不到 co_source 分支。
+      // 写 signal_tower.mode：signal_tower.mode 仅区分手动镜像与自动路由，
+      // 非手动即 'hexp'（和乘幂是唯一自动引擎）。
+      const stMode = target === 0 ? 'manual' : 'hexp';
       await client.put('/api/signal-tower/mode', {
         symbol: selectedSymbol?.symbol || 'XAUUSD',
         mode: stMode,
         manual_regime_score: manualScore,
       });
-      // 写 signal.active_model（Tab 1 双源=co_source / Tab 2 和乘幂=hexp）
-      await client.put('/api/cosource/config', {
-        'signal.active_model': target === 1 ? 'co_source' : target === 2 ? 'hexp' : 'default',
+      // 写 signal.active_model：0=manual → 'default'；1=hexp → 'hexp'。不再出现 co_source。
+      await client.put(ENDPOINTS.engineMode.config, {
+        'signal.active_model': target === 0 ? 'default' : 'hexp',
       });
       // 触发管线：下发激活指令让调度器立即重置并重新检测 active_model，
       // 使引擎 status 的 mode_switched_at 即时更新、按新模式恢复信号生产。
@@ -172,7 +179,8 @@ const Mode: React.FC = () => {
     try {
       await client.put('/api/signal-tower/mode', {
         symbol: selectedSymbol.symbol,
-        mode: activeMode === 0 ? 'manual' : 'co_source',
+        // 【2026-08-28 co_source 清除】双源下线，非 manual 即 hexp
+        mode: activeMode === 0 ? 'manual' : 'hexp',
         manual_regime_score: manualScore,
       });
       setMessage({ type: 'success', text: '手动模式配置已保存' });
@@ -245,9 +253,10 @@ const Mode: React.FC = () => {
           size="small"
           sx={{
             ml: 'auto',
-            backgroundColor: activeMode === 0 ? '#8b5cf622' : activeMode === 2 ? '#a855f722' : '#22c55e22',
-            color: activeMode === 0 ? '#c4b5fd' : activeMode === 2 ? '#c084fc' : '#86efac',
-            border: `1px solid ${activeMode === 0 ? '#8b5cf644' : activeMode === 2 ? '#a855f744' : '#22c55e44'}`,
+            // 【2026-08-28 索引重映射】0=manual, 1=hexp（原 2=hexp 已降为 1）
+            backgroundColor: activeMode === 0 ? '#8b5cf622' : '#a855f722',
+            color: activeMode === 0 ? '#c4b5fd' : '#c084fc',
+            border: `1px solid ${activeMode === 0 ? '#8b5cf644' : '#a855f744'}`,
             fontWeight: 600,
           }}
         />
@@ -349,25 +358,24 @@ const Mode: React.FC = () => {
         </Box>
       )}
 
-      {/* ═══ Tab 1: 双源信号（模型专属变量参数；公用阈值在「评分阈值」独立页）═══ */}
-      {tabValue === 1 && (
-        <Box>
-          <CoSourceConfig />
-        </Box>
-      )}
+      {/* 【2026-08-28 co_source 清除】原「Tab 1: 双源信号（CoSourceConfig）」整块删除；
+          双源模式已下线，Tab 只剩 0=手动模式 / 1=和乘幂。 */}
 
-      {/* ═══ Tab 2: 和乘幂（独立信号源；HP-Score + k 自适应 + 多周期共振 + 微结构动量）═══ */}
-      {tabValue === 2 && (
+      {/* ═══ Tab 1: 和乘幂（独立信号源；HP-Score + k 自适应 + 多周期共振 + 微结构动量）═══
+          【2026-08-28 索引重映射】原 tabValue === 2，双源 Tab 移除后和乘幂由索引 2 降为 1；
+          漏改会导致「和乘幂参数配置」页永不渲染（Tab 只有 0/1 两个）。 */}
+      {tabValue === 1 && (
         <Box>
           <Box className="card mb-4 flex items-center gap-3">
             <Chip
-              label={activeMode === 2 ? '和乘幂已激活' : '和乘幂未激活（切换即激活）'}
+              // 【2026-08-28 索引重映射】hexp 由 2 → 1
+              label={activeMode === 1 ? '和乘幂已激活' : '和乘幂未激活（切换即激活）'}
               size="medium"
               sx={{
-                backgroundColor: activeMode === 2 ? '#a855f722' : '#64748b22',
-                color: activeMode === 2 ? '#c084fc' : '#94a3b8',
+                backgroundColor: activeMode === 1 ? '#a855f722' : '#64748b22',
+                color: activeMode === 1 ? '#c084fc' : '#94a3b8',
                 fontWeight: 600,
-                border: `1px solid ${activeMode === 2 ? '#a855f744' : '#64748b44'}`,
+                border: `1px solid ${activeMode === 1 ? '#a855f744' : '#64748b44'}`,
               }}
             />
             <Typography variant="body2" className="text-gray-400">
