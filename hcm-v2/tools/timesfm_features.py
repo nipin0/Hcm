@@ -150,8 +150,17 @@ def infer_window(model, window: np.ndarray, horizon: int):
     q = np.asarray(quant)[0]      # (horizon, 9)
 
     # 取 output_embeddings（transformer 末层隐状态）→ 池化为 1280 维向量
+    # 【关键】forecast() 内部会做 patch 分块，但直接调 forward() 会绕过分块。
+    # tokenizer 期待 (batch, n_patches, patch_length=32)，与 mask 沿最后一维拼接成
+    # 64 维后再投影到 hidden_size；若直接传 (1, len(window)) 会被当作 len(window) 个
+    # 独立特征 → RuntimeError: mat1 and mat2 shapes cannot be multiplied。
+    # 故此处必须自行分块，并截断到 patch_length 的整数倍。
     m = model.model
-    x = torch.from_numpy(window.astype(np.float32)).reshape(1, -1)
+    n_patch = len(window) // PATCH_LEN
+    usable = n_patch * PATCH_LEN
+    if n_patch <= 0:
+        raise ValueError(f"窗口长度 {len(window)} 不足一个 patch({PATCH_LEN})")
+    x = torch.from_numpy(window[-usable:].astype(np.float32)).reshape(1, n_patch, PATCH_LEN)
     mask = torch.ones_like(x)
     with torch.no_grad():
         (_, output_emb, _, _), _ = m.forward(x, mask)

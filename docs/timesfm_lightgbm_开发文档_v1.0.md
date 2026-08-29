@@ -595,8 +595,8 @@ baseline_auc / with_tmf_auc / lift = (with_tmf_auc - baseline_auc) / baseline_au
 | 2 | **Windows 必须关 torch_compile** | 类默认 `torch_compile=True` 会触发 `torch.compile`；权重 `config.json` 亦为 `"torch_compile": false` | `from_pretrained(..., torch_compile=False)` |
 | 3 | **Xet 后端导致静默挂起** | `cas-server.xethub.hf.co` **超时不可达**；表现为进程 CPU=0、缓存恒 0 字节、**无任何报错** | 必须 `HF_HUB_DISABLE_XET=1`，回退 classic HTTP |
 | 4 | **hf-mirror.com 对本仓库不可用** | `.../model.safetensors` → **308 Permanent Redirect** | 不可用（原"镜像作备用"**对本仓库无效**，已修正） |
-| 5 | **HF 官方源限速且为全局上限** | 单连接 132 KB/s；**12 线程并行聚合仅 114 KB/s**（并行无效）；882MB 约需 **2.1 小时** | 接受后台长传；或用 .NET `WebClient` 下到本地目录后 `--model-dir` 离线加载 |
-| 6 | **ModelScope 大文件不可用** | `resolve/master/model.safetensors` → **403 禁止**（config.json 475B 可下，大文件需 SDK 鉴权）。文件本体与 HF 一致（925,181,104 B） | 不可用 |
+| 5 | **HF 官方源限速且为全局上限**；**ModelScope 快 32 倍** | HF 单连接 125–132 KB/s、**12 线程并行聚合仅 114 KB/s**（并行无效，882MB 约 2 小时）；**ModelScope 实测 4067–7214 KB/s，882MB 仅 2.5 分钟** ✅ | **权重从 ModelScope 下载**（须带 `User-Agent`，否则 CDN 403），落本地目录后用 `--model-dir` 离线加载 |
+| 6 | **ModelScope 的 403 是缺 User-Agent 所致** | `WebClient` 请求 → 403；**Python urllib 带 UA → 206 正常**（同一 URL）。文件与 HF 完全一致（925,181,104 B） | **可用且最快**，必须设置 `User-Agent` 请求头 |
 | 7 | **PyPI 官方源极慢/挂死** | `files.pythonhosted.org` 下 122MB 恒 0 字节；`download.pytorch.org` 挂死 14min 仅 58MB | **改用清华镜像** `https://pypi.tuna.tsinghua.edu.cn/simple`（实测 **19.6 MB/s**，122MB 仅 6 秒） |
 | 8 | **TimesFM 2.5 是单变量模型** | API `forecast(horizon, inputs=[1D 序列])`，无多通道入参 | 《规范》§2.1"输入字段 OHLCV"应理解为**数据取自 OHLCV K 线、实际建模序列用 close**；多变量需另用 `forecast_with_covariates`（非本次范围） |
 
@@ -615,12 +615,36 @@ model.compile(ForecastConfig(max_context=512, max_horizon=128,
 point, quant = model.forecast(horizon=12, inputs=[close_1d])   # (12,) / (12, 9)
 
 # ② Embedding（供 PCA）：forward() 返回四元组
+# 【关键坑·实测】forecast() 内部会自动做 patch 分块，但**直接调 forward() 不会分块**，
+# 必须自行把序列切成 (batch, n_patches, patch_length=32)；否则 tokenizer 收到
+# (1, 512) 会被当作 512 个独立特征，报
+#   RuntimeError: mat1 and mat2 shapes cannot be multiplied (1x1024 and 64x1280)
+n_patch = len(window) // 32
+x = torch.from_numpy(window[:n_patch * 32].astype(np.float32)).reshape(1, n_patch, 32)
+mask = torch.ones_like(x)
 (in_emb, out_emb, out_ts, out_q), caches = model.model.forward(x, mask)
-# out_emb: (batch, n_patches, 1280) → 沿 patch 维均值池化 → 1280 维向量
+# out_emb: (1, 16, 1280) → 沿 patch 维均值池化 → 1280 维向量（实测 dim=1280 ✅）
 ```
 
 - `max_context` 须为 `patch_length=32` 整数倍（256/512 合规）；`max_horizon` 须为 `horizon_length=128` 整数倍（取 128 后再截取前 12 步）。
-- 权重 `config.json`：`hidden_size=1280`、`context_length=16384`、`horizon_length=128`、9 个分位数(0.1–0.9)。
+- 权重 `config.json`：`hidden_size=1280`、`context_length=16384`、`horizon_length=128`、声明 9 个分位数(0.1–0.9)，但 **`forecast()` 实际输出 10 个槽位**（`(horizon, 10)`），以实测形状为准。
+
+#### 16.2.3 M0 冒烟测试结果（2026-08-29 通过）
+
+| 验证项 | 结果 |
+|---|---|
+| 本地离线加载权重（`--model-dir`） | ✅ 2.1s |
+| `compile(ForecastConfig(max_context=512, max_horizon=128))` | ✅ |
+| `forecast(horizon=12)` | ✅ 0.16s，`point=(1,12)`、`quant=(1,12,10)` |
+| `forward()` 取 `output_embeddings` | ✅ `(1, 16, 1280)`（修复分块 bug 后） |
+| 池化 embedding 维度 | ✅ 1280 == `config.hidden_size` |
+| **M0 结论** | **ALL OK —— 环境与 API 准入通过** |
+
+同期完成两项前置验证：
+- **5 类特征数学单测 18 项全通过**（单调上行 `trend_cont=+0.682`、冲高回落 `rev_prob=0.5`、
+  全周期同向 `mtf_resonance=0.9999`、相同向量 `hist_sim=1.0` 等）。
+- **生产代码端到端通过**：`tools/timesfm_features.py` 的 `infer_window()` 在真实权重上
+  返回 `point=(12,)`、`quant=(12,10)`、`pooled=(1280,)`，5 类特征取值均在合法区间。
 
 ### 16.3 P0-2 HP 因子 —— 事项撤销（审计更正）
 
