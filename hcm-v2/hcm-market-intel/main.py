@@ -327,6 +327,32 @@ async def _event_loop() -> None:
         await asyncio.sleep(interval)
 
 
+_liquidity_table_ensured = False
+
+
+async def _persist_liquidity(score: float) -> None:
+    """【流动性特征 2026-08-30】把流动性分值(0~1)落库 liquidity_snapshots(metals 类别)，
+    与 macro/sentiment 快照同构，供训练侧 load_env / 推理侧 _env_features 同表同源读取。
+    表确保一次(CREATE TABLE IF NOT EXISTS)，写入失败不致命（与 macro_collector 同纪律）。"""
+    global _liquidity_table_ensured
+    if db_pool is None or not getattr(db_pool, "is_initialized", False):
+        return
+    try:
+        if not _liquidity_table_ensured:
+            await db_pool.fetchrow(
+                "CREATE TABLE IF NOT EXISTS hcm_market.liquidity_snapshots ("
+                "id SERIAL PRIMARY KEY, category TEXT, liquidity_score REAL, snapshot_time TIMESTAMPTZ)"
+            )
+            _liquidity_table_ensured = True
+        await db_pool.fetchrow(
+            "INSERT INTO hcm_market.liquidity_snapshots "
+            "(category, liquidity_score, snapshot_time) VALUES ($1, $2, $3)",
+            "metals", float(score), datetime.now(timezone.utc),
+        )
+    except Exception as exc:
+        log.warning("Liquidity snapshot PG write failed: %s", exc)
+
+
 async def _liquidity_loop() -> None:
     """Liquidity analyzer: real-time from bridge Redis, 60s refresh."""
     log.info("Liquidity loop started (default 60s)")
@@ -357,6 +383,7 @@ async def _liquidity_loop() -> None:
                 else:
                     score = float(raw)
             await _write_score_to_redis("liquidity", score)
+            await _persist_liquidity(score)   # 【流动性特征 2026-08-30】落库供训练/推理同源读取
         except Exception as exc:
             log.warning("Liquidity analysis failed: %s", exc)
         interval = await _get_interval_seconds("market_liquidity_interval_s", 60)

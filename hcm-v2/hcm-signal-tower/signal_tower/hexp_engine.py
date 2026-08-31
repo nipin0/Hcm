@@ -1719,6 +1719,7 @@ class HexpEngine:
                 passed = False
                 sr.threshold_passed = False
                 sr.direction = "NO_TRADE"
+                sr.momentum_drain_blocked = True
                 if not sr.fallback_reason:
                     sr.fallback_reason = _drain_block
         # A-3) 动量方向否决（2026-08-21）：动量明确反向时，无论位置/趋势结构如何都拦逆动量单。
@@ -1796,6 +1797,7 @@ class HexpEngine:
                 passed = False
                 sr.threshold_passed = False
                 sr.direction = "NO_TRADE"
+                sr.momentum_flip_blocked = True
                 if not sr.fallback_reason:
                     sr.fallback_reason = _flip_block
                 # ── 反向单（2026-08-26 由"纯观测"升级为"经风控后下单"）──
@@ -1914,6 +1916,7 @@ class HexpEngine:
                 passed = False
                 sr.threshold_passed = False
                 sr.direction = "NO_TRADE"
+                sr.range_hurst_blocked = True
                 if not sr.fallback_reason:
                     sr.fallback_reason = _rh_block
         # B) 回踩支撑位诊断（独立于 A 的封单判定，仅作再评估标记/日志）
@@ -2068,33 +2071,51 @@ class HexpEngine:
         # 开关 hexp.trend_start_observe_enabled（默认 True）；阈值可热调。
         _trend_start = None
         _ts_observe = bool(cfg.get("hexp.trend_start_observe_enabled", True))
-        # 放宽触发（2026-08-27 上线）：相位 ignite→ignite+establish（趋势启动到早期确立，
-        # 仍靠 pos 中低位避开高位）；pos 阈值 0.7/0.3→0.8/0.2；mm 容忍微负(默认-0.05)。
-        _ts_phases = [p.strip().lower() for p in
-                      str(cfg.get("hexp.trend_start_phases", "ignite,establish")).split(",") if p.strip()]
-        _ts_mm_min = float(cfg.get("hexp.trend_start_mm_min", -0.05))
-        _ts_hi = float(cfg.get("hexp.trend_start_pos_high", 0.8))
-        _ts_lo = float(cfg.get("hexp.trend_start_pos_low", 0.2))
-        if _ts_observe and _phase in _ts_phases and direction in ("BUY", "SELL"):
-            _ts_mm_ok = (direction == "BUY" and f_mm > _ts_mm_min) or \
-                        (direction == "SELL" and f_mm < -_ts_mm_min)
-            _ts_pos_ok = (direction == "BUY" and _pos_pct < _ts_hi) or \
-                         (direction == "SELL" and _pos_pct > _ts_lo)
-            if _ts_mm_ok and _ts_pos_ok:
-                _trend_start = {
-                    "dir": direction, "phase": _phase,
-                    "squeeze": round(_squeeze, 2), "ignite": round(_ignite, 2),
-                    "pos": round(_pos_pct, 4), "mm": round(f_mm, 4),
-                    "er": round(float(pf.get("_er_raw", 0.0)), 4),
-                    "adx": round(float(pf.get("_adx_raw", 0.0)), 2),
-                    "close": round(close_v, 3), "atr": round(atr, 4),
-                    "verdict": round(verdict, 4), "grade": grade,
-                }
+        # 【2026-08-31 重构】判定模式开关：
+        #   squeeze_breakout = 新判定（默认，回测胜率 62~67%，单均净 +0.24~+0.37R）
+        #   phase_ignite     = 旧判定（热回退；实测胜率仅 4%、单均 -0.804R，勿长期启用）
+        _ts_mode = str(cfg.get("hexp.trend_start_mode", "squeeze_breakout")).strip().lower()
+        if _ts_observe and _ts_mode == "squeeze_breakout":
+            _trend_start = self._trend_start_squeeze_breakout(
+                period_data=period_data, primary=primary, pf=pf, cfg=cfg,
+                atr=atr, close_v=close_v, grade=grade, verdict=verdict)
+            if _trend_start is not None:
                 logger.info(
-                    "hexp %s %s | TREND START CANDIDATE dir=%s phase=%s squeeze=%.1f "
-                    "ignite=%.1f pos=%.2f mm=%.3f er=%.3f — OBSERVE ONLY, no order",
-                    symbol, primary, direction, _phase, _squeeze, _ignite,
-                    _pos_pct, f_mm, float(pf.get("_er_raw", 0.0)))
+                    "hexp %s %s | TREND START CANDIDATE(squeeze_breakout) dir=%s bbw=%.1f<%.1f "
+                    "don_hi=%.3f don_lo=%.3f h1_up=%s close=%.3f atr=%.4f "
+                    "— OBSERVE ONLY, no order",
+                    symbol, primary, _trend_start["dir"], _trend_start["bbw"],
+                    _trend_start["bbw_max"], _trend_start["don_hi"],
+                    _trend_start["don_lo"], _trend_start["h1_up"], close_v, atr)
+        elif _ts_observe:
+            # 旧判定（hexp.trend_start_mode=phase_ignite 时热回退）
+            # 放宽触发（2026-08-27 上线）：相位 ignite→ignite+establish（趋势启动到早期确立，
+            # 仍靠 pos 中低位避开高位）；pos 阈值 0.7/0.3→0.8/0.2；mm 容忍微负(默认-0.05)。
+            _ts_phases = [p.strip().lower() for p in
+                          str(cfg.get("hexp.trend_start_phases", "ignite,establish")).split(",") if p.strip()]
+            _ts_mm_min = float(cfg.get("hexp.trend_start_mm_min", -0.05))
+            _ts_hi = float(cfg.get("hexp.trend_start_pos_high", 0.8))
+            _ts_lo = float(cfg.get("hexp.trend_start_pos_low", 0.2))
+            if _phase in _ts_phases and direction in ("BUY", "SELL"):
+                _ts_mm_ok = (direction == "BUY" and f_mm > _ts_mm_min) or \
+                            (direction == "SELL" and f_mm < -_ts_mm_min)
+                _ts_pos_ok = (direction == "BUY" and _pos_pct < _ts_hi) or \
+                             (direction == "SELL" and _pos_pct > _ts_lo)
+                if _ts_mm_ok and _ts_pos_ok:
+                    _trend_start = {
+                        "dir": direction, "mode": "phase_ignite", "phase": _phase,
+                        "squeeze": round(_squeeze, 2), "ignite": round(_ignite, 2),
+                        "pos": round(_pos_pct, 4), "mm": round(f_mm, 4),
+                        "er": round(float(pf.get("_er_raw", 0.0)), 4),
+                        "adx": round(float(pf.get("_adx_raw", 0.0)), 2),
+                        "close": round(close_v, 3), "atr": round(atr, 4),
+                        "verdict": round(verdict, 4), "grade": grade,
+                    }
+                    logger.info(
+                        "hexp %s %s | TREND START CANDIDATE dir=%s phase=%s squeeze=%.1f "
+                        "ignite=%.1f pos=%.2f mm=%.3f er=%.3f — OBSERVE ONLY, no order",
+                        symbol, primary, direction, _phase, _squeeze, _ignite,
+                        _pos_pct, f_mm, float(pf.get("_er_raw", 0.0)))
         sr.trend_start_candidate = _trend_start
         # ── 趋势启动顺势下单（2026-08-26 由"纯观测"升级为可配置下单）──
         # 目标：趋势启动初期（ignite 点火 + 微动量同向 + 位置中低位）即轻仓顺势进场，
@@ -2104,27 +2125,83 @@ class HexpEngine:
         # 时才覆写放行；不绕过极值/momentum_flip/range_hurst 等安全护栏——三条件的
         # pos 中低位 + mm 同向天然避开这些护栏。开关 hexp.trend_start_order_enabled
         # （默认 True=2026-08-27 上线；metadata 设 false 可热回退纯观测）。
-        _ts_order_enabled = bool(cfg.get("hexp.trend_start_order_enabled", True))
-        if _ts_order_enabled and _trend_start is not None and not passed:
+        # 【2026-08-31 安全收紧·双层保险】
+        #   ① 默认值 True→False：旧判定实测胜率仅 4%、单均 -0.804R，却在生产上真
+        #      下单（绕过 grade 闸门），先止血；新配置部署时缺省也保持纯观测。
+        #   ② 新判定(squeeze_breakout)处于"真实信号影子验证"阶段，代码层明确禁止
+        #      真下单——其下单能力须待 hexp_shadow_eval 累积达标后另行评估开放。
+        _ts_order_enabled = bool(cfg.get("hexp.trend_start_order_enabled", False))
+        # 新判定(squeeze_breakout)默认不下单（真实信号影子验证期）。验证达标后无需改
+        # 代码：配置 hexp.trend_start.new_mode_order_allowed=true 配合 order_enabled
+        # 即可开放。这样"切入生产"是一次纯配置变更，可秒级回退。
+        _ts_new_allowed = bool(cfg.get("hexp.trend_start.new_mode_order_allowed", False))
+        _ts_order_blocked = (_ts_mode == "squeeze_breakout") and not _ts_new_allowed
+        # 【2026-08-31 安全护栏显式豁免】本覆写位于全部五道护栏(1602~1917)之后，
+        # 会无条件把 direction="NO_TRADE"/passed=False 覆写为放行。原设计依赖旧判定
+        # "mm 同向 + pos 中低位"天然避开护栏（2123 行注释），但新判定 squeeze_breakout
+        # 不看 mm/pos，该假设不成立 → 护栏会被静默绕过。现改为显式检查：
+        # 凡被任一道安全护栏拦过的信号，一律不放行；只放行"因 grade 未达 min_grade
+        # 被闸门拦成 NO_TRADE"的信号（这才是本功能的初衷）。
+        # 【2026-08-31 修正】cycle_pos_blocked 不纳入趋势启动豁免 —— 量化回测
+        # (ts_conflict.py) 显示 cycle_pos_guard 会拦掉 45% 的趋势启动信号，但被拦
+        # 信号胜率(62.9%)与保留信号(61.5%)几乎相同，即该护栏对"已有 H1 共振+压缩
+        # 突破"强确认的趋势启动单是误伤、不产生质量增益。保留其余护栏
+        # (grade/momentum/reversal/hurst)作为真正的风险屏障。
+        _ts_guard_blocked = bool(
+            getattr(sr, "extreme_reversal_blocked", False)
+            or getattr(sr, "momentum_drain_blocked", False)
+            or getattr(sr, "momentum_flip_blocked", False)
+            or getattr(sr, "range_hurst_blocked", False)
+        )
+        if _ts_guard_blocked and _ts_order_enabled and not _ts_order_blocked \
+                and _trend_start is not None:
+            logger.info(
+                "hexp %s %s | TREND START ORDER SUPPRESSED dir=%s (安全护栏已拦截，"
+                "趋势启动覆写不放行) grade=%s", symbol, primary,
+                _trend_start.get("dir"), grade)
+        if (_ts_order_enabled and not _ts_order_blocked and not _ts_guard_blocked
+                and _trend_start is not None and not passed):
             _ts_dir = _trend_start["dir"]
             _ts_min_grade = str(cfg.get("hexp.trend_start_min_grade", "B")).strip().upper()
             _ts_min_rank = _GRADE_RANK.get(_ts_min_grade, 1)
             _ts_grade_rank = _GRADE_RANK.get(grade, 0)
             if _ts_dir in ("BUY", "SELL") and _ts_grade_rank >= _ts_min_rank and grade != "RED":
-                _ts_lot_mult = float(cfg.get("hexp.trend_start_order_lot_mult", 0.3))
+                # 手数：链动风控动态手数，禁用硬编码固定折减。
+                # 实际倍率由风控 risk.lot_multiplier_{low,mid,high} 按 lot_tier 决定
+                # （scheduler 会用 trend_start_lot_tier 覆盖 ai_lot_tier）；
+                # lot_mult 默认 1.0 = 完全不干预，仅在确需微调时才配置。
+                _ts_lot_mult = float(cfg.get("hexp.trend_start_order_lot_mult", 1.0))
+                sr.trend_start_lot_tier = str(
+                    cfg.get("hexp.trend_start.lot_tier", "low")).strip().lower()
+                # 【2026-08-31 SL/TP 口径修正】此前的覆写只改手数，SL/TP 沿用
+                # hexp.exec.sl_atr_mult=2.0 / rr_min=1.5。但回测最优为 SL=3.5/RR=1.5，
+                # 且回测中 SL=2.0 在样本外明确亏损(-1.9~-2.9R)、SL=3.5 盈利(+8.1R)。
+                # 不修正则真下单落在回测已知亏损的参数上，回测结论直接失效。
+                # 新判定候选自带 sl_atr_mult/rr；旧判定无此字段时回退 hexp.exec 口径。
+                _ts_sl_mult = _trend_start.get("sl_atr_mult")
+                _ts_rr = _trend_start.get("rr")
+                if _ts_sl_mult is None or _ts_rr is None:
+                    _ts_sl_mult = float(cfg["hexp.exec.sl_atr_mult"])
+                    _ts_rr = float(cfg["hexp.exec.rr_min"])
                 sr.direction = _ts_dir
                 sr.threshold_passed = True
                 sr.pre_score = round(total / 100.0, 4)
                 sr.co_exec_lot_mult = round(float(sr.co_exec_lot_mult) * _ts_lot_mult, 4)
+                sr.co_exec_sl_atr_mult = round(float(_ts_sl_mult), 4)
+                sr.co_exec_rr_min = round(float(_ts_rr), 4)
+                # 锁定 SL：避免被 scheduler 的会话 SL 覆盖改写（欧美盘会话值 2.0
+                # 会把 3.5 打回 2.0，而该参数在回测中样本外明确亏损）。
+                sr.trend_start_sl_locked = True
                 if not sr.fallback_reason:
                     sr.fallback_reason = (
-                        f"hexp_trend_start_order({_ts_dir},ignite,pos={_pos_pct:.2f},"
-                        f"mm={f_mm:.3f},grade={grade})"
+                        f"hexp_trend_start_order({_ts_dir},{_ts_mode},pos={_pos_pct:.2f},"
+                        f"mm={f_mm:.3f},grade={grade},sl={_ts_sl_mult},rr={_ts_rr})"
                     )
                 logger.info(
-                    "hexp %s %s | TREND START ORDER %s pos=%.2f mm=%.3f grade=%s lot×%.2f "
-                    "(ignite 启动顺势轻仓：绕过 grade 闸门、不绕过安全护栏)",
-                    symbol, primary, _ts_dir, _pos_pct, f_mm, grade, _ts_lot_mult)
+                    "hexp %s %s | TREND START ORDER %s mode=%s grade=%s lot×%.2f sl=%.2f rr=%.2f "
+                    "(绕过 grade 闸门，已显式豁免全部安全护栏)",
+                    symbol, primary, _ts_dir, _ts_mode, grade, _ts_lot_mult,
+                    float(_ts_sl_mult), float(_ts_rr))
         sr.used_periods = list(periods)
         sr.primary_period = primary
         sr.transition = transition
@@ -2323,6 +2400,108 @@ class HexpEngine:
         if 30.0 <= pct <= 70.0:
             return 100.0
         return max(0.0, 100.0 - abs(pct - 50.0) * 2.0)
+
+    # ─────────────── 趋势启动候选·新判定（2026-08-31 重构）───────────────
+    @staticmethod
+    def _ema(arr: np.ndarray, span: int) -> np.ndarray:
+        """EMA（adjust=False，与 pandas ewm(span=span, adjust=False).mean() 等价）。
+
+        递推：y[0]=x[0]；y[t]=α·x[t]+(1-α)·y[t-1]，α=2/(span+1)。
+        引擎不依赖 pandas，故本地实现（回测侧用 pandas 同口径验证一致）。
+        """
+        x = np.asarray(arr, dtype=float)
+        if x.size == 0 or span < 1:
+            return x
+        alpha = 2.0 / (span + 1.0)
+        out = np.empty(x.size, dtype=float)
+        out[0] = x[0]
+        for i in range(1, x.size):
+            out[i] = alpha * x[i] + (1.0 - alpha) * out[i - 1]
+        return out
+
+    def _trend_start_squeeze_breakout(
+        self,
+        period_data: dict[str, dict[str, Any]],
+        primary: str,
+        pf: dict[str, float],
+        cfg: dict[str, Any],
+        atr: float,
+        close_v: float,
+        grade: str,
+        verdict: float,
+    ) -> dict[str, Any] | None:
+        """趋势启动候选·新判定：波动率压缩 → Donchian 突破 + H1 多周期共振。
+
+        回测依据（XAUUSD M5，2026-06-16~08-31，16918 根；成本 0.045R/次已扣）：
+            样本内 64 次  胜率 61.8%  净 +15.6R（单均 +0.244R）
+            样本外 29 次  胜率 66.7%  净 +10.7R（单均 +0.369R）
+        参数稳健性：40 组 SL×HOLD×RR 中 30 组样本内外净 R 同正，HOLD 90/150 结果
+        相同，属平原而非孤峰。旧判定(phase=ignite+mm+pos)实测胜率 4%、单均
+        -0.804R（28 样本），根因是相位由滞后组(adx/er/ma≈50%权重)驱动，确认时
+        趋势已走完；本判定改用"状态跃变"事件，不依赖滞后评分。
+
+        三条件（缺一不可）：
+          ① 压缩：bbw 带宽处近 120 根最低 bbw_max% 分位（pf["_bbw_pct"]）
+          ② 突破：收盘突破 Donchian(don_look) 上下轨；切片 [-(n+1):-1] 天然
+             排除当前未收棒，与回测 shift(1) 口径一致，无前视
+          ③ 共振：最近【已完成】H1 棒收盘 > H1 EMA(h1_ema) 只做多，< 只做空；
+             用倒数第二根避开当前未收 H1 棒漂移，与回测 shift(1) 对齐
+
+        返回候选中携带 sl_atr_mult/rr/hold_bars，供 scheduler._reconcile_hexp_shadow
+        按回测口径评估（勿与 hexp.exec.sl_atr_mult=2.0 混用，两者口径不同）。
+        """
+        if atr <= 0 or close_v <= 0:
+            return None
+        pdata = period_data.get(primary)
+        if not pdata:
+            return None
+        _bbw_max = float(cfg.get("hexp.trend_start.bbw_max", 20.0))
+        _don = int(cfg.get("hexp.trend_start.don_look", 10))
+        _h1_ema = int(cfg.get("hexp.trend_start.h1_ema", 50))
+        _sl_mult = float(cfg.get("hexp.trend_start.sl_atr_mult", 3.5))
+        _rr = float(cfg.get("hexp.trend_start.rr", 1.5))
+        _hold = int(cfg.get("hexp.trend_start.hold_bars", 90))
+
+        # ① 压缩（先判：绝大多数 bar 在此被淘汰，开销最低）
+        _bbw = float(pf.get("_bbw_pct", 100.0))
+        if not np.isfinite(_bbw) or _bbw >= _bbw_max:
+            return None
+
+        # ② 突破
+        highs, lows = pdata.get("highs"), pdata.get("lows")
+        if highs is None or lows is None or len(highs) < _don + 2:
+            return None
+        don_hi = float(np.max(highs[-(_don + 1):-1]))
+        don_lo = float(np.min(lows[-(_don + 1):-1]))
+        if close_v > don_hi:
+            _dir = "BUY"
+        elif close_v < don_lo:
+            _dir = "SELL"
+        else:
+            return None
+
+        # ③ H1 多周期共振
+        _h1 = period_data.get("H1")
+        if not _h1:
+            return None
+        _h1c = _h1.get("closes")
+        if _h1c is None or len(_h1c) < _h1_ema + 2:
+            return None
+        _h1_ema_arr = self._ema(np.asarray(_h1c, dtype=float), _h1_ema)
+        _h1_up = float(_h1c[-2]) > float(_h1_ema_arr[-2])
+        if (_dir == "BUY" and not _h1_up) or (_dir == "SELL" and _h1_up):
+            return None
+
+        return {
+            "dir": _dir, "mode": "squeeze_breakout",
+            "bbw": round(_bbw, 2), "bbw_max": round(_bbw_max, 2),
+            "don_hi": round(don_hi, 3), "don_lo": round(don_lo, 3),
+            "h1_up": bool(_h1_up),
+            "close": round(close_v, 3), "atr": round(atr, 4),
+            # 影子评估参数（回测最优值），勿与 hexp.exec.* 口径混用
+            "sl_atr_mult": _sl_mult, "rr": _rr, "hold_bars": _hold,
+            "verdict": round(verdict, 4), "grade": grade,
+        }
 
     @staticmethod
     def _session_score() -> float:

@@ -239,6 +239,44 @@ if !AI_OK!==1 (
 )
 :ai_done
 
+REM ===== 启动 TimesFM 每日 T+1 增量抽取调度器（离线特征，B 方案架构层）=====
+REM 调度器每日 21:30 UTC 增量抽取并落库 hcm_ai.timesfm_features（G0 影子，不进决策）；
+REM 停了则样本停止积累，13 天后 §7.2 重测无数据。
+REM 自启机制：HCM_TimesFMDailyGuard 计划任务（register_timesfm_daily_guard.ps1 注册）每 10 分钟 +
+REM 登录时调用 timesfm_daily_boot.ps1 做 OS 层守护（进程缺失自动重拉 + 脚本/产物完整性自愈）。
+REM 本段仅作为 start.bat 手动运行时的显式启动入口，与计划任务互补；launcher 自带单实例
+REM 互斥 + 运行中探测，重复调用安全幂等（不会因 start.bat 并发产生多个调度器）。
+echo.
+echo [5.6/6] 启动 TimesFM 每日 T+1 增量抽取调度器（timesfm_daily_scheduler.py）...
+set "TF_DIR=%BRIDGE_DIR%"
+set "TF_PY=D:\.venv_timesfm\Scripts\python.exe"
+set "TF_SCHED=%TF_DIR%\timesfm_daily_scheduler.py"
+set "TF_LAUNCHER=%TF_DIR%\timesfm_daily_launcher.py"
+set "ST_TF=OK" & set "DS_TF=运行中"
+REM 启动前先跑 OS 层守护脚本做预检自愈（脚本/PCA/检索库缺失自动从 _baseline 还原）
+powershell -NoProfile -ExecutionPolicy Bypass -File "%TF_DIR%\timesfm_daily_boot.ps1" -Snapshot >nul 2>&1
+if not exist "%TF_SCHED%" (
+    set "ST_TF=FAIL" & set "DS_TF=timesfm_daily_scheduler.py 不存在"
+    goto tf_done
+)
+if not exist "%TF_LAUNCHER%" (
+    set "ST_TF=FAIL" & set "DS_TF=timesfm_daily_launcher.py 不存在"
+    goto tf_done
+)
+REM 经 launcher 拉起（与桥保活同模式）：launcher 自带单实例互斥 + 运行中探测
+"%TF_PY%" -c "import subprocess; subprocess.Popen([r'%TF_PY%', r'%TF_LAUNCHER%'], creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP, stdout=open(r'%TF_DIR%\_logs\timesfm_daily_launcher.log','a'), stderr=subprocess.STDOUT)" >nul 2>&1
+timeout /t 4 /nobreak >nul
+REM 轮询 Redis 心跳确认调度器已上线（最多 10s）
+set "TF_OK=0"
+for /L %%T in (1,1,5) do (
+    docker exec hcm-v2-redis-1 redis-cli GET "hcm:ai:timesfm:daily" >nul 2>&1
+    if not errorlevel 1 (set "TF_OK=1" & goto tf_check_ok)
+    timeout /t 2 /nobreak >nul
+)
+:tf_check_ok
+if !TF_OK!==1 (set "ST_TF=OK" & set "DS_TF=已启动，待首次心跳") else (set "ST_TF=FAIL" & set "DS_TF=无心跳，查 tools\_logs\timesfm_daily.log")
+:tf_done
+
 REM ===== 启动桥保活 launcher（看门狗+双桥，数据驱动零硬编码，双层自愈）=====
 REM 架构：start.bat 拉 launcher → launcher 拉 watchdog → watchdog 拉 mt5_bridge 按终端自动判定主/跟单
 echo.
@@ -303,6 +341,7 @@ if defined BR_PIDS (call :LINE "OK" "mt5_bridge.py" "PID!BR_PIDS!") else (call :
 call :LINE "!ST_MT5!"    "MT5 终端"        "!DS_MT5!"
 call :LINE "!ST_LAUNCH!" "桥保活 launcher" "!DS_LAUNCH!"
 call :LINE "!ST_AI!"      "AI 评分 sidecar" "!DS_AI!"
+call :LINE "!ST_TF!"       "TimesFM 调度器"   "!DS_TF!"
 echo.
 
 REM --- [2] Docker 容器（后端服务）---

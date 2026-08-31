@@ -221,6 +221,26 @@ class ScoreResult:
     # 2026-08-27 周期位置守卫命中标记：由 pos_cycle/pos_z 触发 NO_TRADE 时置 True，
     # 落库供 SQL 统计命中率（可观测性，不阻断逻辑）。
     cycle_pos_blocked: bool = False
+    # ── 2026-08-31: 安全护栏命中标记（趋势启动覆写的显式豁免判据）──
+    # 背景：趋势启动覆写(hexp_engine 约 2139 行)位于全部护栏之后，会无条件把
+    #   direction="NO_TRADE"/threshold_passed=False 覆写为放行。原设计依赖旧判定
+    #   "mm 同向 + pos 中低位"天然避开护栏，但新判定(squeeze_breakout)不看 mm/pos，
+    #   该假设不成立 → 护栏会被静默绕过。故为每道护栏补显式布尔标记，覆写前检查，
+    #   凡被安全护栏拦过的信号一律不放行（只放行"因 grade 未达标被拦"的）。
+    # 沿用 cycle_pos_blocked / extreme_reversal_blocked 既有范式，落库可统计命中率。
+    momentum_drain_blocked: bool = False
+    momentum_flip_blocked: bool = False
+    range_hurst_blocked: bool = False
+    # 趋势启动单的 SL 锁定标记：由 hexp_engine 趋势启动覆写置 True。
+    # 背景：scheduler 的「会话 SL 覆盖」会无条件用会话值改写 ai_sl_mult，而会话值
+    #   亚洲=3.5、欧美=2.0。回测最优 SL=3.5（样本外 +8.1R），SL=2.0 则明确亏损
+    #   （样本外 -1.9~-2.9R）。若不加锁定，欧美盘信号会被打回 2.0，回测结论失效。
+    # 置位后 scheduler 跳过会话覆盖，保留策略自身的 SL。
+    trend_start_sl_locked: bool = False
+    # 趋势启动单的手数分档（链动风控动态手数，禁用硬编码倍率）。
+    # 由 hexp_engine 按 hexp.trend_start.lot_tier 置为 low/mid/high；scheduler 会用它
+    # 覆盖 ai_lot_tier，实际倍率完全由风控 risk.lot_multiplier_* 决定。空串=未设置。
+    trend_start_lot_tier: str = ""
     # 2026-08-27 微动量平滑值（EMA，消抖）：前端画方向箭头若要用 mm 视角，必须用此平滑值，
     # 禁止用 mm_score（原始瞬时值，0 附近高频抖 → 方向闪烁缺陷）。
     mm_smoothed: float = 0.0

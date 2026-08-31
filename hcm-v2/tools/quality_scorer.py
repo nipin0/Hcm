@@ -30,11 +30,11 @@ import psycopg2
 import redis
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from quality_features import enrich_klines, session_onehot  # noqa: E402
+from quality_features import enrich_klines, session_onehot, _as_naive_utc  # noqa: E402
 # 【阶段2·数据契约单一真值】FEATURE_COLS 来自共享模块 _model_feature_cols，
 # 训练侧(train_signal_quality.py)与推理侧必须严格一致，消除双份数据源导致的
 # 列错位风险（详见 _model_feature_cols.py 注释）。
-from _model_feature_cols import MODEL_FEATURE_COLS  # noqa: E402
+from _model_feature_cols import MODEL_FEATURE_COLS, TMF_FEATURE_COLS  # noqa: E402
 
 import faulthandler  # noqa: E402
 import logging  # noqa: E402
@@ -274,6 +274,45 @@ def _num(v, default=0.0):
         return float(default)
 
 
+# 【TimesFM 特征 2026-08-30】按当前 M5 bar 从 hcm_ai.timesfm_features 读取离线时序特征，
+# 供 build_features 注入。缺失(调度滞后/未覆盖)→ {}，build_features 填 0.0 降级，
+# 与训练侧缺省严格一致，保证训练-推理同分布。60s 缓存按 bar_time 避免每 5s 打 PG。
+_TMF_CACHE = {"bar_time": None, "vals": {}, "at": 0.0}
+_TMF_VERSION = "tfm25_pca_v1_sig"
+
+
+def _load_tmf_for_bar(conn, symbol, bar_time, ttl: float = 60.0) -> dict:
+    """读当前 M5 bar 的 TimesFM 离线特征；返回 13 列 dict，缺失→{}。"""
+    if bar_time is None:
+        return {}
+    bt = _as_naive_utc(bar_time)
+    if bt is None:
+        return {}
+    _now = time.time()
+    if _TMF_CACHE["bar_time"] == bt and (_now - _TMF_CACHE["at"]) < ttl:
+        return _TMF_CACHE["vals"]
+    vals: dict = {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT tmf_pc00,tmf_pc01,tmf_pc02,tmf_pc03,tmf_pc04,tmf_pc05,tmf_pc06,tmf_pc07,"
+                "tmf_trend_cont,tmf_rev_prob,tmf_vol_cycle,tmf_mtf_resonance,tmf_hist_sim "
+                "FROM hcm_ai.timesfm_features "
+                "WHERE symbol=%s AND time_frame='M5' AND tmf_version=%s AND bar_time=%s",
+                (symbol, _TMF_VERSION, bt),
+            )
+            r = cur.fetchone()
+            if r:
+                for c, v in zip(TMF_FEATURE_COLS, r):
+                    vals[c] = float(v) if v is not None else 0.0
+    except Exception:
+        pass
+    _TMF_CACHE["bar_time"] = bt
+    _TMF_CACHE["vals"] = vals
+    _TMF_CACHE["at"] = _now
+    return vals
+
+
 # 用 127.0.0.1 而非 localhost：Windows 解析 localhost 优先命中 ::1(IPv6)，会被
 # wslrelay.exe(WSL 端口转发)劫持 [::1]:6379/5432 → 连不上 docker 生产 Redis/PG。
 # 强制 IPv4 直连生产(docker 监听 0.0.0.0) → 2026-08-17 根治"AI评分未显示"根因。
@@ -510,7 +549,8 @@ def load_model(model_path, calib_path, state_path=None, dir_path=None, dir_calib
 def build_features(snapshot: dict, kl: pd.DataFrame,
                    h1_feats: dict | None = None, env_feats: dict | None = None,
                    align_m5: bool = False, audit: bool = False,
-                   ds_out: dict | None = None) -> dict:
+                   ds_out: dict | None = None,
+                   tmf_out: dict | None = None) -> dict:
     """从 hexp 快照 + 已 enrich 的 M5 K 线装配单条特征行（与训练同构）。
 
     【B5 修复 2026-08-14】此前 macd/h1_adx/h1_trend_strength/event_proximity_min/
@@ -612,6 +652,7 @@ def build_features(snapshot: dict, kl: pd.DataFrame,
     row["event_proximity_min"] = envf.get("event_proximity_min")
     row["macro_risk_score"] = envf.get("macro_risk_score")
     row["sentiment_risk_score"] = envf.get("sentiment_risk_score")
+    row["liquidity"] = envf.get("liquidity")   # 【流动性特征 2026-08-30】外部流动性因子(0~1)
     # 【DeepSeek 训练特征增强 2026-08-17】把 DeepSeek 异步票固化为特征列。
     # ds_out 由调用方(主循环)传入 Redis ai:ds:out:{sym} 当前票；缺失→三项全 0.0，
     # 与训练侧缺省(无 DeepSeek 标注历史)严格一致，保证训练-推理同分布。
@@ -621,6 +662,11 @@ def build_features(snapshot: dict, kl: pd.DataFrame,
     row["ds_fake_prob"] = _num(_ds.get("fake_prob"), 0.0) if _ds.get("fake_prob") is not None else 0.0
     row["ds_sl_coeff"] = _num(_ds.get("ai_sl_coeff"), 0.0) if _ds.get("ai_sl_coeff") is not None else 0.0
     row["ds_continuity"] = _num(_ds.get("continuity_score"), 0.0) if _ds.get("continuity_score") is not None else 0.0
+    # 【TimesFM 特征 2026-08-30】注入 tmf_* 13 列：推理侧主循环按当前 M5 bar 查
+    # hcm_ai.timesfm_features，缺失→全 0.0，与训练侧缺省严格一致(保证训练-推理同分布)。
+    _tmf = tmf_out or {}
+    for c in TMF_FEATURE_COLS:
+        row[c] = _tmf.get(c, 0.0)
     # 所有特征缺则补 0.0，避免 LightGBM 因 None/object dtype 抛错（被 score_one 顶层 except 吞）
     feats = {c: (row.get(c) if row.get(c) is not None else 0.0) for c in FEATURE_COLS}
     # 【C·特征口径对齐审计】开启 ai.lm.feature_audit 时打印 FEATURE_COLS 顺序与当前样本，
@@ -707,6 +753,17 @@ def _env_features(conn) -> dict:
         v = cur.fetchone()
         if v and v[0] is not None:
             out["sentiment_risk_score"] = float(v[0])
+        # 【流动性特征 2026-08-30】读最新 liquidity(0~1)；表缺失时优雅降级(不阻断推理)。
+        try:
+            cur.execute(
+                "SELECT liquidity_score FROM hcm_market.liquidity_snapshots "
+                "WHERE category='metals' ORDER BY snapshot_time DESC LIMIT 1"
+            )
+            v = cur.fetchone()
+            if v and v[0] is not None:
+                out["liquidity"] = float(v[0])
+        except Exception:
+            pass
     return out
 
 
@@ -1165,8 +1222,11 @@ def main():
                                         _ds_out = None
                         except Exception:
                             _ds_out = None
+                        # 【TimesFM 特征 2026-08-30】按当前 M5 bar 查离线特征；缺失→{}→0.0 降级。
+                        _bar_time = kl.iloc[-1]["open_time"] if (kl is not None and not kl.empty) else None
+                        _tmf_out = _load_tmf_for_bar(conn, args.symbol.upper(), _bar_time)
                         feats = build_features(snap, kl, _h1f, _envf, align_m5=_align_m5,
-                                               audit=_feature_audit, ds_out=_ds_out)
+                                               audit=_feature_audit, ds_out=_ds_out, tmf_out=_tmf_out)
                         _raw, _pred_state, _ai_dir, _ai_dir_prob, _ai_entry = score_one(
                             model, iso, feats, state_model, state_classes, dir_model, dir_calibs,
                             entry_model, entry_calib)

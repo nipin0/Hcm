@@ -75,17 +75,27 @@ CFG_FALLBACK: dict[str, Any] = {
     # false 时保持原 none 语义(不干预手数)。coupled 模式不受此开关影响(走 total 融合)。
     "hexp.lot_tier_enabled": True,
     "hexp.coupling_pass_threshold": 50.0,
-    # 【2026-08-28 口径修正】tier 门槛按 scorecard_total 真实分布标定（0~1 口径）。
-    # 原注释/值按 0-100 口径(85/70/60 及 70/58/45) 设定，但 lot_tier_for 实际输入
-    # 是 scorecard_total（scheduler.py:264/337 明确用 scorecard_total 而非 hp_score），
-    # 实测分布 p25=0.5/p50=0.6/p75=0.6/max=0.9（2026-08-21~28，n=1364）。
-    # 0-100 口径阈值永远高于 1.0 → 全量 tier=none → scheduler 强转 low → 风控全量
-    # 0.01 手（分档完全失效）。现统一到 0~1 口径，与风控 risk.score_tier_* 对齐：
-    #   low>=0.45 覆盖~75%  mid>=0.55 覆盖~55%  high>=0.65 覆盖~20%
-    # 此值与 DB 已热调一致（config_provider 双写），仅作代码侧兜底/文档归一。
-    "ai.cpl.tier_high": 0.65,
-    "ai.cpl.tier_mid": 0.55,
-    "ai.cpl.tier_low": 0.45,
+    # 【2026-08-31 口径修正·真因回归】scorecard_total 权威口径 = 0–100
+    # （与风控 risk_min_confidence 的 0–100 制对齐，见 scheduler.py:2252-2256）。
+    #
+    # 历史口径迁移轨迹（实测 hcm_signal.signals.confidence 按天分布，n=1398）：
+    #   - 2026-08-27 及之前：scorecard_total 为 0~1  口径（各日 max=1.00）
+    #   - 2026-08-28 起    ：scorecard_total 迁移为 0–100 口径（avg 56.47、max 85.17）
+    # 而 2026-08-28 那次"口径修正"误按 0~1 标定 tier 阈值（0.65/0.55/0.45），
+    # 与迁移后的 0–100 输入失配 → 阈值恒被越过 → lot_tier 恒 "high"（1.5×）
+    # → **动态手数分档完全失效，且系统性按最高档放大于每一笔信号**；
+    # 解耦态走的是同一 lot_tier_for 路径（decide 透传分支），故同样恒 high。
+    #
+    # 现按 0~1 → 0–100 等价映射（×100）把阈值改为 65/55/45，并用 0–100 真实分布复核：
+    #   实测（2026-08-28 起，n=262）：min=26.94 p25=48.94 p50=57.16 p75=65.30
+    #                                p90=73.09 max=85.17
+    #   覆盖：low>=45 ≈78%    mid>=55 ≈53%    high>=65 ≈25%
+    # 与原设计覆盖意图（low 75% / mid 55% / high 20%）一致。
+    # 下游风控 risk.score_tier_* 为同一口径问题，须同步 ×100（52/70/90），否则
+    # ai_lot_tier=none 回退到 score 分档时仍会失配。
+    "ai.cpl.tier_high": 65.0,
+    "ai.cpl.tier_mid": 55.0,
+    "ai.cpl.tier_low": 45.0,
     "ai.cpl.lot_high": 1.5,
     "ai.cpl.lot_low": 0.5,
 }
@@ -163,14 +173,18 @@ def coupling_total(hp_score: float, c_ai: float, k: float, cfg: dict) -> float:
 
 
 def lot_tier_for(total: float, cfg: dict) -> str:
-    """综合分 scorecard_total（0~1 口径）→ 手数分档（low/mid/high/none）。
+    """综合分 scorecard_total（**0–100 口径**）→ 手数分档（low/mid/high/none）。
+
+    【2026-08-31 口径修正】输入 scorecard_total 自 2026-08-28 起为 0–100 口径
+    （此前为 0~1，见上方 CFG_FALLBACK 注释的迁移轨迹）。本函数阈值必须与其同口径，
+    否则 0~1 阈值会被 0–100 输入恒越过 → 恒 high。
 
     仅当 ai.cpl.enabled=true 时启用；否则 caller 侧 fallback 为 "none"。
-    tier 分界（0~1 口径，2026-08-28 按真实分布标定）：
-      total >= ai.cpl.tier_high(0.65) → "high"
-      total >= ai.cpl.tier_mid(0.55)  → "mid"
-      total >= ai.cpl.tier_low(0.45)  → "low"
-      否则                            → "none"（极弱：不发）
+    tier 分界（0–100 口径，2026-08-31 按 0–100 真实分布标定）：
+      total >= ai.cpl.tier_high(65) → "high"
+      total >= ai.cpl.tier_mid(55)  → "mid"
+      total >= ai.cpl.tier_low(45)  → "low"
+      否则                          → "none"（极弱：不发）
     返回的是「档位语义」而非固定倍率——实际倍率由风控面板的动态手数
     配置（risk.lot_multiplier_{low|mid|high} + risk.lot_base）决定，
     实现「AI 只选档、风控定准确下单值」的链动设计（2026-08-14 需求）。

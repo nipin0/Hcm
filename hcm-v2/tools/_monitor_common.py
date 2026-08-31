@@ -55,6 +55,15 @@ def build_live_baseline_from_features(features_df, features=None) -> dict:
         col = s.dropna().values
         if col.size < 30:
             continue
+        # 【2026-08-31 修复】高聚集(低方差)特征检测:众数占比>0.3 时分位边大量
+        # 重合 → deciles 退化 → 分位 PSI 虚高(已验证虚高到 4~7 触发误重训
+        # churn)。此类特征排除出分位 PSI(不建退化 deciles),交由 feature_psi
+        # 退化守卫兜底;仅保留分布离散(众数<0.3)特征供真实漂移监控。
+        # 注:当前低波动市况下多数指标(含 adx_14/rsi_14)呈聚集态,PSI 对该类
+        # 特征本质失真,豁免符合铁律第3条(非平稳/低方差特征不作触发依据)。
+        _vc = s.value_counts(dropna=True)
+        if len(_vc) > 0 and _vc.iloc[0] / max(1, _vc.sum()) > 0.3:
+            continue
         deciles[c] = [float(np.quantile(col, q)) for q in
                       (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)]
         used.append(c)
@@ -108,6 +117,13 @@ def feature_psi(actual, deciles) -> float:
     if np.ptp(d) < 1e-9 or np.nanstd(arr) < 1e-9:
         return 0.0
     edges = np.concatenate(([-np.inf], d, [np.inf]))
+    # 【2026-08-31 修复·PSI 假漂移】deciles 退化守卫:若分位边大量重合(相邻边
+    # 差≈0),说明该特征低方差/高聚集(众数占 50%+)。退化分箱会把 50%+ 实际值
+    # 挤进单一箱,PSI 虚高到 4~7,触发 auto_retrain 误重训 churn(已验证)。退化
+    # 时返回 0(该特征低方差不可靠,不计入 drifted);真实漂移(rsi_14/adx_14)仍
+    # 正常监控。
+    if np.sum(np.diff(edges) > 1e-9) < 9:
+        return 0.0
     counts, _ = np.histogram(arr, bins=edges)
     n = float(counts.sum())
     actual_prop = counts / n if n > 0 else np.zeros(10)

@@ -224,6 +224,39 @@ HEXP_KEYS: dict[str, Any] = {
     # 默认关闭(hard_block_enabled=False)，需显式开启；atr_mult 控制「越过多远算逆结构」。
     "hexp.zone.hard_block_enabled": False,
     "hexp.zone.hard_block_atr_mult": 0.3,
+    # ── 趋势启动候选（2026-08-31 补入白名单 + 判定重构）──
+    # 历史遗漏：trend_start_* 系列此前仅在引擎 cfg.get(默认值) 中使用、从未登记白名单
+    # → 面板无控件且热调无效（只能改代码默认值后重启）。现统一登记，可热调。
+    # 【新判定 squeeze_breakout】回测(XAUUSD M5，06-16~08-31，16918 根，成本 0.045R 已扣)：
+    #   样本内 64 次 胜率 61.8% 净 +15.6R（单均 +0.244R）
+    #   样本外 29 次 胜率 66.7% 净 +10.7R（单均 +0.369R）
+    # 【旧判定 phase_ignite】实测胜率仅 4%、单均 -0.804R，仅作热回退保留，勿长期启用。
+    "hexp.trend_start_observe_enabled": True,
+    "hexp.trend_start_mode": "squeeze_breakout",  # squeeze_breakout | phase_ignite
+    # 下单开关：默认 False。旧判定真下单实测亏损；新判定处影子验证期，代码层另加禁单。
+    "hexp.trend_start_order_enabled": False,
+    # 新判定开放真下单的独立开关：与 order_enabled 为「与」关系。两者同时为 true 且
+    # trend_start_mode=squeeze_breakout 时新判定才真下单。默认关闭——影子验证达标后
+    # 再开，使「切入生产」成为一次纯配置变更（秒级可回退，无需改代码发版）。
+    "hexp.trend_start.new_mode_order_allowed": False,
+    # 新判定参数（回测最优；40 组 SL×HOLD×RR 中 30 组样本内外净 R 同正，属平原非孤峰）
+    "hexp.trend_start.bbw_max": 20.0,      # 压缩：bbw 分位低于此值
+    "hexp.trend_start.don_look": 10,       # 突破：Donchian 周期(根)
+    "hexp.trend_start.h1_ema": 50,         # 共振：H1 EMA 周期
+    "hexp.trend_start.sl_atr_mult": 3.5,   # 出场：SL = 3.5 × ATR
+    "hexp.trend_start.rr": 1.5,            # 出场：TP = 5.25 × ATR
+    "hexp.trend_start.hold_bars": 90,      # 出场：持有上限 90 根 M5(7.5h)
+    # 旧判定参数（hexp.trend_start_mode=phase_ignite 热回退时生效）
+    "hexp.trend_start_phases": "ignite,establish",
+    "hexp.trend_start_mm_min": -0.05,
+    "hexp.trend_start_pos_high": 0.8,
+    "hexp.trend_start_pos_low": 0.2,
+    "hexp.trend_start_min_grade": "B",
+    # 手数：链动风控动态手数，禁用硬编码固定折减。
+    # lot_tier 只选档(low/mid/high)，实际倍率由风控 risk.lot_multiplier_* 决定；
+    # lot_mult 默认 1.0 = 完全不干预，仅在确需微调时才配置。
+    "hexp.trend_start.lot_tier": "low",
+    "hexp.trend_start_order_lot_mult": 1.0,
 }
 
 

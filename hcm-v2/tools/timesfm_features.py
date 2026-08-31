@@ -42,6 +42,10 @@
   python timesfm_features.py --fit-pca --pca-out models/tmf_pca_v1.pkl \
       --pca-start 2026-01-01 --pca-end 2026-06-30
 
+  # 0) 运行前自检（不加载模型/不下载权重/不写库，秒级返回）
+  python timesfm_features.py --check-env \
+      --model-dir D:\\models\\timesfm-2.5-200m-pytorch
+
   # 2) 抽取特征并写库
   python timesfm_features.py --extract --pca models/tmf_pca_v1.pkl \
       --start 2026-07-01 --end 2026-08-29
@@ -470,9 +474,32 @@ def cmd_extract(args) -> None:
                    if i + 1 >= CTX_BARS]
         if not targets:
             raise SystemExit("[fatal] 指定区间内无可用 bar")
+        # 只在信号时刻抽取：特征最终是为训练/推理服务的，只有信号时刻才真正需要。
+        # 相比全量约 1.7 万根（7 小时），按信号抽取约 863 个（20 余分钟），
+        # 且产出的每一行都能直接对上一条训练样本，便于即刻做区分度检验。
+        if args.at_signal_times:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT created_at FROM hcm_signal.signals "
+                    "WHERE symbol = %s AND signal_mode LIKE 'HEXP:%%' "
+                    "AND created_at >= %s::timestamp "
+                    "AND created_at < (%s::date + 1) "
+                    "ORDER BY created_at",
+                    (args.symbol, args.start, args.end),
+                )
+                sig_ts = [r[0] for r in cur.fetchall()]
+            if not sig_ts:
+                raise SystemExit("[fatal] 窗口内无 HEXP 信号")
+            sig64 = _to_naive_utc64(sig_ts)
+            pos = np.searchsorted(ts64, sig64, side="right") - 1
+            targets = sorted({int(p) for p in pos if p + 1 >= CTX_BARS})
+            log(f"at-signal-times: {len(sig_ts)} 条信号 -> {len(targets)} 个去重 bar")
+            raw_targets = len(targets)
+            args.extract_stride = 1  # 已是信号级稀疏，无需再抽样
         # 成本提示：每根 bar 需 1 次主周期推理 + 至多 4 次多周期推理（mtf_resonance），
         # 实测约 1.5s/根 —— 全量约 1.7 万根需 7 小时。故支持等间隔抽样先做小样本验证。
-        raw_targets = len(targets)
+        if not args.at_signal_times:
+            raw_targets = len(targets)
         estride = max(1, int(args.extract_stride))
         if estride > 1:
             targets = targets[::estride]
@@ -485,6 +512,27 @@ def cmd_extract(args) -> None:
         lib_start = max(CTX_BARS - 1, targets[0] - HIST_LIB - HORIZON)
         lib_idx = list(range(lib_start, max(lib_start + 1, targets[0] - HORIZON)))
         lib_vecs = np.zeros((0, HIDDEN_SIZE))
+        lib_ts = np.zeros((0,), dtype="datetime64[ns]")
+        # 【2026-08-30 增量调度一致性】检索库跨批次持久化。
+        # 原实现每批都从空库起步，tmf_hist_sim 因此依赖"该信号在本批内的位置"
+        # （批首恒为 0.0）：整批 861 条时末段有 2048 条候选，每日增量每批仅约 30 条。
+        # 启用 --lib-cache 后启动时载入上批库、结束时回写，使两者数学等价。
+        # 载入时按时间戳剔除「不早于本批首个目标」的向量：既杜绝自匹配污染
+        # （重抽到已抽取的信号时不会与自身比相似度），也容忍增量调度的重叠回看。
+        if args.lib_cache and os.path.exists(args.lib_cache):
+            try:
+                _z = np.load(args.lib_cache)
+                _v = _z["lib_vecs"]
+                _t = _z["lib_ts"].astype("datetime64[ns]")
+                _keep = _t < ts64[targets[0]]
+                lib_vecs = _v[_keep][-HIST_LIB:]
+                lib_ts = _t[_keep][-HIST_LIB:]
+                log(f"lib-cache loaded: {len(lib_vecs)} vecs "
+                    f"(dropped {int((~_keep).sum())} not-before-window) <- {args.lib_cache}")
+            except Exception as e:  # noqa: BLE001
+                lib_vecs = np.zeros((0, HIDDEN_SIZE))
+                lib_ts = np.zeros((0,), dtype="datetime64[ns]")
+                log(f"[warn] lib-cache 载入失败，按空库继续: {e}")
 
         rows = []
         for n, i in enumerate(targets):
@@ -526,9 +574,12 @@ def cmd_extract(args) -> None:
             rows.append(row)
 
             # 检索库滚动纳入（保持 HIST_LIB 容量）
+            # 注意：必须在上面算完本行 hist_sim 之后才纳入自身，杜绝自匹配。
             lib_vecs = np.vstack([lib_vecs, pooled]) if lib_vecs.size else pooled.reshape(1, -1)
+            lib_ts = np.append(lib_ts, np.datetime64(ts64[i], "ns"))
             if len(lib_vecs) > HIST_LIB:
                 lib_vecs = lib_vecs[-HIST_LIB:]
+                lib_ts = lib_ts[-HIST_LIB:]
 
             if (n + 1) % 50 == 0:
                 log(f"  {n + 1}/{len(targets)}")
@@ -540,6 +591,17 @@ def cmd_extract(args) -> None:
 
         write_rows(conn, rows, args.create_table)
         log(f"[saved] {len(rows)} 行 -> hcm_ai.timesfm_features")
+        # 库在落库成功之后才回写：若本次写库失败，缓存不推进，下批仍会重抽这段，
+        # 避免"库已前进但数据没进库"造成样本永久缺失。
+        if args.lib_cache and lib_vecs.size:
+            try:
+                _dir = os.path.dirname(os.path.abspath(args.lib_cache))
+                if _dir:
+                    os.makedirs(_dir, exist_ok=True)
+                np.savez_compressed(args.lib_cache, lib_vecs=lib_vecs, lib_ts=lib_ts)
+                log(f"lib-cache saved: {len(lib_vecs)} vecs -> {args.lib_cache}")
+            except Exception as e:  # noqa: BLE001
+                log(f"[warn] lib-cache 保存失败（下批将从空库起步）: {e}")
     finally:
         conn.close()
 
@@ -581,6 +643,132 @@ def write_rows(conn, rows: list[dict], create_table: bool) -> None:
     conn.commit()
 
 
+def cmd_check_env(args) -> None:
+    """运行前快速自检：venv 依赖 / 模型权重路径 / DB 连通与表存在。
+
+    设计红线：不加载模型、不触发权重下载、不写库、不触碰任何线上进程。
+    仅做 import 级依赖校验 + 路径/连通性探测，数秒内返回。
+    """
+    print("=" * 62)
+    print("TimesFM 运行环境自检 (--check-env)")
+    print("=" * 62)
+
+    # ── 1) venv / Python 依赖（仅 import 包，不触发权重下载）──
+    print("\n[1] 依赖包 (venv)")
+    deps = {
+        "numpy": "numpy",
+        "scikit-learn": "sklearn",
+        "torch": "torch",
+        "psycopg2": "psycopg2",
+        "timesfm": "timesfm",
+    }
+    dep_ok = True
+    for name, mod in deps.items():
+        try:
+            m = __import__(mod)
+            ver = getattr(m, "__version__", "?")
+            print(f"  OK   {name:14s} {ver}")
+        except Exception as e:
+            dep_ok = False
+            print(f"  FAIL {name:14s} {e.__class__.__name__}: {e}")
+    py = sys.version_info
+    print(f"  INFO Python {py.major}.{py.minor}.{py.micro}")
+    if (py[0], py[1]) < (3, 10):
+        dep_ok = False
+        print("  FAIL Python < 3.10 与 timesfm 3.0.0 不兼容（建议 3.13 venv）")
+
+    # ── 2) 模型权重路径 ──
+    print("\n[2] 模型权重")
+    weight_ok = True
+    if args.model_dir:
+        md = args.model_dir
+        if not os.path.isdir(md):
+            weight_ok = False
+            print(f"  FAIL --model-dir 不存在: {md}")
+        else:
+            cfg = os.path.join(md, "config.json")
+            wts = [f for f in os.listdir(md)
+                   if f.endswith(".safetensors") or f.endswith(".bin")]
+            if not os.path.exists(cfg):
+                weight_ok = False
+                print(f"  FAIL 缺 config.json: {md}")
+            elif not wts:
+                weight_ok = False
+                print(f"  FAIL 缺权重文件(*.safetensors/*.bin): {md}")
+            else:
+                print(f"  OK   本地权重目录: {md}")
+                print(f"         config.json [OK]  weights={wts[0]}"
+                      + (f" (+{len(wts) - 1})" if len(wts) > 1 else ""))
+    else:
+        print(f"  WARN 未指定 --model-dir → 将从 HF 下载 {args.repo}")
+        # 连通性探测：本环境若到 huggingface.co 握手超时（防火墙/无外网），
+        # from_pretrained 会卡 60s+ 才抛 ConnectTimeout。提前用短超时探测，
+        # 不可达即明确报错，避免真跑时才白等。
+        try:
+            import urllib.request
+            _p = urllib.request.urlopen("https://huggingface.co", timeout=8)
+            _p.close()
+            _reach = True
+        except Exception as _e:
+            _reach = False
+            print(f"  FAIL HF 不可达（{_e.__class__.__name__}）：无法下载权重，"
+                  f"需先用浏览器/.NET 将 model.safetensors 下到本地并用 --model-dir 指定")
+        if _reach:
+            print(f"        首次运行触发 ~882MB 权重下载（官方 CDN ~114KB/s，约 2 小时）")
+            xet = os.environ.get("HF_HUB_DISABLE_XET")
+            if xet == "1":
+                print(f"  OK   HF_HUB_DISABLE_XET=1（已绕过会静默挂起的 Xet 后端）")
+            else:
+                weight_ok = False
+                print(f"  FAIL HF_HUB_DISABLE_XET 未设 1（Xet 后端会静默挂起）；"
+                      f"本脚本已默认 setdefault=1，正常应为 1")
+        else:
+            weight_ok = False
+
+    # ── 3) DB 连通 + 落库表 + 输入数据 ──
+    print("\n[3] 数据库")
+    db_ok = True
+    try:
+        import psycopg2
+        conn = psycopg2.connect(args.db_url)
+        print(f"  OK   连接成功: {args.db_url}")
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('hcm_ai.timesfm_features')")
+            tbl = cur.fetchone()[0]
+            if tbl:
+                cur.execute("SELECT count(*) FROM hcm_ai.timesfm_features")
+                n = cur.fetchone()[0]
+                print(f"  OK   表 hcm_ai.timesfm_features 存在（当前 {n} 行）")
+            else:
+                db_ok = False
+                print(f"  WARN 表 hcm_ai.timesfm_features 不存在"
+                      f"（extract 加 --create-table 自动建）")
+            cur.execute(
+                "SELECT count(*) FROM hcm_market.klines "
+                "WHERE symbol=%s AND time_frame='M5'", (args.symbol,))
+            k = cur.fetchone()[0]
+            if k >= CTX_BARS + 1:
+                print(f"  OK   hcm_market.klines[{args.symbol}/M5] 有 {k} 根"
+                      f" (>= ctx_bars+1={CTX_BARS + 1})")
+            else:
+                db_ok = False
+                print(f"  FAIL hcm_market.klines[{args.symbol}/M5] 仅 {k} 根"
+                      f" (< {CTX_BARS + 1})，无法抽取")
+        conn.close()
+    except Exception as e:
+        db_ok = False
+        print(f"  FAIL DB 连接/查询失败: {e.__class__.__name__}: {e}")
+
+    # ── 汇总 ──
+    print("\n" + "=" * 62)
+    all_ok = dep_ok and weight_ok and db_ok
+    print("自检结果:", "PASS [OK] 可直接运行 --fit-pca / --extract" if all_ok
+          else "BLOCKED [FAIL] 见上方 FAIL/WARN，修完再跑")
+    print("=" * 62)
+    if not all_ok:
+        raise SystemExit(1)
+
+
 def main() -> None:
     # 必须在使用 CTX_BARS / HORIZON（含作 argparse 默认值）之前声明 global
     global CTX_BARS, HORIZON
@@ -601,17 +789,25 @@ def main() -> None:
                     help="PCA 拟合样本数上限（在 stride 抽样之后截断，默认 5000）")
     ap.add_argument("--embed-norm", choices=["none", "l2"], default="l2",
                     help="embedding 逐样本归一化方式（默认 l2）。设为 none 时 PC1 会"
-                         "独占 99.95% 方差、embedding 退化为近似 1 维，仅用于对照实验。")
+                         # 注意：help 串会走 argparse 的 % 格式化，字面百分号必须写 %%，
+                         # 否则 --help / 参数报错时抛 ValueError 而非打印用法（2026-08-30 修复）
+                         "独占 99.95%% 方差、embedding 退化为近似 1 维，仅用于对照实验。")
     ap.add_argument("--normalize-inputs", action="store_true",
                     help="让 TimesFM 对输入做实例归一化（强烈建议）。喂原始价格水平时"
                          "激活尺度随价位漂移，会使 embedding 退化为近似一维")
     ap.add_argument("--save-pool", default=None,
                     help="把抽取到的 embedding 落盘为 npz（供后续调整 k/标准化/池化"
                          "方式时复用，避免重复 15 分钟推理）")
+    ap.add_argument("--lib-cache", default=None,
+                    help="相似度检索库跨批次持久化路径（npz）。缺省 None = 每批从空库"
+                         "起步（旧行为）。注意：旧行为下 tmf_hist_sim 依赖该信号在"
+                         "本批内的位置（批首恒为 0.0），单次整批 861 条与每日增量约"
+                         "30 条的两侧分布不可比，混训会退化成批次伪影。增量调度必须"
+                         "指定本项，使「每日增量」与「单次整批」在数学上等价。")
     ap.add_argument("--horizon", type=int, default=HORIZON)
     ap.add_argument("--ctx-bars", type=int, default=CTX_BARS)
 
-    sub = ap.add_mutually_exclusive_group(required=True)
+    sub = ap.add_mutually_exclusive_group(required=False)
     sub.add_argument("--fit-pca", action="store_true")
     sub.add_argument("--extract", action="store_true")
 
@@ -621,25 +817,38 @@ def main() -> None:
     ap.add_argument("--pca-end", default=None)
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
+    ap.add_argument("--at-signal-times", action="store_true",
+                    help="只在 HEXP 信号产生的时刻抽取特征（推荐）。"
+                         "特征最终服务于训练/推理，仅信号时刻才真正需要；"
+                         "且每行可直接对应一条训练样本，便于做区分度检验")
     ap.add_argument("--extract-stride", type=int, default=1,
                     help="抽取时按每 N 根 bar 等间隔抽样（默认 1=全量）。"
                          "全量约 7 小时，建议先用较大 stride 小样本验证")
     ap.add_argument("--create-table", action="store_true",
                     help="建表 hcm_ai.timesfm_features（缺省不建，避免误改库）")
     ap.add_argument("--dry-run", action="store_true", help="只打印不落库")
+    ap.add_argument("--check-env", action="store_true",
+                    help="运行前快速自检：依赖包/模型权重路径/DB 连通与表存在。"
+                         "不加载模型、不下载权重、不写库，秒级返回")
     args = ap.parse_args()
     CTX_BARS, HORIZON = args.ctx_bars, args.horizon
     if CTX_BARS % PATCH_LEN != 0:
         raise SystemExit(f"[fatal] ctx-bars 须为 {PATCH_LEN} 的整数倍")
 
+    if args.check_env:
+        cmd_check_env(args)
+        return
+
     if args.fit_pca:
         if not (args.pca_start and args.pca_end):
             raise SystemExit("[fatal] --fit-pca 需 --pca-start / --pca-end（训练期窗口）")
         cmd_fit_pca(args)
-    else:
+    elif args.extract:
         if not (args.start and args.end):
             raise SystemExit("[fatal] --extract 需 --start / --end")
         cmd_extract(args)
+    else:
+        raise SystemExit("[fatal] 必须指定 --fit-pca / --extract / --check-env 之一")
 
 
 if __name__ == "__main__":

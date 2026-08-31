@@ -2098,6 +2098,14 @@ class Scheduler:
             # 注：这是有意的兜底（弱信号最小档），非掩盖 bug——阈值已正确，none 即真弱。
             if ai_lot_tier == "none":
                 ai_lot_tier = "low"
+            # 【2026-08-31】趋势启动单：手数改由 lot_tier 分档链动风控动态手数，
+            # 不再依赖固定的 lot_mult 折减（禁用硬编码倍率）。实际倍率由风控
+            # risk.lot_multiplier_* 决定，signal_tower 侧只选档、不乘死系数。
+            _ts_tier = str(getattr(score_result, "trend_start_lot_tier", "") or "").strip().lower()
+            if _ts_tier in ("low", "mid", "high"):
+                logger.info("trend_start lot tier override: %s → %s (链动风控动态手数)",
+                            ai_lot_tier, _ts_tier)
+                ai_lot_tier = _ts_tier
             # 【2026-08-27 修订】放行严格回到 6 维综合(scorecard_total)：lot_tier=none 仅当
             # HEXP 未 passed 时才抑制信号；HEXP 已 passed（6 维达标）时，hp_score 单维低导致的
             # none 不再抑制下单（仅观测），杜绝单维绕过综合闸门。手数档交由风控动态手数兜底。
@@ -2347,11 +2355,20 @@ class Scheduler:
         _min_rr, _ = await _session_float(
             self._redis, "min_rr", 1.2, fallback_keys=("signal_tower.min_rr",)
         )
-        if _sl_session:
+        # 【2026-08-31 冲突修复】趋势启动单锁定自身 SL，不受会话覆盖影响。
+        # 会话值：asia=3.5、europe=2.0、us=2.0。回测最优 SL=3.5（样本外 +8.1R），
+        # 而 SL=2.0 样本外为 -1.9~-2.9R。若不加豁免，欧美盘(黄金波动最大时段)的
+        # 趋势启动单会被打回 2.0，回测结论失效。仅影响趋势启动覆写产生的单。
+        _ts_sl_locked = bool(getattr(score_result, "trend_start_sl_locked", False))
+        if _sl_session and not _ts_sl_locked:
             _old_sl = ai_sl_mult
             ai_sl_mult = _sl_mult
             logger.info("Session SL override [%s]: ai_sl_mult=%.2f → %.2f (R:R≥%.2f)",
                         _sess, _old_sl, ai_sl_mult, _min_rr)
+        elif _sl_session and _ts_sl_locked:
+            logger.info("Session SL override [%s]: SKIPPED for trend_start signal "
+                        "(locked sl_mult=%.2f, session would be %.2f)",
+                        _sess, ai_sl_mult, _sl_mult)
         # ── LightGBM ai_score → SL 宽度缩放 (2026-08-18 设计修正) ──
         # 期望（用户确认）：AI 分的高低缩放 SL 宽度，数值范围参考设计文档
         # hcm-ai-quality-scorer-design.md 的 ai_sl_coeff 区间 0.8~1.5×ATR。
@@ -2372,6 +2389,8 @@ class Scheduler:
         except Exception:
             _ai_sl_enabled = True
         if (_ai_sl_enabled
+                and not _ts_sl_locked   # 趋势启动单锁定 SL：AI 缩放区间仅 0.8~1.5×ATR，
+                                        # 会把回测最优的 3.5 改写掉，故跳过
                 and _ai_lm_score is not None
                 and (ai_q or {}).get("source") not in ("none",)):
             try:
@@ -2649,7 +2668,10 @@ class Scheduler:
         # close.<session>.trailing_stop_distance 重算 SL，改 ai_sl_mult 不生效）。
         _chase_sl_price = 0.0
         _chase_tp1 = 0.0
-        if getattr(score_result, "extreme_chase", False):
+        # 【2026-08-31 冲突修复】趋势启动单已锁定 SL，不再被 extreme_chase 收紧。
+        # 本分支会【显式写 sl_price】（桥对非零 sl_price 直接采用，优先级最高），
+        # 若与趋势启动单叠加，会把锁定的 3.5 压到 3.5×0.7=2.45，锁定形同虚设。
+        if getattr(score_result, "extreme_chase", False) and not _ts_sl_locked:
             _chase = 0.7
             try:
                 if self._config is not None:
@@ -3416,7 +3438,12 @@ class Scheduler:
         try:
             _eval_bars = int(await self._config.get_int("hexp.shadow.eval_bars", 60)) if self._config else 60
             _dir_ratio = float(await self._config.get_float("hexp.shadow.dir_atr_ratio", 0.5)) if self._config else 0.5
-            _horizon = timedelta(minutes=(_eval_bars + 2) * 5)
+            # 【2026-08-31 修正·评估窗口不足】趋势启动策略持有期(HOLD=90 根 M5=450 分钟)
+            # 长于默认评估窗口(eval_bars=60→310 分钟)。_horizon 决定"多久以前的信号
+            # 才拿来评估"，若小于持有期，信号在【未满持有期】时就被评估成 expired，
+            # 系统性低估胜率（TP 尚未触及即被判平）。故取两者的最大值。
+            _ts_hold_cfg = int(await self._config.get_int("hexp.trend_start.hold_bars", 90)) if self._config else 90
+            _horizon = timedelta(minutes=(max(_eval_bars, _ts_hold_cfg) + 2) * 5)
             _rows = await self._db.fetch(
                 """
                 SELECT s.signal_id, s.symbol, s.time_frame, s.signal_dir,
@@ -3522,6 +3549,16 @@ class Scheduler:
             )
             for _r in _ts_rows:
                 _ts = _r["ts"]
+                # 【2026-08-31 修复·影子评估断链】本进程未注册 asyncpg jsonb codec
+                # （全项目无 set_type_codec），故 SQL 里 `::jsonb` 列实际返回 **str**
+                # 而非 dict。原 isinstance(_ts, dict) 恒为 False → 28 条趋势启动候选
+                # 每轮全部 continue → hcm_signal.hexp_shadow_eval 自上线起恒为 0 行，
+                # 趋势抢跑观测形同虚设。此处补齐 str/bytes 解析（json 已在模块顶部导入）。
+                if isinstance(_ts, (str, bytes)):
+                    try:
+                        _ts = json.loads(_ts)
+                    except Exception:
+                        continue
                 if not isinstance(_ts, dict):
                     continue
                 _ts_dir = _ts.get("dir")
@@ -3529,9 +3566,12 @@ class Scheduler:
                 _ts_atr = float(_ts.get("atr") or 4.0)
                 if _ts_dir not in ("BUY", "SELL") or _ts_close <= 0 or _ts_atr <= 0:
                     continue
-                # 趋势启动单 SL/TP 参数（与 hexp.exec.sl_atr_mult=2.0 / rr_min=1.5 一致）
-                _ts_sl_mult = 2.0
-                _ts_rr = 1.5
+                # 趋势启动单 SL/TP 参数：优先用候选自带值（新判定 squeeze_breakout
+                # 携带回测最优 sl=3.5/rr=1.5/hold=90），旧判定无此三字段时回退
+                # hexp.exec 口径(2.0/1.5/eval_bars)。两者口径不同，勿混用。
+                _ts_sl_mult = float(_ts.get("sl_atr_mult") or 2.0)
+                _ts_rr = float(_ts.get("rr") or 1.5)
+                _ts_hold = int(_ts.get("hold_bars") or _eval_bars)
                 _ts_tp_mult = _ts_sl_mult * _ts_rr
                 if _ts_dir == "BUY":
                     _ts_sl = _ts_close - _ts_sl_mult * _ts_atr
@@ -3539,6 +3579,8 @@ class Scheduler:
                 else:
                     _ts_sl = _ts_close + _ts_sl_mult * _ts_atr
                     _ts_tp = _ts_close - _ts_tp_mult * _ts_atr
+                # 取数需覆盖策略持有期（HOLD=90 可能 > eval_bars=60）
+                _ts_bars = max(_eval_bars, _ts_hold)
                 _ts_kl = await self._db.fetch(
                     """
                     SELECT open_time, high, low, close
@@ -3548,12 +3590,14 @@ class Scheduler:
                     ORDER BY open_time ASC
                     LIMIT $4
                     """,
-                    _r["symbol"], _r["time_frame"], _r["created_at"], _eval_bars,
+                    _r["symbol"], _r["time_frame"], _r["created_at"], _ts_bars,
                 )
                 _ts_outcome = "expired"
                 _ts_pnl_r = 0.0
                 _ts_dir_hit = False
-                for _b in _ts_kl:
+                for _bi, _b in enumerate(_ts_kl):
+                    if _bi >= _ts_hold:  # 超出策略持有期 → 到期离场（未触发 SL/TP）
+                        break
                     _hi = float(_b["high"])
                     _lo = float(_b["low"])
                     _cl = float(_b["close"])
@@ -3590,7 +3634,7 @@ class Scheduler:
                     """,
                     _r["signal_id"], _r["symbol"], _r["time_frame"], _ts_dir, _ts_close,
                     _ts_sl, _ts_tp, _r["created_at"],
-                    _eval_bars, _ts_outcome, _ts_dir_hit, round(_ts_pnl_r, 4),
+                    _ts_hold, _ts_outcome, _ts_dir_hit, round(_ts_pnl_r, 4),
                 )
             logger.info("SHADOW hexp reconcile: evaluated %d shadow signals, %d trend-start candidates",
                         len(_rows), len(_ts_rows))

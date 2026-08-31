@@ -738,6 +738,34 @@ per-dim std 变异系数 **1.81**（min 0.64 vs max 2066，少数维方差占优
 
 **建议**：先做离线验证（VIF + 单特征 AUC 增益），**增益不显著则不加**；且 HP 因子与 TimesFM 应**合并为一次维度评估**，避免 39→48→65 两次重训。
 
+### 16.7 TimesFM 每日 T+1 增量抽取调度 —— B 方案落地（2026-08-30）
+
+**决策（用户裁定）**：严格遵循规范，先跑架构、再积累样本。立即投产每日 T+1 增量抽取调度器，架构先运转、样本持续积累，13 天后（约 2026-09-11）按 §7.2 门禁重测。
+
+**四层架构（与桥栈 / AI 评分侧完全对等）**：
+1. 脚本本体 `tools/timesfm_daily_scheduler.py`：每日 21:30 UTC 触发（重叠 2 天防跨日漏抽），水位线对齐、`tmf_version=tfm25_pca_v1_sig` 幂等 upsert；`--once/--force-start/--force-end` 支持手动回填；Redis 心跳 `hcm:ai:timesfm:daily`（TTL 48h）。
+2. 单实例 launcher `tools/timesfm_daily_launcher.py`：Global 互斥体 + 进程探测，幂等拉起。
+3. OS 层守护 `tools/timesfm_daily_boot.ps1` + `register_timesfm_daily_guard.ps1` + 计划任务 `HCM_TimesFMDailyGuard`（每 10 分钟 + 登录时触发）；含 `_baseline/` 还原点自愈。
+4. `tools/_baseline/`：脚本与产物（PCA / 检索库缓存）还原点。
+
+**关键工程决策**：
+- **检索库缓存增量一致性**（`timesfm_features.py --lib-cache`）：将 861 条历史向量物化到 `tools/models/tmf_hist_lib_v1.npz`，每批抽取按"信号时间严格早于本批首目标"过滤载入，确保任意时刻检索库恒等于"所有历史向量"，与一次性整批结果**逐项一致**（已实证：hist_sim min/avg/max = 0.0/0.9988/1.0 逐位复现，trend_cont 均值 -0.0186、rev_prob 均值 0.0310 不变）。该开关纯新增、幂等，未更改任何既有值。
+- **铁律 5.1 守住**：调度器只产出离线特征，G0 影子模式不参与决策；质量头未过 §7.2 门禁前不得接入下单链路。
+- **OS 守护对等桥栈**：与 `bridge_boot.ps1`/`HCM_BridgeGuard`、`ai_scorer_boot.ps1`/`HCM_AIScorerGuard` 同源同构，消除"关键进程只随 start.bat 手动启动、机器重启即静默消失"的整栈停机风险（2026-08-29 曾停机 1h22m）。
+
+**实施中修复的缺陷（已写入代码注释）**：
+- 调度器 `log()` 在 GBK 控制台打印含 U+FFFD 字符时二次崩溃 → 改为完全静默降级，日志落盘独立不受影响。
+- launcher 进程探测未带 Name 过滤，会匹配自身派生的 PowerShell → 改为按命令行匹配 + 排除 powershell/wscript/cmd/conhost。
+- 单实例锁只加在 launcher 短命进程上：计划任务与手动启动会各拉一个调度器并存 → 锁改加在长驻调度器本身（DAEMON + EXTRACT 两把互斥体，前者守生命周期、后者守抽取期）。
+- venv 的 `pythonw.exe`/`python.exe` 为 uv 风格 shim（会再 exec 出 `python.exe` 子进程）→ 进程探测按命令行匹配而非进程名。
+
+**验收**：
+- 回填 861 行 + 物化缓存，回溯基线逐位一致 ✅
+- 增量重抽（水位线回看 2 天）与整批等价 ✅
+- 单实例：重复拉起被互斥体拒绝（`another scheduler daemon already holds the singleton mutex; exiting`）✅
+- OS 守护：计划任务 + 登录触发，进程缺失自动重拉；心跳 `hcm:ai:timesfm:daily` 正常写入 ✅
+- 当前状态：调度器经 `HCM_TimesFMDailyGuard` 运行中，每日 21:30 UTC 增量抽取。
+
 ---
 
 ## 附录 A：关键文件与代码位置索引

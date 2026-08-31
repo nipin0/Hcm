@@ -541,6 +541,12 @@ def fetch_recent(window_hours: float = 24.0):
     return ai, feats, passed
 
 
+# 【2026-08-31 加固】live 基线健康阈值：恒定(唯一值<=1)特征占比超过此值即判定
+# 输入退化，拒绝 re-pin 并保留旧基线（完整教训见 build_live_baseline 内注释）。
+# 参考：健康状态下恒定占比约 0.06~0.14(实测)；2026-08-30 故障期高达 25/39≈0.64。
+LIVE_BASELINE_MAX_CONST_RATIO = 0.30
+
+
 def build_live_baseline(window_days: float = 1.0) -> dict | None:
     """从 inference_log 近窗口特征构建 live 群体基线(deciles)→ models/live_baseline.json。
 
@@ -566,6 +572,31 @@ def build_live_baseline(window_days: float = 1.0) -> dict | None:
             present |= set(_f.keys())
         cols = list(present)
     fdf = pd.DataFrame([{c: f.get(c, float("nan")) for c in cols} for f in feats])
+
+    # 【2026-08-31 加固】拒绝用退化数据 re-pin 基线（重要教训，务必读完）。
+    # 背景：2026-08-30 因桥时区偏移在休市重启被探测成 +0h → K 线停入库；
+    # sidecar 用同一批陈旧 K 线计算特征 → 全部特征恒定（实测 2026-08-30
+    # 13:00~21:00 期间 adx_14 恒为 44.80，该时段 100% 行命中）。
+    # 本函数于是"忠实"记录下 25/39 特征恒定，而这份故障期快照随后被当作
+    # train/serve skew 的判据使用，导致误删 7 个生产实际有真实取值的特征
+    # （ds_fake_prob/ds_sl_coeff/ds_continuity/dev_z_ema200/extreme_reversal/
+    # trend_aligned/entry_atr_ratio），质量头 AUC 因此被压到 0.37。
+    # 教训：live_baseline 只反映"构建当时"的生产状态。生产故障期它会如实失真，
+    # 因此**不能直接当作"某特征在生产是否有信息"的判据**；判断特征是否有信息，
+    # 应直接读 sidecar 发布的 lm_features（真实入模值）交叉验证。
+    # 故此处增加健康校验：恒定特征占比超阈值 → 告警并跳过 re-pin，保留旧基线。
+    try:
+        _n_const = sum(1 for c in cols if fdf[c].nunique(dropna=True) <= 1)
+        const_ratio = _n_const / max(1, len(cols))
+    except Exception:
+        _n_const, const_ratio = 0, 0.0
+    if const_ratio > LIVE_BASELINE_MAX_CONST_RATIO:
+        log(f"[live-baseline] DEGRADED INPUT: {_n_const}/{len(cols)} features constant "
+            f"(ratio={const_ratio:.3f} > {LIVE_BASELINE_MAX_CONST_RATIO}) — "
+            f"skip re-pin, keep previous baseline. "
+            f"This usually means the production pipeline is broken (e.g. K-line stalled).")
+        return None
+
     bl = build_live_baseline_from_features(fdf, cols)
     save_live_baseline(bl)
     log(f"[live-baseline] built from {len(feats)} samples, "
@@ -827,14 +858,22 @@ def retrain_once(use_deepseek: bool = True) -> dict:
     # 2026-08-21: 加 --ds-calibrate，使 build_labels 计算 ds_calib_weight
     # (DeepSeek 票近邻匹配加权 1.5/0.5)，供 train_signal_quality 作 sample_weight。
     # 修复前未传此参数 → ds_calib_weight 恒 1.0 → DeepSeek 完全未参与训练加权(断链)。
-    rc, out, err = run([PY, "build_labels.py", "--out", labels_csv, "--mode", "HEXP:%",
+    # 【2026-08-31 扩样本】原单模式 HEXP:% 仅约 864 条信号、有效样本 307，
+    # 不足以稳定训练（质量头 AUC 长期 ~0.49、测试集仅 62 条噪声主导）。
+    # 并入同期的 live_override（indicator_values 口径已验证与 HEXP 一致）后
+    # 有效样本 857、测试集 172、质量头 AUC 提升至 0.5917。
+    # 与 build_labels.py / quality_features.py 的逗号分隔多模式支持配套
+    # （单模式行为向后兼容）。
+    rc, out, err = run([PY, "build_labels.py", "--out", labels_csv,
+                        "--mode", "HEXP:%,live_override",
                         "--ds-calibrate"])
     if rc != 0:
         log(f"[ABORT] build_labels failed: {err[-500:]}")
         return {"ok": False, "stage": "build_labels", "error": err[-500:]}
 
     # 2) 特征（自动带 ds_* DeepSeek 特征 = 路径 C）
-    rc, out, err = run([PY, "quality_features.py", "--out", features_csv, "--mode", "HEXP:%", "--period-align", "m5"])
+    rc, out, err = run([PY, "quality_features.py", "--out", features_csv,
+                        "--mode", "HEXP:%,live_override", "--period-align", "m5"])
     if rc != 0:
         log(f"[ABORT] quality_features failed: {err[-500:]}")
         return {"ok": False, "stage": "quality_features", "error": err[-500:]}

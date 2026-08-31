@@ -32,6 +32,9 @@ import numpy as np
 import pandas as pd
 import psycopg2
 
+# 【TimesFM 特征 2026-08-30】契约单一真值：tmf 列名与训练/推理侧共享
+from _model_feature_cols import TMF_FEATURE_COLS  # noqa: E402
+
 DB_URL_DEFAULT = "postgresql://hcm:hcm_dev_pwd@localhost:5432/hcm_v2"
 
 # 缺省 EMA/布林/Hurst 参数（后续并入 ai.lm.feature.* 配置，禁硬编码）
@@ -51,14 +54,19 @@ MISSING_HEXP = ["hp_score", "hp_strength", "dir_sum", "k", "verdict"]
 
 
 def load_signals(conn, mode: str) -> pd.DataFrame:
+    # 【2026-08-31 扩样本】mode 支持逗号分隔多模式(OR)，单模式行为完全不变(向后兼容)。
+    # 与 build_labels.py 同批改造：HEXP 信号历史仅约 3 周、有效样本不足，
+    # 并入同期的 live_override（indicator_values 口径已验证一致）以扩充训练样本。
+    modes = [m.strip() for m in (mode or "").split(",") if m.strip()] or ["HEXP:%"]
+    _mode_clause = " OR ".join(["s.signal_mode LIKE %s"] * len(modes))
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             SELECT s.signal_id, s.symbol, s.signal_dir, s.entry_price, s.sl_price,
                    s.created_at, s.regime, s.pre_score, s.position_in_range,
                    s.confidence, s.lot, s.indicator_values
             FROM hcm_signal.signals s
-            WHERE s.signal_mode LIKE %s
+            WHERE ({_mode_clause})
               AND s.signal_dir IN ('BUY','SELL')
               AND s.entry_price IS NOT NULL AND s.entry_price > 0
               -- 【2026-08-25 训练集时间窗对齐】仅保留能与 DeepSeek 落库票
@@ -75,7 +83,7 @@ def load_signals(conn, mode: str) -> pd.DataFrame:
               )
             ORDER BY s.created_at
             """,
-            (mode,),
+            tuple(modes),
         )
         cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
@@ -322,8 +330,52 @@ def _nearest_ds(ds_list, ts, window_sec: int = 1800):
     return best if best is not None else (0.0, 0.0, 0.0)
 
 
-def load_env(conn, symbols: list[str]) -> tuple[pd.DataFrame, dict, dict]:
-    """加载事件日历 + 最近宏观/情绪快照。"""
+def load_tmf_features(conn, version: str = "tfm25_pca_v1_sig") -> dict:
+    """加载 TimesFM 离线特征表 hcm_ai.timesfm_features，按 (symbol, bar_time) 精确索引。
+
+    【TimesFM 特征 2026-08-30】与推理侧 quality_scorer.build_features 读同一张表、同口径。
+    特征严格按 bar open_time 对齐(scheduler 用 --at-signal-times 抽取，bar_time 即信号所在
+    M5 bar 的 open_time)，训练侧 _bar['open_time'] 同义 → 精确 join。缺失(调度未覆盖的日期/
+    非 XAUUSD)→ 该 signal 全 0.0，与推理侧缺省一致，保证训练-推理同分布。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT symbol, bar_time, "
+            "tmf_pc00,tmf_pc01,tmf_pc02,tmf_pc03,tmf_pc04,tmf_pc05,tmf_pc06,tmf_pc07,"
+            "tmf_trend_cont,tmf_rev_prob,tmf_vol_cycle,tmf_mtf_resonance,tmf_hist_sim "
+            "FROM hcm_ai.timesfm_features "
+            "WHERE time_frame='M5' AND tmf_version=%s ORDER BY bar_time",
+            (version,),
+        )
+        rows = cur.fetchall()
+    out = {}
+    for r in rows:
+        sym = r[0]
+        bt = _as_naive_utc(r[1])
+        if bt is None:
+            continue
+        vals = {}
+        for c, v in zip(TMF_FEATURE_COLS, r[2:]):
+            vals[c] = float(v) if v is not None else 0.0
+        out.setdefault(sym, {})[bt] = vals
+    return out
+
+
+def _row_tmf(tmf_sym, bar):
+    """返回 tmf_* 13 列：命中则填真实值，未命中(无 bar / 无覆盖)→全 0.0（与推理侧缺省一致）。"""
+    if bar is not None:
+        bt = _as_naive_utc(bar["open_time"])
+        if bt is not None and tmf_sym is not None and bt in tmf_sym:
+            return dict(tmf_sym[bt])
+    return {c: 0.0 for c in TMF_FEATURE_COLS}
+
+
+def load_env(conn, symbols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """加载事件日历 + 最近宏观/情绪/流动性快照。
+
+    【流动性特征 2026-08-30】新增 liquidity_snapshots 表（与 macro/sentiment 同构）。
+    表缺失时优雅降级：liq_df 为空 → 训练侧 liquidity 列全空 → 该特征填 0.0，不阻断训练。
+    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT category, event_date, importance FROM hcm_market.event_calendar "
@@ -333,9 +385,9 @@ def load_env(conn, symbols: list[str]) -> tuple[pd.DataFrame, dict, dict]:
         cur.execute(
             "SELECT category, macro_risk_score, sentiment_risk_score, snapshot_time FROM "
             "(SELECT category, macro_risk_score, NULL::int AS sentiment_risk_score, snapshot_time "
-            " FROM hcm_market.macro_snapshots UNION ALL "
-            " SELECT category, NULL::int, sentiment_risk_score, snapshot_time "
-            " FROM hcm_market.sentiment_snapshots) t ORDER BY snapshot_time",
+             " FROM hcm_market.macro_snapshots UNION ALL "
+             " SELECT category, NULL::int, sentiment_risk_score, snapshot_time "
+             " FROM hcm_market.sentiment_snapshots) t ORDER BY snapshot_time",
         )
         snaps = cur.fetchall()
     ev = pd.DataFrame(events, columns=["category", "event_date", "importance"])
@@ -344,8 +396,29 @@ def load_env(conn, symbols: list[str]) -> tuple[pd.DataFrame, dict, dict]:
     snap_df = pd.DataFrame(snaps, columns=["category", "macro_risk_score", "sentiment_risk_score", "snapshot_time"])
     if not snap_df.empty:
         snap_df["snapshot_time"] = pd.to_datetime(snap_df["snapshot_time"], utc=True)
-    # 每 category 最新宏观/情绪快照索引（在下方按时间就近取）
-    return ev, snap_df, {}
+    # 【流动性特征 2026-08-30】独立查询 liquidity_snapshots（表可能尚未建，try 降级）
+    liq_df = pd.DataFrame(columns=["category", "liquidity_score", "snapshot_time"])
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT category, liquidity_score, snapshot_time "
+                "FROM hcm_market.liquidity_snapshots ORDER BY snapshot_time"
+            )
+            _l = cur.fetchall()
+        liq_df = pd.DataFrame(_l, columns=["category", "liquidity_score", "snapshot_time"])
+        if not liq_df.empty:
+            liq_df["snapshot_time"] = pd.to_datetime(liq_df["snapshot_time"], utc=True)
+            liq_df["liquidity_score"] = pd.to_numeric(liq_df["liquidity_score"], errors="coerce")
+    except Exception as _e:
+        print(f"[warn] liquidity_snapshots 读取失败(表未建?): {_e}", file=sys.stderr)
+        # 【修复 2026-08-30】失败未回滚会使整个连接事务进入中止态，导致后续
+        # load_ds_output / load_tmf_features 的查询全部报 InFailedSqlTransaction。
+        # 已 fetch 的 events/snaps 数据在客户端，回滚不影响它们，仅重置服务端事务。
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+    return ev, snap_df, liq_df
 
 
 def main():
@@ -367,9 +440,12 @@ def main():
             print("[warn] no signals", file=sys.stderr)
             return
 
-        events, snaps, _ = load_env(conn, sorted(set(signals["symbol"].tolist())))
+        events, snaps, liq = load_env(conn, sorted(set(signals["symbol"].tolist())))
         # 【DeepSeek 训练特征增强 2026-08-17】加载 DeepSeek 落库票，与推理侧同构
         ds_by_sym = load_ds_output(conn)
+        # 【TimesFM 特征 2026-08-30】加载 TimesFM 离线特征，按 (symbol, M5 bar_time) 精确索引，
+        # 供下方 per-signal 循环 join（与推理侧 build_features 同表同口径）。
+        tmf_by_sym = load_tmf_features(conn)
 
         # 加载并重算各 symbol M5 指标
         with conn.cursor() as cur:
@@ -448,6 +524,10 @@ def main():
                 _mom = (float(_cl.iloc[idx]) - float(_cl.iloc[max(0, idx - 6)])) if len(_cl) > 6 else 0.0
                 row["close_mom_atr"] = _mom / _atr
                 row["trend_aligned"] = 1.0 if float(_cl.iloc[idx]) >= float(_bar.get("ema20", _cl.iloc[idx])) else 0.0
+            # 【TimesFM 特征 2026-08-30】按 (symbol, M5 bar_time) 精确 join hcm_ai.timesfm_features。
+            # _bar['open_time'] 即该信号所在 M5 bar 的 open_time，与特征表 bar_time 同义(精确对齐)。
+            # 未命中(调度未覆盖的日期/非 XAUUSD)→ 13 列全 0.0，与推理侧缺省同分布。
+            row.update(_row_tmf(tmf_by_sym.get(r["symbol"]), _bar))
             # 环境
             row.update(session_onehot(r["created_at"]))
             row["event_proximity_min"] = None
@@ -479,6 +559,19 @@ def main():
                         _fb2 = _metals[_metals["sentiment_risk_score"].notna()].sort_values("snapshot_time")
                         if not _fb2.empty:
                             row["sentiment_risk_score"] = _fb2.iloc[-1]["sentiment_risk_score"]
+            # 【流动性特征 2026-08-30】注入 liquidity(0~1)，与 macro/sentiment 同口径取 metals 最近快照；
+            # 表未建或该信号早于所有快照 → None → 训练侧 fillna 后该特征恒 0.0（降级，不阻断）。
+            row["liquidity"] = None
+            if not liq.empty:
+                _metals_l = liq[liq["category"] == "metals"]
+                if not _metals_l.empty:
+                    m_l = _metals_l[(_metals_l["snapshot_time"] <= r["created_at"]) & _metals_l["liquidity_score"].notna()]
+                    if not m_l.empty:
+                        row["liquidity"] = float(m_l.iloc[-1]["liquidity_score"])
+                    else:
+                        _fb_l = _metals_l[_metals_l["liquidity_score"].notna()].sort_values("snapshot_time")
+                        if not _fb_l.empty:
+                            row["liquidity"] = float(_fb_l.iloc[-1]["liquidity_score"])
             # 【DeepSeek 训练特征增强 2026-08-17】注入 ds_fake_prob/ds_sl_coeff/ds_continuity
             # 三特征，与推理侧 build_features 缺省(0.0)严格一致；按 signal 时刻近邻匹配落库票。
             _fp, _sl, _cont = _nearest_ds(ds_by_sym.get(r["symbol"], []), r["created_at"])

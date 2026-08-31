@@ -2,10 +2,49 @@
 
 训练侧(train_signal_quality.py)与推理侧(quality_scorer.build_features)必须
 产出完全相同的特征集合与顺序——LightGBM 按列名匹配，但为 fail-fast 与
-可审计，此处固定权威 33 维列表（P2-T8 经 VIF 诊断裁剪 7 个强冗余列），
-双方均从此 import，消除双份数据源。
+可审计，此处固定权威 35 维列表，双方均从此 import，消除双份数据源。
 
 若推理侧 FEATURE_COLS 调整，必须同步修改本文件并由训练侧 reindex 对齐。
+
+──────────────────────────────────────────────────────────────────────
+【2026-08-31 修订·37 维】修正 A1 的误删（重要教训）
+──────────────────────────────────────────────────────────────────────
+A1(53→32 维)的裁剪依据是 `live_baseline.json` 声称"某特征生产恒 0"。
+但事后用推理侧真实装配值 `lm_features`（sidecar 发布到 Redis
+hcm:live:hexp:ai:{sym} 的实际入模特征）交叉验证，发现 **live_baseline 失真**：
+    live_baseline 声称 adx_14=44.8 恒定 → 实际 18.4（有变化）
+    live_baseline 声称 atr_14=4.18 恒定 → 实际 7.49
+    live_baseline 声称 ds_* 恒 0     → 实际 0.62/1.2/45（真实且新鲜）
+    live_baseline 声称 25/39 特征恒定 → 实际 feat_constant_ratio 仅 0.0625(2/32)
+即 A1 据此误删了 7 个**生产实际有真实取值**的特征。
+
+本次修正：
+  - 移除 4 维（均经 lm_features 连续采样复核确为恒定）：
+      r_dist_atr / sl_mult_used
+        推理侧 quality_scorer.py:634 取 snapshot["ai_sl_mult"]，快照无此键 →
+        恒 fallback 2.0；且 :593-594 两者取同一值 _mult（注释自称"冗余对齐"），互为副本。
+      dev_z_ema200 / entry_atr_ratio
+        2026-08-31 追加移除：连续 9 次采样恒定 0.0，推理侧取不到对应数据，
+        入模只引入常数维度与噪声。故 37 维 → 35 维。
+  - 加回 7 维（A1 误删，推理侧均有真实计算逻辑）：
+      dev_z_ema200 / extreme_reversal   quality_scorer.py:591-593 由 enrich_klines 算好
+      trend_aligned                     :621-623  close > EMA20 ? 1 : 0
+      ds_fake_prob / ds_sl_coeff /
+      ds_continuity                     :662-664  读 Redis ai:ds:out:{sym}，实测有票
+      entry_atr_ratio                   :643      (entry - close均值)/atr
+
+  - 暂不加 tmf_* 13 维：表 hcm_ai.timesfm_features 存在且有 1865 行，但最新
+    停在 2026-08-28 23:35（TimesFM 管线停更）→ 按当前 bar_time 查不到 → 恒 0。
+    待 TimesFM 调度器恢复产出后，训练+生产同步加回即可。
+
+【方法论教训（务必记住）】
+  判断"某特征在生产是否真有信息"，判据应是**分位数有无跨度 / 方差是否为零**，
+  而不是"中位数是否等于 0"，更不能依赖 live_baseline 这类可能失真的派生统计。
+  权威做法：直接读 sidecar 发布的 `lm_features`（真实入模值）交叉验证。
+
+回滚锚点：
+  _scratch/_model_feature_cols.py.bak_20260831_a1      (53 维，A1 前)
+  _scratch/_model_feature_cols.py.bak_20260831_32dim   (32 维，A1 后、本次修正前)
 """
 
 MODEL_FEATURE_COLS = [
@@ -29,7 +68,6 @@ MODEL_FEATURE_COLS = [
     "donchian_q",
     "dev_z_ema20",
     "dev_z_ema60",
-    "dev_z_ema200",
     "macd_slope3",
     "body_wick_ratio",
     "extreme_reversal",
@@ -37,27 +75,32 @@ MODEL_FEATURE_COLS = [
     "di_net",
     "close_mom_atr",
     "trend_aligned",
+    # 时段哑变量：分位数 [0,0,0,0,0,0,1,1,1]（约 30% 时间取 1），属有效特征，保留。
     "session_eu",
     "session_us",
+    # 外部因子：生产确有真实取值，保留（与 ds_* 是两套体系）。
     "event_proximity_min",
     "macro_risk_score",
     "sentiment_risk_score",
-    # 【DeepSeek 特征 2026-08-24 纳入契约】ds_* 三列由 quality_features 产出、
-    # 推理侧 build_features 从 Redis ai:ds:out:{sym} 读取；此前只在 _model_feature_cols
-    # 缺失导致 reindex 丢弃、模型从未吸收 ds 语义（ds_diag 永不触发、裁判拿不到
-    # ds_nonzero_ratio）。现纳入 34-36 维，训练 reindex 保留、ds_diag 生效。
-    # 缺省 0.0 语义：与推理侧无 ds 票时恒 0 一致，保证训练-推理同分布。
+    # DeepSeek 票：实测 ai:ds:out:XAUUSD 有真实值(fake_prob/ai_sl_coeff/continuity)，保留。
     "ds_fake_prob",
     "ds_sl_coeff",
     "ds_continuity",
-    # 【阶段 2·方案 A·质量头治本】入场质量特征：质量标签="入场后先触 ±R 哪边"，
-    # 依赖入场点本身优劣（离 stop 远/离 target 近=好入场）。此前 36 维特征全是市场状态指标、
-    # 不含入场位置信息 → 质量头 AUC≈0.48（不可学）。现注入 3 维入场质量因子（推理侧可从
-    # hexp 快照 entry_price/sl_price/atr 取，训练侧从 signals 表取，口径对齐）：
-    #   r_dist_atr     : R/atr（止损距离相对波动率，越大=越难被扫、越易达标）
-    #   sl_mult_used   : 实际 SL 倍数（ai_sl_mult，越大=止损越宽）
-    #   entry_atr_ratio: entry_price/atr（价位相对波动率，量纲无关）
-    "r_dist_atr",
-    "sl_mult_used",
-    "entry_atr_ratio",
+    # 注：dev_z_ema200 / entry_atr_ratio 已于 2026-08-31 移除——
+    # 经 lm_features 连续采样复核，两者在生产恒为 0.0（推理侧取不到对应数据），
+    # 入模只会引入常数维度与噪声。
+]
+
+# 【TimesFM 特征 2026-08-30】独立导出，供 quality_features / quality_scorer 在 join / 注入时
+# 按名遍历，避免与 MODEL_FEATURE_COLS 全表耦合。
+#
+# 【2026-08-31】tmf_* 13 维当前不在 MODEL_FEATURE_COLS：表数据停在 2026-08-28 23:35，
+# 推理侧按当前 bar_time 查不到 → 实际恒 0（与 A1 的判定一致，但原因是"管线停更"而非"无数据源"）。
+# 本列表予以保留：
+#   - quality_features.py / quality_scorer.py 仍 import 它，删除会致 ImportError；
+#   - 推理侧即便查表注入 row，也会被 `for c in FEATURE_COLS` 过滤，不入模；
+#   - 待 TimesFM 调度器恢复产出后，把列名加回 MODEL_FEATURE_COLS 即可（训练+生产同步）。
+TMF_FEATURE_COLS = [
+    "tmf_pc00", "tmf_pc01", "tmf_pc02", "tmf_pc03", "tmf_pc04", "tmf_pc05", "tmf_pc06", "tmf_pc07",
+    "tmf_trend_cont", "tmf_rev_prob", "tmf_vol_cycle", "tmf_mtf_resonance", "tmf_hist_sim",
 ]

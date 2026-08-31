@@ -400,7 +400,9 @@ def build_state_labels(klines_by_sym: dict[str, pd.DataFrame], signals: pd.DataF
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="labels.csv")
-    ap.add_argument("--mode", default="HEXP:%", help="signals.signal_mode LIKE 过滤")
+    ap.add_argument("--mode", default="HEXP:%",
+                    help="signals.signal_mode LIKE 过滤；逗号分隔支持多模式(OR)，"
+                         "如 'HEXP:%,live_override'。单模式行为与旧版完全一致(向后兼容)")
     ap.add_argument("--db-url", default=os.environ.get("DB_URL", DB_URL_DEFAULT))
     ap.add_argument("--r-win", type=float, default=None, help="覆盖 ai.lm.label_r_win")
     ap.add_argument("--r-loss", type=float, default=None, help="覆盖 ai.lm.label_r_loss")
@@ -444,20 +446,26 @@ def main():
             cfg["ai.lm.label_sl_source"] = args.sl_source
         print(f"[cfg] {cfg}", file=sys.stderr)
 
+        # 【2026-08-31 扩样本】--mode 支持逗号分隔多模式(OR)，单模式向后兼容。
+        # 背景：HEXP 信号历史仅约 3 周(864 条)、有效样本 307，不足以稳定训练质量头
+        # （AUC 仅 ~0.49，测试集噪声主导）。live_override(1862 条)与 HEXP 同期且
+        # indicator_values 口径一致(均含 rsi_14/adx_14/macd/atr_14/h1_*)，可安全并入。
+        modes = [m.strip() for m in (args.mode or "").split(",") if m.strip()] or ["HEXP:%"]
+        _mode_clause = " OR ".join(["s.signal_mode LIKE %s"] * len(modes))
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT s.signal_id, s.symbol, s.signal_dir, s.entry_price,
                        s.sl_price, s.created_at,
                        s.indicator_values->>'atr_14' AS atr_14,
                        s.indicator_values->'_collab'->>'ai_sl_mult' AS ai_sl_mult
                 FROM hcm_signal.signals s
-                WHERE s.signal_mode LIKE %s
+                WHERE ({_mode_clause})
                   AND s.signal_dir IN ('BUY','SELL')
                   AND s.entry_price IS NOT NULL AND s.entry_price > 0
                 ORDER BY s.created_at
                 """,
-                (args.mode,),
+                tuple(modes),
             )
             cols = [d[0] for d in cur.description]
             rows = cur.fetchall()
