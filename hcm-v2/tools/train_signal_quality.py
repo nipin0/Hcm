@@ -240,6 +240,10 @@ def main():
     X, y, created = prepare(df)
     order = np.argsort(created.values)
     X, y = X.iloc[order].reset_index(drop=True), y[order]
+    # 【对齐修复 2026-09-01】prepare() 内部已按 label.notna() 过滤并 reset_index，
+    # 方向头/买点头标签若仍从完整 df 取会行错位 → 标签配错特征行 → 方向头塌缩恒 BUY。
+    # 用与 prepare 相同的 label.notna() 过滤取标签列，保证与 X(order 重排后) 严格对齐。
+    df_valid = df[df["label"].notna()].reset_index(drop=True)
 
     # 【设计文档 1.3 标签校准】若 labels.csv 含 ds_calib_weight 列（build_labels --ds-calibrate
     # 产出），作为质量头训练的样本权重（强化 DeepSeek 看对、弱化疑似噪声样本）。
@@ -284,7 +288,7 @@ def main():
 
     # ── 多任务状态头：先用 state_label 训一个多分类器（让模型"看见"状态）──
     # state_label 来自 build_labels 的 KMeans 自动聚类（无人工阈值），只用入场窗口历史，无未来泄露。
-    state_col = df["state_label"].iloc[order].reset_index(drop=True)
+    state_col = df_valid["state_label"].iloc[order].reset_index(drop=True)
     state_mask = state_col.notna()
     if state_mask.sum() >= 50:
         Xs = X[state_mask]
@@ -318,7 +322,7 @@ def main():
     _ver = _model_version_from_path(getattr(args, "model", None))
     _heads_dir = (os.path.dirname(os.path.abspath(args.model))
                   if getattr(args, "model", None) else args.outdir)
-    dir_col = df["dir_label"].iloc[order].reset_index(drop=True) if "dir_label" in df.columns else None
+    dir_col = df_valid["dir_label"].iloc[order].reset_index(drop=True) if "dir_label" in df_valid.columns else None
     if dir_col is not None and dir_col.notna().sum() >= 50:
         Xd = X[dir_col.notna()]
         yd = dir_col[dir_col.notna()].astype(int)
@@ -369,7 +373,7 @@ def main():
         print("[direction_head] dir_label 样本不足，跳过方向头训练")
 
     # ── 阶段 0·买点头 entry_head（2 类，条件于 dir_label 方向的 R 触达，学习驱动点位）──
-    entry_col = df["entry_label"].iloc[order].reset_index(drop=True) if "entry_label" in df.columns else None
+    entry_col = df_valid["entry_label"].iloc[order].reset_index(drop=True) if "entry_label" in df_valid.columns else None
     if entry_col is not None and entry_col.notna().sum() >= 50:
         Xe = X[entry_col.notna()]
         ye = entry_col[entry_col.notna()].astype(int)
@@ -552,10 +556,19 @@ def main():
     else:
         _save_model = model.booster_
         _save_calib = iso
-    _save_model.save_model(os.path.join(args.outdir, args.model))
-    with open(os.path.join(args.outdir, args.calib), "wb") as f:
+    # 【路径修复 2026-09-01】args.model/args.calib 可能自带目录（auto_retrain 传
+    # models/lgbm_quality_vN.txt + _artifacts/calib_vN.pkl），原 join(outdir, model)
+    # 会重复拼成 _artifacts/models/... 导致质量头保存失败、质量头长期停留在旧版本。
+    # 现按 自带目录用原路径、否则落 outdir 解析。
+    def _resolve_out(p, outdir):
+        return p if os.path.dirname(p) else os.path.join(outdir, p)
+
+    _m_path = _resolve_out(args.model, args.outdir)
+    _c_path = _resolve_out(args.calib, args.outdir)
+    _save_model.save_model(_m_path)
+    with open(_c_path, "wb") as f:
         pickle.dump(_save_calib, f)
-    print(f"[saved] {args.outdir}/{args.model} + {args.outdir}/{args.calib}")
+    print(f"[saved] {_m_path} + {_c_path}")
     # 导出特征基准分布（供推理侧 PSI 漂移检测 / 离群检测对比）
     try:
         import json as _json
