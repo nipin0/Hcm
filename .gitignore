@@ -50,7 +50,29 @@ disp*.txt
 risk_*.txt
 _scratch/
 *.bak_*
+*.pre_dh_*
 铁律.md
 docs/hexp_direction
 hcm-v2/hcm-web/web/api/*.bak_*
 hcm-v2/shared/*.bak_*
+
+# ===== runtime logs / launcher outputs (never commit) =====
+hcm-v2/hcm-signal-tower/_st_run.log*
+hcm-v2/hcm-web/frontend/_cp_err.txt
+hcm-v2/tools/ai_stack_guard.log*
+hcm-v2/tools/models/quality_scorer.log*
+
+# ===== one-off local debug / session scratch =====
+hcm-v2/tools/_dbg_*.py
+hcm-v2/tools/_logs/
+hcm-v2/tools/_t_redis_fn.ps1
+hcm-v2/tools/_tmf_retrain_done.flag
+
+# ===== runtime model/calib artifacts (shadow-elected, not versioned) =====
+hcm-v2/tools/calib_*.pkl
+hcm-v2/tools/models/*.txt
+hcm-v2/tools/models/*.csv
+hcm-v2/tools/models/*.npz
+hcm-v2/tools/models/*_bak.json
+hcm-v2/tools/models/*_meta.json
+hcm-v2/tools/models/snapshots/

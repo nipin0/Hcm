@@ -812,29 +812,45 @@ def build_confluence_zones(
     within `cluster_mult × atr` of it. Only zones with strength >= min_strength
     are returned (deduped by proximity, strongest kept).
     """
+    # 【2026-09-01 结论：保持 PIVOT 标签不变，改为在下游用「相对位置」判方向】
+    # 曾尝试按真实语义拆分(R1-R3→RESISTANCE / S1-S3→SUPPORT)，实测造成严重回归：
+    # zone 产出从 ~68% 直接归零（PIVOT/ROUND/SUPPORT/SESSION/RESISTANCE 全部消失），
+    # 因 strength 按「标签」去重，拆分后枢轴阻力与分形阻力合并计 1 层 → 普降 1 层，
+    # 大量位置卡在 min_strength 之外。
+    # 正确解法是：① strength 改按「来源」去重（见下方，与标签解耦）；
+    #           ② 方向判定改由下游按「结构位相对现价」决定（hexp_engine 评分段），
+    #              不再依赖 ztype 标签，整数关口 ROUND 亦自动生效。
+    # 二者叠加后 zone 产出与改造前一致，且方向语义更稳健，故标签维持原状。
     pmap = {
         "PP": "PIVOT", "R1": "PIVOT", "S1": "PIVOT",
         "R2": "PIVOT", "S2": "PIVOT", "R3": "PIVOT", "S3": "PIVOT",
     }
+    # 【2026-09-01 修正·按「来源」而非「标签」计共振】
+    # 候选统一为 (level, ztype, source)。strength = 汇聚的【不同来源】数量：
+    #   PIVOT=枢轴 / SR=分形摆动 / ROUND=整数关口 / SESSION=前日高低
+    # 原因：pmap 语义拆分后(R1-R3→RESISTANCE)，枢轴阻力与分形阻力标签相同，若仍按
+    # 标签去重则两者合并计 1 层 → strength 普降 1 → 实测 zone 产出几乎归零
+    # (PIVOT/ROUND/SUPPORT/SESSION/RESISTANCE 全部消失)。共振的真实含义是
+    # 「不同来源指向同一价位」，故应按 source 去重。
     candidates: list = []
     for k, v in (pivots or {}).items():
         if k in pmap:
-            candidates.append((float(v), pmap[k]))
-    candidates += list(sr_zones or [])
-    candidates += list(round_levels or [])
-    candidates += list(session_hl or [])
+            candidates.append((float(v), pmap[k], "PIVOT"))
+    candidates += [(float(l), str(t), "SR") for (l, t) in (sr_zones or [])]
+    candidates += [(float(l), str(t), "ROUND") for (l, t) in (round_levels or [])]
+    candidates += [(float(l), str(t), "SESSION") for (l, t) in (session_hl or [])]
     if not candidates:
         return []
 
     tol = max(cluster_mult * atr, 1.0) if atr and atr > 0 else 1.0
     raw: list = []
-    for i, (lvl, typ) in enumerate(candidates):
-        near = {typ}
-        for j, (lvl2, typ2) in enumerate(candidates):
+    for i, (lvl, typ, src) in enumerate(candidates):
+        near = {src}
+        for j, (lvl2, typ2, src2) in enumerate(candidates):
             if i == j:
                 continue
             if abs(lvl2 - lvl) <= tol:
-                near.add(typ2)
+                near.add(src2)
         strength = len(near)
         if strength >= min_strength:
             raw.append(Zone(level=lvl, ztype=typ, strength=strength))

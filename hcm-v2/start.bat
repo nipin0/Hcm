@@ -1,4 +1,4 @@
-﻿@echo off
+@echo off
 chcp 65001 >nul
 setlocal enabledelayedexpansion
 title HCM v2 一键启动

@@ -204,6 +204,18 @@ _DEFAULTS: dict[str, Any] = {
     # 低于此级的信号仍完整落库供观测/影子对照，但不产生交易方向（direction=NO_TRADE），
     # 根治「C 级(45~60分)低质量信号占比 75% 全部下单」导致的信号泛滥。
     "hexp.min_grade": "C",
+    # 【2026-09-01 regime 门槛】按市况提高 min_grade：逗号分隔 "regime:grade"，
+    # 如 "RANGE:A,NEUTRAL:A"。命中当前 regime_tag 时用该档覆盖全局 hexp.min_grade，
+    # 使震荡/中性市（双向易被扫，昨日尾盘实证）更挑剔；趋势市维持全局门槛。
+    # 空串=不覆盖（零回归）。
+    "hexp.regime_min_grade": "",
+    # 【2026-09-01 AI 方向头快翻·选项B】dir_lm(方向头)更贴合实时行情，而 hexp 方向
+    # 翻转滞后（MTF+迟滞）导致"高位追多/低位追空"。dir_lm 明确(prob≥flip_prob)且与
+    # hexp 当前方向反向、连续 flip_bars 次确认 → 强制 hexp 翻向 dir_lm（类比 MTF
+    # momentum flip）。默认关(False)，先观测后启用。
+    "hexp.dir_lm_flip_enabled": False,
+    "hexp.dir_lm_flip_prob": 0.65,
+    "hexp.dir_lm_flip_bars": 2,
     # B' 延伸（2026-08-17）：逆风/回踩单综合评分(total)额外下压系数。
     # 1.0 = 不额外罚（维持既有仅折扣 hp_100 行为，向后兼容）；
     # <1.0 = 逆风时 total 乘性下压，使 grade 更难达 min_grade 闸门——仅降分不硬封，
@@ -212,7 +224,7 @@ _DEFAULTS: dict[str, Any] = {
     # 极值动量感知闸门（2026-08-13 升级·替换无条件硬封）：
     # 价格相对 Donchian 通道分位触及极值时，仅当「微动量 f_mm 回撤」才封 NO_TRADE；
     # mm 仍朝原方向则允许极值追单（可能扫损，由减少止损方案另议，本次未做）。
-    "hexp.extreme.high_pct": 0.85,
+    "hexp.extreme.high_pct": 0.92,
     "hexp.extreme.low_pct": 0.15,
     "hexp.extreme.donchian_look": 20,
     # 极值区封单条件：仅当 mm 动量相对方向的同向分量 < mm_retreat_min 才封。
@@ -282,6 +294,15 @@ _DEFAULTS: dict[str, Any] = {
     "hexp.momentum_flip_trend_enabled": True,   # 趋势单保护总开关；False→退回纯动量否决(旧行为)
     "hexp.momentum_flip_trend_adx": 25.0,       # 辅助判据：主周期 ADX≥此视为强趋势(ADX>25 标准强趋势线)
     "hexp.momentum_flip_trend_mm": 0.15,        # 顺势趋势单放宽反向阈值：|mm|≥此(剧烈反向)才拦
+    # 【2026-09-01 方案B·趋势保护判据根治】原辅助判据仅凭「ADX≥trend_adx + ma 方向一致」
+    # 即放宽到 flip_trend_mm；但 ADX 只衡量趋势强度、不辨方向且滞后，ma 是滞后均线，
+    # 导致主周期 RANGE（本就处于震荡/反弹）时仍被判"顺势趋势单"而放宽 → 反弹中追空被
+    # 放行（实证 2026-09-01 10:15 SELL@4381.31 开在 M5 四连阳反弹高点，当时 mm=+0.09、
+    # pstate=M5=RANGE 却因 ADX=54+ma 空头而放宽到 0.15 未拦）。
+    # 现要求：辅助判据生效需主周期非 RANGE；主周期 RANGE → 回退基础 flip_mm，敏捷拦
+    # 逆动量追单（配合方案D 挂起等待，而非市价追顶/追底）。
+    # False→退回旧行为（RANGE 中也可能放宽），用于紧急回退。
+    "hexp.momentum_flip_trend_require_trend_state": True,
     # 【2026-08-26 P0-2 震荡市均值回归校验】NEUTRAL/RANGE 市(hurst<0.5 均值回归态)中，
     # 高位(Donchian 分位接近极值)顺势追单易被均值回归反打（实证 sig=388640598 BUY@4666.08
     # pos=0.846 hurst=0.449 regime=NEUTRAL 高位追多被止损）。震荡市应等回撤/极值反向，
@@ -305,6 +326,20 @@ _DEFAULTS: dict[str, Any] = {
     # 避免把"回调中动量暂歇"误判成"极值位反转接刀"（假候选偏多）。以下两开关可热调。
     "hexp.reverse_candidate_wick_enabled": True,   # 长影线确认：顶部需长上影/底部需长下影才产候选
     "hexp.reverse_candidate_er_enabled": True,     # 效率比枯竭确认：er<阈值(同 drain_er)才产候选
+    # 周期位置硬守护·豁免键（2026-09-02 P0 补录）：hexp.cycle.* 此前未列入 _DEFAULTS，
+    # 引擎用 cfg.get(...,True) 硬编码默认，面板/配置中心改值不生效。现补入使双写一致、可热调。
+    "hexp.cycle.trend_exempt": True,       # 主周期顺势时低位禁空/高位禁多不再硬封
+    "hexp.cycle.mm_confirm_enabled": True, # 低位空/高位多豁免额外要求微动量未反向(真接刀→硬封)
+    "hexp.cycle.be_exempt": True,          # P0：保本不再单独豁免低位禁空，须叠加动量未反向
+    # P1-1（2026-09-02）：超卖做空/超买做多 → 评级封顶，禁止极值追单拿高评级
+    "hexp.rsi_guard_enabled": True,
+    "hexp.rsi_guard_oversold": 30.0,
+    "hexp.rsi_guard_overbought": 70.0,
+    "hexp.rsi_guard_max_grade": "C",
+    # P1-2（2026-09-02）：live_override 禁止在已大幅单边延伸后追单
+    "hexp.live_extend_guard_enabled": True,
+    "hexp.live_extend_bars": 6,
+    "hexp.live_extend_atr": 1.5,
 }
 
 # 分级序：用于 hexp.min_grade 门槛比较（RED 恒不可交易）
@@ -492,6 +527,16 @@ class HexpEngine:
         # 2026-08-27 方向迟滞死区状态（每 symbol 独立）：消除 dir_sum 在 0 附近跨阈值
         # 翻转导致的 direction 闪烁（BUY/SELL/NO_TRADE 频繁跳）。
         self._dir_hyst_state: dict[str, str] = {}
+        # 2026-09-01 AI 方向头快翻连续确认计数（每 symbol 独立）：dir_lm 与 hexp 反向
+        # 且高置信时连续 flip_bars 次才翻向，防瞬断误翻。
+        self._ai_flip_cnt: dict[str, int] = {}
+        # ── 2026-09-01 抢跑态(Front-Run)跟踪（每 symbol 独立）──
+        # dir_lm 高置信翻向后，在 TTL 窗口内维持「快变量已确认」状态，供下游
+        # _trend_follow / _in_trend_dir 两处豁免判据采用快变量口径，绕开 H1 状态机摇摆。
+        # 与 _reversal_until 同构：用绝对时间戳而非计数器（produce 既被 symbol_loop
+        # 按棒调用、也被 live 每 3s 调用，计数器会随调用频率漂移）。
+        self._frontrun_until: dict[str, float] = {}   # 抢跑态到期时间戳（epoch 秒）
+        self._frontrun_dir: dict[str, str] = {}       # 抢跑态锁定方向
 
     # ─────────────────────── 配置读取（零硬编码）───────────────────────
     async def _get(self, key: str) -> Any:
@@ -997,6 +1042,8 @@ class HexpEngine:
         zone_level: float = 0.0,
         zone_type: str = "",
         zone_strength: int = 0,
+        ai_direction: Optional[str] = None,
+        ai_dir_prob: Optional[float] = None,
     ) -> ScoreResult:
         """和乘幂完整信号管线。返回与下游兼容的 ScoreResult（附加 hexp 元数据）。"""
         cfg = await self._load()
@@ -1298,6 +1345,59 @@ class HexpEngine:
         self._dir_hyst_state[symbol] = cand
         direction = cand
 
+        # ── 【2026-09-01 AI 方向头快翻·选项B】──
+        # dir_lm(LightGBM 方向头) 更贴合实时行情；当它明确(prob≥flip_prob)且与 hexp
+        # 当前方向反向、连续 flip_bars 次确认时，强制 hexp 翻向 dir_lm（类比 MTF
+        # momentum flip），根治"hexp 滞后→高位追多/低位追空"。灰度默认关(False)，
+        # 先观测后启用；翻向后继续走后续极值护栏/grade 闸门。
+        _flip_en = bool(cfg.get("hexp.dir_lm_flip_enabled", False))
+        if _flip_en and direction in ("BUY", "SELL") and ai_direction in ("BUY", "SELL"):
+            _flip_prob = float(cfg.get("hexp.dir_lm_flip_prob", 0.65))
+            _flip_bars = max(1, int(cfg.get("hexp.dir_lm_flip_bars", 2)))
+            if ai_direction != direction and (ai_dir_prob or 0.0) >= _flip_prob:
+                _cnt = self._ai_flip_cnt.get(symbol, 0) + 1
+                self._ai_flip_cnt[symbol] = _cnt
+                if _cnt >= _flip_bars:
+                    logger.info(
+                        "hexp %s %s | AI dir-head FLIP %s→%s (dir_prob=%.2f cnt=%d)",
+                        symbol, primary, direction, ai_direction, ai_dir_prob, _cnt)
+                    direction = ai_direction
+                    cand = ai_direction
+                    # 【Step1 锁向】必须回写迟滞状态：上方迟滞段已在 FLIP 之前写入旧方向，
+                    # 此处不覆盖则下一棒迟滞比较仍以旧方向为基准 → FLIP 只存活 1 棒即被弹回
+                    # （实证 02:45:12 翻 SELL→BUY，02:46 起却又 BLOCK dir=SELL）。
+                    self._dir_hyst_state[symbol] = cand
+                    # 【Step2 抢跑态】dir_lm 已确认新方向 → 开 TTL 窗口（仅记录，不改裁决）
+                    self._frontrun_until[symbol] = time.time() + float(
+                        cfg.get("hexp.frontrun.ttl_sec", 900.0))
+                    self._frontrun_dir[symbol] = ai_direction
+                    logger.info(
+                        "hexp %s %s | FRONTRUN set dir=%s (dir_lm confirmed, Step2 observe-only)",
+                        symbol, primary, ai_direction)
+                    self._ai_flip_cnt.pop(symbol, None)
+            else:
+                self._ai_flip_cnt.pop(symbol, None)
+
+        # ── 【2026-09-01 抢跑态·Step 2 观测（零风险：仅落库+日志，不改裁决）】──
+        # 抢跑态 = dir_lm 高置信翻向后维持的「快变量已确认」窗口，与 _reversal_until 同构
+        # （时间戳制 / per-symbol / 自动过期，不锁死）。用途：让下游 _trend_follow 与
+        # _in_trend_dir 两处【既有】豁免判据可采用快变量口径，绕开 H1 状态机摇摆。
+        # Step 3 才把 frontrun_aligned 注入这两处（届时由 hexp.frontrun.exempt_enabled 控制）。
+        _fr_until = float(self._frontrun_until.get(symbol, 0.0))
+        _fr_active = _fr_until > time.time()
+        if not _fr_active and _fr_until:
+            self._frontrun_until.pop(symbol, None)   # 过期清理，避免长跑内存增长
+            self._frontrun_dir.pop(symbol, None)
+        _fr_dir = self._frontrun_dir.get(symbol, "") if _fr_active else ""
+        sr.frontrun_active = _fr_active
+        sr.frontrun_dir = _fr_dir
+        sr.frontrun_aligned = bool(
+            _fr_active and _fr_dir in ("BUY", "SELL") and direction == _fr_dir)
+        if _fr_active:
+            logger.info(
+                "hexp %s %s | FRONTRUN active dir=%s aligned=%s left=%.0fs (Step2 observe-only)",
+                symbol, primary, _fr_dir, sr.frontrun_aligned, _fr_until - time.time())
+
         # 6) 多周期共振裁决（M5 主执行周期权重=0，不自我裁决）
         # 2026-08-28：MTF 加权共识直接进方向裁决（不止于调分，见下方方向闸）。
         # 先算 verdict（含 M30/H1/H4/D1 按 weight_* 加权），供方向闸与评分段共用。
@@ -1390,6 +1490,32 @@ class HexpEngine:
                 if _pb < 1.0:
                     _pending_pullback_mult = _pb
         self._pending_pullback_mult = _pending_pullback_mult
+        # ── 【2026-09-02 方案1·分级处理】强共振逆风硬拦 ──
+        # 背景：08-10 方案B 把"逆风硬封"改为仅降分(penalty)，但线性折扣在单边趋势中力度
+        # 不足——实证 2026-09-01：10 笔逆势 BUY 的 verdict 全为 -1.0（多周期强共振向下
+        # 却做多），penalty=0.3 只降分 21~27% 仍过闸，结果 -72.06、胜率 30%、盈亏比 1:8。
+        # 逆势风险随共振强度非线性放大，故改为分级处理：
+        #   |verdict| >= counter_block_threshold 且方向与共振相反 → 硬拦 NO_TRADE
+        #   |verdict| <  阈值（弱共振/震荡/反转初期）            → 维持降分，保留柔性
+        # 阈值 0.5 由昨日实测标定（逆势 BUY 的 |verdict|=1.0；顺势单多为同向，不受影响）。
+        # 阈值 <=0 表示关闭硬拦、退回纯降分，可热回退。
+        _cb_th = float(cfg.get("hexp.resonance.counter_block_threshold", 0.5))
+        if (sig_dir != 0 and _cb_th > 0 and abs(verdict) >= _cb_th
+                and (verdict > 0) != (sig_dir > 0)):
+            _cb_dir = "BUY" if sig_dir > 0 else "SELL"
+            direction = "NO_TRADE"
+            passed = False
+            sr.threshold_passed = False
+            sr.direction = "NO_TRADE"
+            sr.resonance_counter_blocked = True
+            if not sr.fallback_reason:
+                sr.fallback_reason = (
+                    f"hexp_resonance_counter_block(verdict={verdict:.2f} "
+                    f"dir={_cb_dir} th={_cb_th:.2f})")
+            logger.info(
+                "hexp %s %s | BLOCK hexp_resonance_counter_block"
+                "(verdict=%.2f dir=%s th=%.2f) (强共振逆风 → 硬拦)",
+                symbol, primary, verdict, _cb_dir, _cb_th)
         # 2026-08-26 修复：HP-Score 物理上限封顶 [0,100]。
         # tailwind_bonus（顺风共振加成，124行默认0=不虚涨）若被热配成 >0，
         # hp_100 会突破 100 且污染 state 维（权重27%）致 total 虚高、面板显示 100+。
@@ -1465,10 +1591,19 @@ class HexpEngine:
         if (cfg.get("hexp.zone.grade_align_enabled", True)
                 and zone_type and zone_level and zone_strength > 0
                 and direction in ("BUY", "SELL")):
-            _zdir = "SELL" if zone_type in ("PIVOT", "RESISTANCE") else "BUY"
+            _z_close = float(period_data[primary]["close"])
+            _z_level = float(zone_level)
+            # 【2026-09-01 修正·改造2】方向性改由「结构位相对现价的位置」判定，而非 ztype 标签：
+            #   level > 现价 = 上方阻力(利 SELL)；level < 现价 = 下方支撑(利 BUY)。
+            # 原实现按 ztype 映射(PIVOT/RESISTANCE→SELL，其余含 ROUND→BUY)，在 PIVOT 未细分
+            # 与整数关口未纳入时系统性判错方向 —— 而 4450 这类关口恰是黄金最强的结构位。
+            _zdir = "SELL" if _z_level > _z_close else ("BUY" if _z_level < _z_close else "")
+            _z_dist_atr = (abs(_z_level - _z_close) / atr) if atr > 0 else 99.0
+            sr.zone_dir = _zdir
+            sr.zone_dist_atr = round(float(_z_dist_atr), 3)
+            sr.zone_aligned = bool(_zdir and _zdir == direction)
             if _zdir == direction:
-                _z_close = float(period_data[primary]["close"])
-                _prox = max(0.0, 1.0 - min(1.0, abs(_z_close - zone_level) / (atr * 3.0)))
+                _prox = max(0.0, 1.0 - min(1.0, _z_dist_atr / 3.0))
                 _zone_bonus = float(cfg.get("hexp.zone.grade_bonus", 2.0)) * float(zone_strength) * _prox
                 # 低位启动放大（2026-08-27 修复"低位分不够不下单"）：RSI 处于低位超卖区时，
                 # 结构位对齐的顺势信号更可能是趋势启动而非追高，额外加分让其达 min_grade。
@@ -1477,10 +1612,44 @@ class HexpEngine:
                 if _rsi < _rsi_launch_low:
                     _zone_bonus += _lowpos_bonus * float(zone_strength) * _prox
                 total += _zone_bonus
+            elif _zdir:
+                # 【改造 2·双向化】逆结构 → 按同口径(强度×近度)扣分。
+                # 原实现此处什么都不做，使"阻力位追多 / 支撑位追空"与顺结构单待遇完全相同
+                # —— 实测成交 BUY 中 71% 位于 pos>0.7 高位、live_override 路径占 76%，
+                # 主因即此。默认关闭(penalty_enabled=False)，观测确认后再开启。
+                if bool(cfg.get("hexp.zone.penalty_enabled", False)):
+                    _prox = max(0.0, 1.0 - min(1.0, _z_dist_atr / 3.0))
+                    total -= (float(cfg.get("hexp.zone.grade_penalty", 2.0))
+                              * float(zone_strength) * _prox)
         # ── grade 迟滞裁决（升档用 +gap 边界、降档用 -gap 边界，连续 confirm_bars 确认）──
         _gap = float(cfg.get("hexp.score.hyst_gap", 2.5))
         _cbars = int(cfg.get("hexp.score.hyst_confirm_bars", 2))
         grade = self._resolve_grade_hyst(symbol, total, hp_100, _gap, _cbars)
+
+        # ── P1-1（2026-09-02）：超卖做空 / 超买做多 → 评级封顶 ──────────────
+        # 实证：2026-09-02 两笔最大亏损单（SELL -20.16 / -22.22）信号快照均为
+        #   grade="S"、hp_score 93.6~100（最高确信度），而 rsi 分别为 26.01 / 34.49，
+        #   即在【超卖区】给出最高确信度的空单，随后价格反转打满止损。
+        # 根因：滞后型因子(adx/ma/dir_sum)在拐点处最强，使极值追单反而拿最高评级。
+        # 措施：逆 RSI 方向时把评级压到 hexp.rsi_guard_max_grade（默认 C）。
+        #   当前 hexp.min_grade=B，故 C < B → 直接被 step9 拦下（不给 S 级去追）。
+        #   想"降档但放行"把该键设为 B；想完全硬封设为 RED；关闭用 rsi_guard_enabled=false。
+        sr.rsi_guard_applied = False   # 始终赋值，避免无方向时字段缺失
+        if bool(cfg.get("hexp.rsi_guard_enabled", True)) and direction in ("BUY", "SELL"):
+            _rsi_os = float(cfg.get("hexp.rsi_guard_oversold", 30.0))
+            _rsi_ob = float(cfg.get("hexp.rsi_guard_overbought", 70.0))
+            _rsi_cap = str(cfg.get("hexp.rsi_guard_max_grade", "C")).strip().upper()
+            _rsi_cap_rank = _GRADE_RANK.get(_rsi_cap, 1)
+            _rsi_counter = ((direction == "SELL" and float(_rsi) < _rsi_os)
+                            or (direction == "BUY" and float(_rsi) > _rsi_ob))
+            sr.rsi_guard_applied = bool(_rsi_counter)
+            if _rsi_counter and _GRADE_RANK.get(grade, 0) > _rsi_cap_rank:
+                logger.info(
+                    "hexp %s %s | RSI GUARD cap dir=%s rsi=%.2f grade %s→%s "
+                    "(超卖做空/超买做多，禁止极值追单拿高评级)",
+                    symbol, primary, direction, float(_rsi), grade, _rsi_cap)
+                grade = _rsi_cap
+
         # 2026-08-27 方案A：移除 hp_floor 对 grade/passed 的强制干预。
         # 原逻辑 hp_100<floor(默认30)→grade="RED"，经 step9(_grade_ok)间接拦单，
         # 属"强度单维(hp_score)绕过 6 维综合闸门"，与"放行严格回到 scorecard_total"冲突。
@@ -1512,6 +1681,17 @@ class HexpEngine:
         # 低于门槛的信号照常落库（grade/hp/评分卡元数据齐全）供观测与影子对照，
         # 但 direction=NO_TRADE 不进下单链路 —— 这是「少而准」的核心开关。
         _min_grade = str(cfg.get("hexp.min_grade") or "C").strip().upper()
+        # 【2026-09-01 regime 门槛】震荡/中性市提高 min_grade（昨日尾盘 RANGE 双向被扫）。
+        # 配置 hexp.regime_min_grade：逗号分隔 "regime:grade"，如 "RANGE:A,NEUTRAL:A"。
+        # 命中当前 regime_tag 时覆盖全局门槛；空串=不覆盖。
+        _regime_floor_cfg = str(cfg.get("hexp.regime_min_grade") or "").strip()
+        if _regime_floor_cfg:
+            for _pair in _regime_floor_cfg.split(","):
+                if ":" in _pair:
+                    _rg, _grd = _pair.split(":", 1)
+                    if _rg.strip().upper() == regime_tag:
+                        _min_grade = _grd.strip().upper()
+                        break
         _min_rank = _GRADE_RANK.get(_min_grade, 1)
         if _min_rank < 1:
             _min_rank = 1  # RED 永不可交易，门槛下限锁在 C
@@ -1587,26 +1767,120 @@ class HexpEngine:
                 _sym_be_ok = (_be_flag is not None and str(_be_flag).strip() == "1")
             except Exception:
                 _sym_be_ok = False
+        # ── 【2026-09-01 庚方案 Step1·微动量反向确认接入裁决（默认开 hexp.cycle.mm_confirm_enabled）】──
+        # 依据 _scratch/ts_conflict.py 回测：cycle_pos_guard 拦掉 45% 趋势启动信号，
+        # 被拦胜率 62.9% vs 保留 61.5% → 零质量增益。根因：pos_cycle<0.15/>0.85 是
+        # 趋势中的必然特征（创新低 ⟹ pos_cycle 极低），单因子硬封系统性误伤顺势单。
+        # 庚方案：位置极值豁免(趋势顺势放行)应追加「微动量尚未反向」确认（与 momentum_flip
+        # 同口径 flip_mm），语义 = 「位置极值 + 动量已反向」才构成真接刀/摸顶风险，须硬封；
+        # 「位置极值但动量仍顺势」是趋势延续的自然特征，应放行。
+        # Step1 落地：下方「周期位置硬守护」决策段读取 hexp.cycle.mm_confirm_enabled，
+        # 在趋势顺势豁免上额外要求 _mm_against=False；mm_confirm_enabled=False 退回旧行为。
+        # 此处仅算不用→写入 sr.* 供观测，并使用同一口径 flip_mm 计算 _mm_against_obs。
+        _obs_flip_mm = float(cfg.get("hexp.momentum_flip_mm", 0.04))
+        _obs_dir_sign = 1.0 if direction == "BUY" else (-1.0 if direction == "SELL" else 0.0)
+        _mm_aligned_obs = _obs_dir_sign * float(f_mm_s)
+        _mm_against_obs = ((direction == "BUY" and f_mm_s < -_obs_flip_mm)
+                           or (direction == "SELL" and f_mm_s > _obs_flip_mm))
+        sr.cycle_mm_aligned = round(float(_mm_aligned_obs), 4)
+        sr.cycle_mm_against = bool(_mm_against_obs)
+        # 影子判定：命中位置极值但动量未明确反向 → 庚方案下应改降档放行（非硬封）
+        sr.cycle_pos_pending = bool(_cycle_blocked and not _mm_against_obs)
         if _cycle_blocked:
-            if _sym_be_ok:
+            logger.info(
+                "hexp %s %s | CYCLE_POS observe dir=%s pos_cycle=%.2f pos_z=%.2f "
+                "mm=%.4f aligned=%.4f against=%s pending=%s (庚Step1观测; 决策见周期位置硬守护段)",
+                symbol, primary, direction, _pos_cycle, _pos_z, float(f_mm_s),
+                _mm_aligned_obs, _mm_against_obs, sr.cycle_pos_pending)
+        # ── 【2026-09-01 改造 3·逆结构硬约束（默认关 hexp.zone.block_enabled）】──
+        # 贴脸逆结构下单：BUY 而上方近处有强阻力 / SELL 而下方近处有强支撑。
+        # 与 cycle_pos_guard 互补 —— 后者用「统计分位 pos_cycle」，在趋势中会被拉宽
+        # 的通道稀释；本护栏用「绝对结构水平」(S/R + 枢轴 + 整数关口 + 会话共振)，
+        # 不滞后、不因趋势失真、不随状态机摇摆，是真正的「位置先行」判据。
+        # 方向沿用相对位置口径(level>现价=阻力 / level<现价=支撑)，不依赖 ztype 标签，
+        # 故整数关口 ROUND 自动生效（4450 这类关口对黄金是最强结构之一）。
+        # 此处独立重算而不复用评分段变量：zone_level 为空时那些变量未定义。
+        if bool(cfg.get("hexp.zone.block_enabled", False)) and direction in ("BUY", "SELL"):
+            _zb_level = float(zone_level or 0.0)
+            _zb_close = float(period_data[primary]["close"])
+            _zb_strength = float(zone_strength or 0)
+            if _zb_level > 0 and _zb_strength > 0:
+                _zb_dir = ("SELL" if _zb_level > _zb_close
+                           else ("BUY" if _zb_level < _zb_close else ""))
+                _zb_dist = (abs(_zb_level - _zb_close) / atr
+                            if atr > 0 else 99.0)
+                if (_zb_dir and _zb_dir != direction
+                        and _zb_strength >= float(cfg.get("hexp.zone.block_min_strength", 3.0))
+                        and _zb_dist < float(cfg.get("hexp.zone.block_atr", 0.8))):
+                    _zone_block = (f"hexp_zone_guard(dir={direction} vs {zone_type}"
+                                   f"@{_zb_level:.2f} dist={_zb_dist:.2f}atr"
+                                   f" strength={int(_zb_strength)})")
+                    logger.info("hexp %s %s | BLOCK %s dir=%s (逆结构: 贴脸强%s)",
+                                symbol, primary, _zone_block, direction,
+                                "阻力追多" if direction == "BUY" else "支撑追空")
+                    direction = "NO_TRADE"
+                    passed = False
+                    sr.threshold_passed = False
+                    sr.direction = "NO_TRADE"
+                    sr.zone_blocked = True
+                    if not sr.fallback_reason:
+                        sr.fallback_reason = _zone_block
+        if _cycle_blocked:
+            # ── 豁免判据统一前置（2026-09-02 P0）──
+            # 【原缺陷】动量确认(mm_confirm)此前只加在「顺势趋势豁免」路径，未覆盖
+            #   「保本豁免」路径 → 只要 symbol 有同向保本持仓，即便动量已反向也照样
+            #   在周期极值放行追单。实测 2026-09-02 多笔亏损单即由此产生（信号快照
+            #   cycle_pos_blocked=true 却仍放行）。
+            # 【现规则】两条豁免路径都必须满足「微动量尚未反向」：
+            #   - 保本豁免：BE 标志 + 总开关(be_exempt) + 动量未反向
+            #   - 顺势豁免：主周期顺势 + 总开关(trend_exempt) + 动量未反向
+            #   动量已明确反向 = 真接刀 → 一律硬封，不再有任何豁免。
+            # 即：保本不再【单独】构成豁免低位禁空的理由。
+            # 【2026-09-03 修复·逻辑冲突根治】原 _trend_follow 依赖滞后的
+            # period_states.get(primary)==_TREND_UP：上涨顶部那几根常因 MTF 状态机迟滞翻成
+            # TRANSITION/RANGE → 趋势豁免失效 → 顺势 BUY 被周期位置守卫硬封 → 整段上涨空仓
+            # （用户报"上涨趋势不下单"）。庚方案本意：位置极值 + 动量已反向才硬封，位置极值
+            # 但动量仍顺势应放行。此处把"顺势"判定由滞后状态机改为「微动量尚未反向」
+            # (_mm_against_obs)，使上涨中动量仍朝上的顺势 BUY 获豁免，仅真接刀(动量反向)硬封。
+            _trend_follow = (not _mm_against_obs)
+            _trend_exempt = bool(cfg.get("hexp.cycle.trend_exempt", True))
+            _mm_confirm_enabled = bool(cfg.get("hexp.cycle.mm_confirm_enabled", True))
+            _mm_against = bool(_mm_against_obs)
+            _mm_ok = (not _mm_confirm_enabled) or (not _mm_against)
+            _be_exempt = bool(cfg.get("hexp.cycle.be_exempt", True))
+            _be_ok = bool(_sym_be_ok) and _be_exempt and _mm_ok
+            _trend_ok = bool(_trend_follow) and _trend_exempt and _mm_ok
+
+            if _be_ok:
                 sr.extreme_pending = True
                 logger.info(
                     "hexp %s %s | CYCLE_POS PENDING(保本追单) dir=%s "
-                    "pos_cycle=%.2f pos_z=%.2f (sym be=1 → risk BE-gate 裁决)",
-                    symbol, primary, direction, _pos_cycle, _pos_z)
+                    "pos_cycle=%.2f pos_z=%.2f mm_against=%s "
+                    "(sym be=1 且动量未反向 → risk BE-gate 裁决)",
+                    symbol, primary, direction, _pos_cycle, _pos_z, _mm_against)
+            elif _trend_ok:
+                sr.cycle_pos_blocked = True   # 观测保留：曾命中位置极值，但趋势顺势+动量未反向→放行
+                logger.info(
+                    "hexp %s %s | CYCLE_POS trend-follow EXEMPT dir=%s "
+                    "pos_cycle=%.2f pos_z=%.2f mm_against=%s (primary=%s 顺势趋势单→放行, 风控兜底)",
+                    symbol, primary, direction, _pos_cycle, _pos_z,
+                    _mm_against, period_states.get(primary))
             else:
-                _cycle_block = (f"hexp_cycle_pos_guard(pos_cycle={_pos_cycle:.2f} "
-                                f"pos_z={_pos_z:.2f} dir={direction})")
-                logger.info("hexp %s %s | BLOCK %s dir=%s (cycle extreme position: "
-                            "bottom-short/top-long guarded)", symbol, primary,
-                            _cycle_block, direction)
-                direction = "NO_TRADE"
-                passed = False
-                sr.threshold_passed = False
-                sr.direction = "NO_TRADE"
-                sr.cycle_pos_blocked = True
-                if not sr.fallback_reason:
-                    sr.fallback_reason = _cycle_block
+                    _reason_mm = ""
+                    if _mm_confirm_enabled and _mm_against:
+                        _reason_mm = " mm_reversed(真接刀)"
+                    _cycle_block = (f"hexp_cycle_pos_guard(pos_cycle={_pos_cycle:.2f} "
+                                    f"pos_z={_pos_z:.2f} dir={direction}){_reason_mm}")
+                    logger.info("hexp %s %s | BLOCK %s dir=%s (cycle extreme position: "
+                                "bottom-short/top-long guarded%s)", symbol, primary,
+                                _cycle_block, direction, _reason_mm)
+                    direction = "NO_TRADE"
+                    passed = False
+                    sr.threshold_passed = False
+                    sr.direction = "NO_TRADE"
+                    sr.cycle_pos_blocked = True
+                    if not sr.fallback_reason:
+                        sr.fallback_reason = _cycle_block
         # ── 极值反转护栏（2026-08-18 增强）──
         # 触发需三条件同时成立，且仅拦「原趋势延续单」（顶拦 BUY / 底拦 SELL）：
         #   ① 价位处于极值区（_in_extreme 已判定）
@@ -1773,7 +2047,14 @@ class HexpEngine:
                 _adx_now = float(pf.get("_adx_raw", 0.0))
                 _ma_deg_ok = (direction == "BUY" and _ma_deg > 50.0) or \
                              (direction == "SELL" and _ma_deg < 50.0)
-                _is_trend = _in_trend_dir or (_adx_now >= _trend_adx and _ma_deg_ok)
+                # 【2026-09-01 方案B】辅助判据(ADX+ma)仅在「主周期非 RANGE」时生效：
+                # RANGE 表示主周期正处震荡/反弹，此时 ADX 高只反映此前趋势强度、ma 滞后，
+                # 不足以证明当下顺势；应回退基础阈值敏捷拦逆动量。开关可热回退旧行为。
+                _require_trend_state = bool(cfg.get(
+                    "hexp.momentum_flip_trend_require_trend_state", True))
+                _is_trend = _in_trend_dir or (
+                    (_pstate != _RANGE or not _require_trend_state)
+                    and _adx_now >= _trend_adx and _ma_deg_ok)
                 # 高位分级收紧区(顶部/底部追单)优先：即使趋势单也绝不放宽，保持严格拦截
                 if _is_trend and not _at_extreme_ma:
                     # 仅当趋势保护阈值更宽(更不敏感)时才覆盖，绝不收紧(高位分级收紧优先)
@@ -1790,9 +2071,53 @@ class HexpEngine:
                 _flip_block = f"hexp_momentum_flip(SELL but mm={f_mm_s:.4f} ma={_ma_deg:.0f} th={_eff_th:.3f})"
             # 【2026-08-28 闸门清除】G5b 高位微正枯竭加固已移除（原"ma 极高位+mm 微正枯竭"
             # 拦顶部追多/追空）。_flip_block 现仅由 momentum_flip(动量明确反向)产生。
+            # ── 【P2-A 2026-09-04】极高多头位限制追多 / 极低空头位限制追空 ──
+            # A-3 只在「动量明确反向」时拦（f_mm_s < -eff_th），对「极端位 + 动量仍
+            # 顺势 + 已超买/超卖」的追单完全不设防。昨日实证：15:20 BUY（ma=100、
+            # rsi=69.96、mm=+0.1469 动量仍向上）无任何闸门拦截 → -9.39 当日最大亏损。
+            # ⚠️ 判据必须双条件：同为 ma=100 的两笔盈利单(+13.64/+12.07) rsi 仅
+            # 63.45/64.35（未超买），单看 ma 会误杀强趋势盈利单。故要求
+            # 「极端位 AND 超买/超卖」同时成立才限制，用 rsi 作过热佐证。
+            # 处置沿用方案D：挂起等回踩（momentum_pending），不硬拒，避免错失趋势。
+            _pole_wait = bool(cfg.get("hexp.pole_chase_wait_enabled", True))
+            _pole_ma_hi = float(cfg.get("hexp.pole_chase_wait_ma_hi", 90.0))
+            _pole_ma_lo = float(cfg.get("hexp.pole_chase_wait_ma_lo", 10.0))
+            _pole_rsi_hi = float(cfg.get("hexp.pole_chase_wait_rsi_hi", 68.0))
+            _pole_rsi_lo = float(cfg.get("hexp.pole_chase_wait_rsi_lo", 32.0))
+            if (_pole_wait and passed and direction in ("BUY", "SELL")
+                    and not sr.fallback_reason):
+                _ma_now = float(pf.get("_ma_raw", 50.0))
+                _rsi_now = float(pf.get("_rsi_raw", pf.get("rsi", 50.0)))
+                _pole_block = None
+                if direction == "BUY" and _ma_now >= _pole_ma_hi and _rsi_now >= _pole_rsi_hi:
+                    _pole_block = (f"hexp_pole_chase_wait(BUY ma={_ma_now:.0f}>={_pole_ma_hi:.0f} "
+                                   f"rsi={_rsi_now:.1f}>={_pole_rsi_hi:.0f} mm={f_mm_s:.4f})")
+                elif direction == "SELL" and _ma_now <= _pole_ma_lo and _rsi_now <= _pole_rsi_lo:
+                    _pole_block = (f"hexp_pole_chase_wait(SELL ma={_ma_now:.0f}<={_pole_ma_lo:.0f} "
+                                   f"rsi={_rsi_now:.1f}<={_pole_rsi_lo:.0f} mm={f_mm_s:.4f})")
+                if _pole_block:
+                    logger.info("hexp %s %s | PENDING %s dir=%s (极端位追单 → 挂起等回踩)",
+                                symbol, primary, _pole_block, direction)
+                    sr.momentum_pending = True
+                    sr.momentum_pending_dir = direction
+                    sr.momentum_pending_mm = float(f_mm_s)
+                    direction = "NO_TRADE"
+                    passed = False
+                    sr.threshold_passed = False
+                    sr.direction = "NO_TRADE"
+                    if not sr.fallback_reason:
+                        sr.fallback_reason = _pole_block
             if _flip_block:
                 logger.info("hexp %s %s | BLOCK %s dir=%s (momentum against direction)",
                             symbol, primary, _flip_block, direction)
+                # 【2026-09-01 方案D·入场时机闸门（方向与时机解耦）】
+                # 动量反向被拦 ≠ 信号作废：记录原方向与当时动量，交 scheduler 挂起(pending)，
+                # 在棒间(3s)持续重评，待动量转向后再放行执行。避免「高周期定方向、却在小周期
+                # 反弹顶/回调底市价追单」（SELL 而 mm>0 / BUY 而 mm<0 即为本场景）。
+                # 仅打标记不改裁决路径：direction 仍置 NO_TRADE、passed=False，零实盘副作用。
+                sr.momentum_pending = True
+                sr.momentum_pending_dir = direction
+                sr.momentum_pending_mm = float(f_mm_s)
                 direction = "NO_TRADE"
                 passed = False
                 sr.threshold_passed = False
@@ -1930,6 +2255,42 @@ class HexpEngine:
                         "hexp %s %s | SUPPORT PULLBACK dir=%s pivot=%.2f close=%.2f "
                         "(within %.1fATR, direction re-evaluated by 7 factors)",
                         symbol, primary, direction, _pivot, close_v, _sup_atr)
+        # ── 【P2-C 2026-09-04】回踩/反抽未到支撑位禁止追单 ──
+        # 用户诉求："回踩或反转，未到支撑位禁止追单"。
+        # 机制：动量已反向（BUY 而 mm<0 = 回踩中 / SELL 而 mm>0 = 反抽中）说明当前
+        #       处于回调而非推进；此时若价格尚未回到近期枢轴（支撑/阻力）的
+        #       ±support_atr×ATR 带内，即属"半空中追单"（接刀/追顶），挂起等到位。
+        # 与 A-3/P2-A 的分工：A-3 拦「动量明确反向」（趋势单阈值现为 0.02）；
+        #       本闸门用更小的 mm 阈值（默认 0.005，微负即视为回踩中），覆盖
+        #       mm∈(-0.02, -0.005) 这段 A-3 放行、但确实在回调的区间，形成互补。
+        # 处置同 P2-A：沿用方案D 挂起（momentum_pending），不硬拒、信号不作废。
+        # 失败安全：无有效枢轴（数据不足）/ATR 缺失 → 放行，绝不卡死信号。
+        _pb_gate = bool(cfg.get("hexp.pullback_gate_enabled", True))
+        if (_pb_gate and passed and direction in ("BUY", "SELL")
+                and not sr.fallback_reason and atr > 0):
+            _pb_mm_th = float(cfg.get("hexp.pullback_gate_mm", 0.005))
+            _pb_against = ((direction == "BUY" and f_mm_s < -_pb_mm_th)
+                           or (direction == "SELL" and f_mm_s > _pb_mm_th))
+            if _pb_against:
+                _pb_pivot = self._get_recent_pivot(period_data[primary], direction, cfg)
+                if _pb_pivot is not None:
+                    _pb_band = float(cfg.get("hexp.extreme.support_atr", 1.0)) * atr
+                    _pb_gap = abs(close_v - _pb_pivot)
+                    if _pb_gap > _pb_band:
+                        _pb_block = (f"hexp_pullback_gate({direction} mm={f_mm_s:.4f} "
+                                     f"close={close_v:.2f} pivot={_pb_pivot:.2f} "
+                                     f"gap={_pb_gap:.2f}>band={_pb_band:.2f})")
+                        logger.info("hexp %s %s | PENDING %s dir=%s (回踩未到位 → 挂起等支撑)",
+                                    symbol, primary, _pb_block, direction)
+                        sr.momentum_pending = True
+                        sr.momentum_pending_dir = direction
+                        sr.momentum_pending_mm = float(f_mm_s)
+                        direction = "NO_TRADE"
+                        passed = False
+                        sr.threshold_passed = False
+                        sr.direction = "NO_TRADE"
+                        if not sr.fallback_reason:
+                            sr.fallback_reason = _pb_block
 
         sr.buy_score = max(0.0, dir_sum)
         sr.sell_score = max(0.0, -dir_sum)
@@ -2219,6 +2580,28 @@ class HexpEngine:
             "hexp %s: dir=%s hp=%.1f k=%.2f grade=%s verdict=%+.2f total=%.1f passed=%s",
             symbol, sr.direction, hp_100, k, grade, verdict, total, passed)
 
+        # ── 10.5) grade 与闸门同步观测（2026-09-01，纯观测·零裁决影响）──
+        # grade 在 step9(1578) 先评出，而 A11-A16 等安全护栏全部跑在其后，只改
+        # direction / threshold_passed 而**不回改 grade** → 面板与 signals 表会显示
+        # A/S 级，但该信号实为 NO_TRADE。此处补标记，供面板区分与 SQL 归因。
+        # 注意：刻意不改 sr.grade 本身（下游 min_grade 闸门与既有统计均依赖原语义）。
+        if _grade_ok and (not passed or sr.direction == "NO_TRADE"
+                          or not sr.threshold_passed):
+            sr.grade_vetoed = True
+            sr.grade_veto_by = (
+                "momentum_flip" if getattr(sr, "momentum_flip_blocked", False) else
+                "momentum_drain" if getattr(sr, "momentum_drain_blocked", False) else
+                "range_hurst" if getattr(sr, "range_hurst_blocked", False) else
+                "cycle_pos" if getattr(sr, "cycle_pos_blocked", False) else
+                "extreme_reversal" if getattr(sr, "extreme_reversal_blocked", False) else
+                "zone" if getattr(sr, "zone_blocked", False) else
+                "extreme_guard" if getattr(sr, "extreme_pending", False) else
+                (sr.fallback_reason or "unknown")
+            )
+            logger.info(
+                "hexp %s: grade=%s vetoed by guard (%s) — panel/SQL must treat as NO_TRADE",
+                symbol, grade, sr.grade_veto_by)
+
         # 10) 实时快照发布（面板数据源）
         if live and self._redis is not None and getattr(self._redis, "is_initialized", False):
             try:
@@ -2262,6 +2645,10 @@ class HexpEngine:
                         "lot_mult": sr.co_exec_lot_mult,
                         "close": close_v, "atr": round(atr, 5),
                         "passed": bool(passed),
+                        # 2026-09-01：grade 被安全护栏否决标记。面板须据此区分
+                        # 「A/S 级可交易」与「A/S 级但已被护栏封成 NO_TRADE」。
+                        "grade_vetoed": bool(getattr(sr, "grade_vetoed", False)),
+                        "grade_veto_by": getattr(sr, "grade_veto_by", ""),
                         "reason": sr.reason, "ts": time.time(),
                     }, default=str),
                     ex=15,

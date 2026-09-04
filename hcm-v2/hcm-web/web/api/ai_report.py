@@ -292,10 +292,52 @@ def create_ai_report_router(db_pool: Any = None, auth_handler: Any = None) -> AP
         }
         return {"code": 0, "data": data, "message": "ok"}
 
+    # ── ⑦ 反转头每日绩效报表（2026-09-04 新增，设计方案 §5/§7.2）──
+    async def _reversal(request: Request, days: int = 7, user=Depends(auth_handler.require_auth)):
+        """GET 反转头每日绩效报表（只读 PG 聚合表 hcm_ai.rev_daily_report；
+        由 scheduler rev_daily.aggregate_rev_daily 同节拍 upsert）。空表 → days=[]。"""
+        if db_pool is None:
+            return {"code": "SERVICE_NOT_READY", "data": None, "message": "db not available"}
+        days = max(1, min(days, 30))
+        rows = await _fetch(
+            db_pool,
+            "SELECT stat_date, n_scored, n_rev_call, n_pull_call, n_act, n_shadow, "
+            "n_settled, n_saved, n_killed, n_neutral, "
+            "COALESCE(sum_delta,0) AS sum_delta, COALESCE(sum_delta_r,0) AS sum_delta_r, "
+            "avg_delta_r, detail "
+            "FROM hcm_ai.rev_daily_report "
+            "WHERE stat_date >= (now() - make_interval(days => $1))::date "
+            "ORDER BY stat_date",
+            days,
+        )
+        data = {
+            "days": [
+                {
+                    "date": str(r["stat_date"]),
+                    "n_scored": int(r["n_scored"] or 0),
+                    "n_rev_call": int(r["n_rev_call"] or 0),
+                    "n_pull_call": int(r["n_pull_call"] or 0),
+                    "n_act": int(r["n_act"] or 0),
+                    "n_shadow": int(r["n_shadow"] or 0),
+                    "n_settled": int(r["n_settled"] or 0),
+                    "n_saved": int(r["n_saved"] or 0),
+                    "n_killed": int(r["n_killed"] or 0),
+                    "n_neutral": int(r["n_neutral"] or 0),
+                    "sum_delta": float(r["sum_delta"] or 0),
+                    "sum_delta_r": float(r["sum_delta_r"] or 0),
+                    "avg_delta_r": float(r["avg_delta_r"]) if r["avg_delta_r"] is not None else None,
+                    "detail": r["detail"] or {},
+                }
+                for r in (rows or [])
+            ],
+        }
+        return {"code": 0, "data": data, "message": "ok"}
+
     router.add_api_route("/api/v1/ai/report/health", _health, methods=["GET"], summary="系统健康监控")
     router.add_api_route("/api/v1/ai/report/layer", _layer, methods=["GET"], summary="信号分层统计")
     router.add_api_route("/api/v1/ai/report/performance", _performance, methods=["GET"], summary="交易绩效对比")
     router.add_api_route("/api/v1/ai/report/snapshot", _snapshot, methods=["GET"], summary="AI 快照明细")
     router.add_api_route("/api/v1/ai/report/daily", _daily, methods=["GET"], summary="每日 KPI 聚合")
     router.add_api_route("/api/v1/ai/report/monitor", _monitor, methods=["GET"], summary="模型监控报表")
+    router.add_api_route("/api/v1/ai/report/reversal", _reversal, methods=["GET"], summary="反转头每日绩效报表")
     return router

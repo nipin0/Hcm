@@ -103,7 +103,9 @@ def prepare(df: pd.DataFrame):
     # 排除推理侧 build_features 不装配的列（推理时这些信号属性根本不可得 → 恒 0 失真）：
     #   pre_score/confidence/lot/ai_sl_mult/suggested_lot_ratio（下单时信号属性，实时无）
     #   regime/h1_regime/h1_trend_direction/position_in_range（hexp 决策元数据，build_features 不产）
-    #   hp_score/hp_strength/dir_sum/k/verdict（MISSING_HEXP 占位，NaN）
+    #   hp_score/hp_strength/dir_sum/k（MISSING_HEXP 占位，NaN）
+    #   【2026-09-02】verdict 已不再丢弃：它由 quality_features._compute_verdict 从多周期 K 线重算
+    #   填入（HEXP+live_override 全覆盖），是方向头关键特征，故从 drop 名单移除。
     #   signal_id/symbol/signal_dir/reason/hit_bar_idx/R/label/created_at/entry_price（标识/标签）
     # 保留 build_features 真实产出的所有列（adx_14/rsi_14/macd/atr_14/h1_adx/h1_trend_strength/
     # er/bbw/.../session_*/增强列/结构因子列）。
@@ -116,7 +118,7 @@ def prepare(df: pd.DataFrame):
     drop_cols = ["signal_id", "symbol", "signal_dir", "reason", "hit_bar_idx", "R",
                  "pre_score", "confidence", "lot", "ai_sl_mult", "suggested_lot_ratio",
                  "regime", "h1_regime", "h1_trend_direction", "position_in_range",
-                 "hp_score", "hp_strength", "dir_sum", "k", "verdict",
+                 "hp_score", "hp_strength", "dir_sum", "k",
                  "ds_calib_weight"]
     # 【2026-08-24 修复·标签污染根因】labels.csv 中约 23% 样本 label 为 NaN
     # （未平仓/无 outcome 的实时信号）。若不剔除，df["label"].astype(int) 会把 NaN
@@ -293,8 +295,12 @@ def main():
     if state_mask.sum() >= 50:
         Xs = X[state_mask]
         ys = state_col[state_mask].astype(str)
-        from sklearn.model_selection import train_test_split as _tts
-        Xs_tr, Xs_te, ys_tr, ys_te = _tts(Xs, ys, test_size=0.2, random_state=args.seed)
+        # 【2026-09-01 时序分割修复】金融时序禁止随机 split（未来泄露 → 指标虚高）。
+        # 统一改为按时间顺序切分（X 已按 created_at 排序）：前段训练、后段测试。
+        _ns = len(Xs)
+        _cuts = int(_ns * (1 - args.test_ratio))
+        Xs_tr, Xs_te = Xs.iloc[:_cuts], Xs.iloc[_cuts:]
+        ys_tr, ys_te = ys.iloc[:_cuts], ys.iloc[_cuts:]
         state_model = lgb.LGBMClassifier(
             objective="multiclass", num_class=4, n_estimators=200, learning_rate=0.05,
             num_leaves=15, min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
@@ -326,7 +332,14 @@ def main():
     if dir_col is not None and dir_col.notna().sum() >= 50:
         Xd = X[dir_col.notna()]
         yd = dir_col[dir_col.notna()].astype(int)
-        Xd_tr, Xd_te, yd_tr, yd_te = train_test_split(Xd, yd, test_size=0.2, random_state=args.seed)
+        # 【2026-09-01 时序分割修复·方向头】原用 train_test_split(random) —— 金融时序
+        # 随机切分会把"未来"样本混进训练集 → 模型用未来信息拟合，dir_hit 虚高至
+        # 0.89/0.95 而实盘判反（追顶）。现改为时间序切分：前段训练、后段测试，
+        # 与质量头(split 段)同口径，指标才反映真实预测力。
+        _nd = len(Xd)
+        _cutd = int(_nd * (1 - args.test_ratio))
+        Xd_tr, Xd_te = Xd.iloc[:_cutd], Xd.iloc[_cutd:]
+        yd_tr, yd_te = yd.iloc[:_cutd], yd.iloc[_cutd:]
         dir_model = lgb.LGBMClassifier(
             objective="multiclass", num_class=3, n_estimators=200, learning_rate=0.05,
             num_leaves=15, min_child_samples=20, subsample=0.8, colsample_bytree=0.8,
@@ -377,7 +390,11 @@ def main():
     if entry_col is not None and entry_col.notna().sum() >= 50:
         Xe = X[entry_col.notna()]
         ye = entry_col[entry_col.notna()].astype(int)
-        Xe_tr, Xe_te, ye_tr, ye_te = train_test_split(Xe, ye, test_size=0.2, random_state=args.seed)
+        # 【2026-09-01 时序分割修复·买点头】同方向头：改时间序切分，禁随机 split。
+        _ne = len(Xe)
+        _cute = int(_ne * (1 - args.test_ratio))
+        Xe_tr, Xe_te = Xe.iloc[:_cute], Xe.iloc[_cute:]
+        ye_tr, ye_te = ye.iloc[:_cute], ye.iloc[_cute:]
         entry_model = lgb.LGBMClassifier(
             objective="binary", n_estimators=200, learning_rate=0.05,
             num_leaves=15, min_child_samples=20, subsample=0.8, colsample_bytree=0.8,

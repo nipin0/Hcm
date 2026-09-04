@@ -261,49 +261,126 @@ def _bump_fail_streak(r, ok: bool) -> int:
         return 0
 
 
+def _protected_model_files() -> set:
+    """当前 ai.lm.*_path 正引用的模型/校准器文件名集合（清理时一律跳过）。
+
+    【2026-09-03 防误删兜底】方向头/买点头/反转头的路径配置由人工维护，
+    可能仍指向旧版本（如 entry_path=v81 而磁盘已推进到 v85）。若只按版本号
+    清理，会把配置正引用的文件删掉 → 配置指向悬空文件 → sidecar 加载失败
+    → 该头在前端显示「未启用」（2026-09-03 方向头事故的直接成因）。
+    故无论版本号多老，只要被配置引用就永不删除。
+    """
+    names = set()
+    keys = ("ai.lm.model_path", "ai.lm.calib_path", "ai.lm.dir_path",
+            "ai.lm.dir_calib_path", "ai.lm.entry_path", "ai.lm.entry_calib_path")
+    vals = []
+    # ① Redis 缓存（hcm:config:v2 单哈希）
+    try:
+        import redis as _redis_lib
+        _rc = _redis_lib.Redis.from_url(
+            os.environ.get("REDIS_URL", "") or "redis://localhost:6379",
+            socket_timeout=3,
+        )
+        for k in keys:
+            v = _rc.hget("hcm:config:v2", k)
+            if v:
+                vals.append(v.decode("utf-8", "ignore")
+                            if isinstance(v, (bytes, bytearray)) else str(v))
+    except Exception as e:
+        log(f"[cleanup] Redis 配置引用读取失败（回退 PG）: {e}")
+    # ② PG 真源（hcm_config.metadata），覆盖 Redis 缺失/过期/分裂的键
+    try:
+        conn = psycopg2.connect(DB_URL_DEFAULT, connect_timeout=5)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT config_key, current_value FROM hcm_config.metadata "
+                    "WHERE config_key LIKE 'ai.lm.%_path'"
+                )
+                for _k, _v in cur.fetchall():
+                    if _v:
+                        vals.append(str(_v))
+        finally:
+            conn.close()
+    except Exception as e:
+        log(f"[cleanup] PG 配置引用读取失败: {e}")
+    for v in vals:
+        v = (v or "").strip()
+        if not v:
+            continue
+        for sep in ("/", "\\"):
+            if sep in v:
+                v = v.split(sep)[-1]
+        names.add(v.strip())
+    return names
+
+
 def cleanup_old_versions(keep: int | None = None) -> None:
     """清理 models 目录旧版本（用户决策 6：保留最近 3 版）。
 
-    按 ``lgbm_quality_vN.txt`` 解析版本号，保留最近 ``keep`` 个版本，
-    更老版本连同配套文件（calib_vN.pkl / lgbm_direction_vN.txt /
-    calib_dir_np_vN.pkl / lgbm_entry_vN.txt / calib_entry_np_vN.pkl）
-    一并删除——方向头/买点头与质量头同版本同目录（阶段 2 已保证），
-    按版本**整组**清理，绝不半组残留。
+    【2026-09-03 五头独立版本管理·替换旧的一刀切逻辑】
+    旧逻辑以「质量头版本号」为基准，一次性删除该版本号的六件套
+    （quality/calib/direction/calib_dir/entry/calib_entry）。但三头版本号
+    并不同步，且 switch 只更新质量头路径、从不更新 dir_path/entry_path
+    → 方向头/买点头配置僵死在旧版本号，该版本号一旦滚出「最近 keep 版」
+    即被连带删除 → 配置指向悬空 → 该头加载失败（前端「未启用」）。
 
-    仅当保留数超过 keep 时才动手；且只删有 quality 主文件的版本，
-    避免误删 sidecar 正在加载的模型。调用时机：仅在切换成功后
-    （此时新版本已上线，清理更老版本不会影响 sidecar 的版本发现）。
+    新逻辑（三条）：
+      1) 五头（quality / direction / entry / reversal / state）**各自按自身
+         文件名模式独立解析版本号、各自保留最近 keep 版**，互不影响；
+      2) 每头只清理**自己那头**的配套文件（模型 + 校准器），绝不跨头删除；
+      3) 叠加「配置引用保护」：ai.lm.*_path 正指向的文件一律跳过，永不删除。
+
+    调用时机：仅在切换成功后（此时新版本已上线，清理更老版本不影响 sidecar）。
     """
     import re as _re
     import glob as _glob
     import os as _os
 
     keep = KEEP_MODEL_VERSIONS if keep is None else int(keep)
-    versions = []
-    for p in _glob.glob(_os.path.join(MODELS_DIR, "lgbm_quality_v*.txt")):
-        m = _re.search(r"lgbm_quality_v(\d+)\.txt$", _os.path.basename(p))
-        if m:
-            versions.append(int(m.group(1)))
-    if len(versions) <= keep:
-        return
-    versions.sort(reverse=True)
-    for v in versions[keep:]:
-        for name in (
-            f"lgbm_quality_v{v}.txt",
-            f"calib_v{v}.pkl",
-            f"lgbm_direction_v{v}.txt",
-            f"calib_dir_np_v{v}.pkl",
-            f"lgbm_entry_v{v}.txt",
-            f"calib_entry_np_v{v}.pkl",
-        ):
-            p = _os.path.join(MODELS_DIR, name)
-            if _os.path.exists(p):
-                try:
-                    _os.remove(p)
-                    log(f"[cleanup] 删除旧版本文件 {name}")
-                except Exception as e:
-                    log(f"[cleanup] 删除失败 {name}: {e}")
-        log(f"[cleanup] 版本 v{v} 已清理（保留最近 {keep} 版）")
+
+    # (头名称, 版本文件 glob, 版本号正则, 该头配套文件名模板(含 {v} 占位))
+    _HEADS = (
+        ("quality", "lgbm_quality_v*.txt", r"lgbm_quality_v(\d+)\.txt$",
+         ("lgbm_quality_v{v}.txt", "calib_v{v}.pkl")),
+        ("direction", "lgbm_direction_v*.txt", r"lgbm_direction_v(\d+)\.txt$",
+         ("lgbm_direction_v{v}.txt", "calib_dir_np_v{v}.pkl")),
+        ("entry", "lgbm_entry_v*.txt", r"lgbm_entry_v(\d+)\.txt$",
+         ("lgbm_entry_v{v}.txt", "calib_entry_np_v{v}.pkl")),
+        ("reversal", "lgbm_reversal_v*.txt", r"lgbm_reversal_v(\d+)\.txt$",
+         ("lgbm_reversal_v{v}.txt", "calib_reversal_v{v}.pkl")),
+        ("state", "lgbm_state_v*.pkl", r"lgbm_state_v(\d+)\.pkl$",
+         ("lgbm_state_v{v}.pkl",)),
+    )
+
+    protected = _protected_model_files()
+
+    for head, pat, rx, tmpl in _HEADS:
+        versions = []
+        for p in _glob.glob(_os.path.join(MODELS_DIR, pat)):
+            m = _re.search(rx, _os.path.basename(p))
+            if m:
+                versions.append(int(m.group(1)))
+        if len(versions) <= keep:
+            continue
+        versions.sort(reverse=True)
+        for v in versions[keep:]:
+            grp = [t.format(v=v) for t in tmpl]
+            # 整组保护：该版本任一文件被配置引用 → 整组保留。
+            # 避免"留模型删校准器"（或反之）的半组残留——两者缺一均无法加载。
+            if any(n in protected for n in grp):
+                log(f"[cleanup] 跳过 {head} v{v} 整组"
+                    f"（含被 ai.lm.*_path 引用的文件，保持配套完整）")
+                continue
+            for name in grp:
+                p = _os.path.join(MODELS_DIR, name)
+                if _os.path.exists(p):
+                    try:
+                        _os.remove(p)
+                        log(f"[cleanup] 删除旧版本文件 {name}")
+                    except Exception as e:
+                        log(f"[cleanup] 删除失败 {name}: {e}")
+            log(f"[cleanup] {head} 头版本 v{v} 已清理（保留最近 {keep} 版）")
 
 
 def parse_dir_hit(stdout: str) -> float | None:

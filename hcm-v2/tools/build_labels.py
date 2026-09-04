@@ -51,6 +51,11 @@ CFG_FALLBACK = {
     # 【阶段 0·方向头/买点头标签】独立于 hexp 方向，由未来 K 线方向驱动。
     "ai.lm.dir_atr_mult": 0.8,        # 方向幅度阈值(ATR 倍数)：未来 N 根 close 相对 entry 涨/跌 ≥ ±0.8·ATR → 有方向
     "ai.lm.dir_horizon_bars": 24,     # 方向展望期(根 M5)，长于质量头 12 以稳方向
+    # 【2026-09-02 趋势对齐】方向头标签只学"顺 H1 主趋势"的运动方向：
+    #   逆 H1 趋势的未来 ±dir_atr_mult 运动压为 FLAT(0) —— 趋势市不教摸顶/抄底
+    #   （根治"buy 趋势行情判 SELL、被 flip 成逆势空单"系统性背离）。
+    "ai.lm.dir_trend_align": "true",  # 开关：false 则完全退回旧双向(纯未来收益)语义
+    "ai.lm.dir_trend_tf": "H1",       # 趋势基准周期（当前实现仅 H1；扩展需另加载对应 tf）
 }
 
 
@@ -218,15 +223,56 @@ def label_one(sig_row, kl: pd.DataFrame, cfg: dict, events=None):
 
 
 # ── 阶段 0·方向头标签：独立于 hexp 方向，纯看未来 K 线走向 ──
-def dir_label_one(sig_row, kl: pd.DataFrame, cfg: dict):
+def _h1_trend_dir(h1kl, ts) -> int:
+    """ts 时刻**已收盘** H1 棒的主趋势方向：+1=TREND_UP / -1=TREND_DOWN / 0=其它或缺失。
+
+    复用 quality_features._period_trend_state（ma close vs EMA60 与 DI 同向 + ADX 分段
+    TrendScore≥enter），与生产 hexp 共振矩阵口径一致。只读过去已收盘棒 → 无未来泄露。
+    """
+    if h1kl is None or h1kl.empty:
+        return 0
+    try:
+        import quality_features as _qf
+    except Exception:
+        return 0
+    i = _qf._bar_at_or_before(h1kl, ts)
+    if i is None:
+        return 0
+    try:
+        row = h1kl.iloc[i]
+        _adx = float(row["adx_14"])
+        _pdi = float(row["plus_di"])
+        _mdi = float(row["minus_di"])
+        _ema60 = float(row["ema60"])
+        _close = float(row["close"])
+    except Exception:
+        return 0
+    if any(pd.isna(v) for v in (_adx, _pdi, _mdi, _ema60, _close)):
+        return 0
+    _st = _qf._period_trend_state(_adx, _pdi, _mdi, _close, _ema60)
+    if _st == "TREND_UP":
+        return 1
+    if _st == "TREND_DOWN":
+        return -1
+    return 0
+
+
+def dir_label_one(sig_row, kl: pd.DataFrame, cfg: dict, h1kl: pd.DataFrame | None = None):
     """对单条信号构造「市场方向」标签（不看 signal_dir，彻底解耦 hexp）。
 
-    未来 ``dir_horizon_bars`` 根 M5 收盘相对 entry 的标准化收益：
+    基础语义（不变）：未来 ``dir_horizon_bars`` 根 M5 收盘相对 entry 的标准化收益：
         fut_ret = (close_N - entry) / atr
         fut_ret >= +dir_atr_mult  -> +1 (BUY 方向)
         fut_ret <= -dir_atr_mult  -> -1 (SELL 方向)
         否则                      ->  0 (FLAT 横盘)
-    纪律红线：标签仅用未来 K 线（监督学习标准），推理侧只用当前特征，无泄露。
+
+    【2026-09-02 趋势对齐·ai.lm.dir_trend_align】H1 主趋势约束：
+        TREND_UP   -> 未来下跌段(原 -1) 压为 0(FLAT) —— 上升趋势不教"摸顶做空"；
+        TREND_DOWN -> 未来上涨段(原 +1) 压为 0 —— 下降趋势不教"抄底做多"；
+        RANGE/TRANSITION / H1 数据缺失 -> 保留原双向（震荡市均值回归仍可学）。
+    开关=false 或 h1kl 缺失时完全退回旧纯收益语义（向后兼容）。
+
+    纪律红线：标签仅用未来 K 线（监督学习标准），趋势约束只读过去已收盘 H1，无泄露。
     排除：atr 缺失 / 前向 K 线不足。
     """
     entry = float(sig_row["entry_price"])
@@ -245,10 +291,19 @@ def dir_label_one(sig_row, kl: pd.DataFrame, cfg: dict):
         return None
     fut_ret = (float(window.iloc[-1]["close"]) - entry) / atr
     if fut_ret >= x_dir:
-        return 1
-    if fut_ret <= -x_dir:
-        return -1
-    return 0
+        raw = 1
+    elif fut_ret <= -x_dir:
+        raw = -1
+    else:
+        raw = 0
+    _align = str(cfg.get("ai.lm.dir_trend_align", "true")).strip().lower()
+    if _align in ("true", "1", "yes", "on"):
+        _td = _h1_trend_dir(h1kl, created) if h1kl is not None else 0
+        if _td > 0 and raw == -1:
+            return 0
+        if _td < 0 and raw == 1:
+            return 0
+    return raw
 
 
 # ── 阶段 0·买点头标签：条件于方向头预测方向(训练时用真实 dir_label)的 R 触达 ──
@@ -482,6 +537,30 @@ def main():
         klines = load_klines(conn, sorted(set(signals["symbol"].tolist())))
         print(f"[klines] symbols={list(klines.keys())}", file=sys.stderr)
 
+        # 【2026-09-02 方向头趋势对齐】加载 H1 已收盘趋势态（仅 dir_trend_align 开启时）。
+        # 复用 quality_features.load_klines_multi_tf（enrich 含 adx_14/plus_di/minus_di），
+        # 再补 ema60 列供 _period_trend_state 用。
+        h1_by_sym = {}
+        _align_cfg = str(cfg.get("ai.lm.dir_trend_align", "true")).strip().lower()
+        if _align_cfg in ("true", "1", "yes", "on"):
+            try:
+                import quality_features as _qf
+                _mtf = _qf.load_klines_multi_tf(
+                    conn, sorted(set(signals["symbol"].tolist())), ["H1"])
+                for _sym, _tfmap in _mtf.items():
+                    _g = _tfmap.get("H1")
+                    if _g is None or _g.empty:
+                        continue
+                    _g = _g.sort_values("open_time").reset_index(drop=True)
+                    _g["ema60"] = _g["close"].astype(float).ewm(span=60, adjust=False).mean()
+                    h1_by_sym[_sym] = _g
+                print(f"[h1_trend] loaded symbols={list(h1_by_sym.keys())}",
+                      file=sys.stderr)
+            except Exception as _he:
+                print(f"[warn] H1 trend load failed, dir_trend_align disabled: {_he}",
+                      file=sys.stderr)
+                h1_by_sym = {}
+
         # 【设计文档 1.3 标签校准】可选：DeepSeek 票近邻匹配，构造样本权重。
         # 规则（不翻 label，只调权重，2026-08-21 增强为 4 象限 + continuity 微调，见下方循环体）：
         #   - DS fake_prob>=0.6 且 label=1(DS看真+价格赢)   → 1.5 强化
@@ -505,8 +584,18 @@ def main():
             kl = klines.get(r["symbol"])
             label, reason, R, hit_idx = label_one(r, kl, cfg, events)
             # 【阶段 0·方向头/买点头标签】独立于 hexp 方向，影子输出不破红线。
-            dir_val = dir_label_one(r, kl, cfg)
-            entry_lbl = entry_label_one(r, kl, cfg, dir_val, events)
+            # 2026-09-02: h1kl 传入使 dir_label 受 H1 主趋势约束（趋势对齐语义）。
+            dir_val = dir_label_one(r, kl, cfg, h1_by_sym.get(r["symbol"]))
+            # 【2026-09-03 买入头根因修复】entry_label 必须条件于「意图方向」(signal_dir)，
+            # 而非真实方向(dir_label)。旧实现用 dir_label 作 dir_val：
+            #   方向头标签用 24 根长视野判定 dir_label，买入头标签用 12 根短视野判定 entry_label；
+            #   趋势中"先回踩后延续"使 12 根内常先触反向 −1R → entry_label 与入场即时方向特征
+            #   反相关 → 模型学到反向映射 → 测试集 AUC≈0.33(低于随机)。
+            #   推理时 ai_entry 是无条件输出、被解释为"该信号方向的好买点"，故标签须对齐 signal_dir。
+            #   修复后：entry_label=1 ⟺ 价格先确认「意图方向」±1R，与可学习特征正相关，
+            #   且语义与消费端(ai_entry=好买点 for signal_dir)一致。
+            _intended = 1 if r["signal_dir"] == "BUY" else (-1 if r["signal_dir"] == "SELL" else 0)
+            entry_lbl = entry_label_one(r, kl, cfg, _intended, events)
             # 设计文档 1.3：DeepSeek 视角样本权重（默认 1.0，仅 --ds-calibrate 时计算）
             # 【2026-08-21 增强】原规则只加权"DS看真+价格赢"(1.5)与"DS看假+价格输"(0.5)，
             # 且 label==0 且 fp<0.4 因 DS 实测 fp≥0.42 永不触发 → DS 高置信但价格输的

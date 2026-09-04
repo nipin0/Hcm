@@ -221,6 +221,44 @@ class ScoreResult:
     # 2026-08-27 周期位置守卫命中标记：由 pos_cycle/pos_z 触发 NO_TRADE 时置 True，
     # 落库供 SQL 统计命中率（可观测性，不阻断逻辑）。
     cycle_pos_blocked: bool = False
+    # ── 2026-09-01 庚方案·Step 0 观测字段（周期位置护栏动量确认）──
+    # 背景：_scratch/ts_conflict.py 回测显示 cycle_pos_guard 拦掉 45% 趋势启动信号，
+    #   被拦信号胜率 62.9% vs 保留 61.5% → 零质量增益。根因：pos_cycle<0.15/>0.85
+    #   在趋势中是必然特征（创新低 ⟹ pos_cycle 极低），单因子硬封系统性误伤顺势单。
+    # 庚方案：硬封应追加「动量已明确反向」确认（与 momentum_flip 同口径 flip_mm）。
+    # cycle_mm_aligned = 动量与方向的对齐度（dir_sign × f_mm_s，>0=仍支持方向）
+    # cycle_mm_against = 动量已明确反向（|f_mm| 越过 flip_mm 且符号相反）→ 真风险
+    # cycle_pos_pending = 影子判定：命中位置极值但动量未反向 → 庚方案下应降档放行
+    #   （Step 0 仅落库/日志观测，不参与任何裁决；Step 1 由 hexp.cycle.mm_confirm_enabled 接入）
+    cycle_mm_aligned: float = 0.0
+    cycle_mm_against: bool = False
+    cycle_pos_pending: bool = False
+    # ── 2026-09-01 抢跑态(Front-Run)·Step 2 观测字段 ──
+    # 背景：摇摆的 H1 状态机绑架了整条裁决链——它同时决定 direction、verdict、
+    #   以及 _trend_follow / _in_trend_dir 两处护栏豁免判据。dir_lm(AI 方向头)是
+    #   不摇摆的高质量方向源，但此前 FLIP 只在最末端改 direction，下游判据仍读
+    #   摇摆的 period_states → 翻了也白翻，照样被拦（实测 7 翻 4 无产出）。
+    # 抢跑态 = dir_lm 高置信(prob≥flip_prob)翻向后，在 TTL 窗口内把「快变量已确认」
+    #   作为一等裁决输入，绕开慢变量摇摆。与 _reversal_until 同构（时间戳制、per-symbol、
+    #   自动过期不锁死）。Step 2 仅落库+日志；Step 3 才注入两处豁免判据。
+    # frontrun_active  = 当前处于抢跑态窗口内
+    # frontrun_dir     = 抢跑态锁定的方向（dir_lm 翻向后的方向）
+    # frontrun_aligned = 抢跑态方向与本信号方向一致（Step 3 的豁免命中判据）
+    frontrun_active: bool = False
+    frontrun_dir: str = ""
+    frontrun_aligned: bool = False
+    # ── 2026-09-01 逆结构护栏（zone guard）诊断字段 ──
+    # 背景：S/R 识别体系（分形/枢轴/整数关口/会话 + 共振 strength）早已具备，
+    #   但 hexp 里只用于「顺结构加分」，逆结构（阻力位追多 / 支撑位追空）不扣分、
+    #   不拦截 → 实测成交 BUY 中 71% 位于 pos>0.7 高位（live_override 路径占 76%）。
+    # zone_dir       = 结构位相对现价的方向（SELL=上方阻力 / BUY=下方支撑）
+    # zone_dist_atr  = 结构位与现价的距离（单位 ATR）
+    # zone_aligned   = 结构方向与本信号方向一致（顺结构）
+    # zone_blocked   = 命中逆结构硬约束被拦
+    zone_dir: str = ""
+    zone_dist_atr: float = -1.0
+    zone_aligned: bool = False
+    zone_blocked: bool = False
     # ── 2026-08-31: 安全护栏命中标记（趋势启动覆写的显式豁免判据）──
     # 背景：趋势启动覆写(hexp_engine 约 2139 行)位于全部护栏之后，会无条件把
     #   direction="NO_TRADE"/threshold_passed=False 覆写为放行。原设计依赖旧判定
@@ -231,6 +269,18 @@ class ScoreResult:
     momentum_drain_blocked: bool = False
     momentum_flip_blocked: bool = False
     range_hurst_blocked: bool = False
+    # ── 2026-09-01: grade 与安全护栏同步观测字段（纯观测，零裁决影响）──
+    # 背景：grade 由 step9 _resolve_grade_hyst(hexp_engine.py:1578) 先评出，而
+    #   zone / extreme / momentum_flip / momentum_drain / range_hurst 等安全护栏
+    #   全部跑在 grade 之后，且只改 direction / threshold_passed，**不回改 grade**。
+    #   → signals.indicator_values._hexp.grade 与面板会显示 A/S，而该信号实为
+    #   NO_TRADE。这是「看到 A 级却不下单」的根因，也是 SQL 统计等级胜率时的头号
+    #   污染（A/S 级样本被 NO_TRADE 混入而失真）。
+    # grade_vetoed  = grade 已达 min_grade(_grade_ok=True) 但被后续安全护栏否决
+    # grade_veto_by = 否决来源护栏名，便于统计各护栏「误杀高等级」命中率
+    # 仅观测落库；不改 grade 语义、不参与任何裁决。
+    grade_vetoed: bool = False
+    grade_veto_by: str = ""
     # 趋势启动单的 SL 锁定标记：由 hexp_engine 趋势启动覆写置 True。
     # 背景：scheduler 的「会话 SL 覆盖」会无条件用会话值改写 ai_sl_mult，而会话值
     #   亚洲=3.5、欧美=2.0。回测最优 SL=3.5（样本外 +8.1R），SL=2.0 则明确亏损

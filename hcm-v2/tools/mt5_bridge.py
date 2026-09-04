@@ -1402,6 +1402,28 @@ def place_mt5_order(mt5, signal_data, symbol, timeframe_str, redis_conn=None):
         except Exception as exc:
             log.error(f"SL calc failed: {exc}")
 
+    # ── 【2026-09-01 会话 SL 下限兜底】──
+    # zone back-offset / AI 路径会把 SL 收得比平仓配置/时段系数键值更紧（昨日内
+    # 低位追空单 SL 被 zone 收到 ~1.1ATR，被 19:00 反弹直接扫损）。此处将 SL 距离
+    # 放大到 close.<session>.trailing_stop_distance×ATR（会话键值兜底），
+    # 下方 P0-1 再按 max_sl_atr_mult 封顶（最终 = min(会话值, max_sl)）。
+    if redis_conn and sl > 0:
+        try:
+            _sess_floor = _current_session()
+            _floor_raw = _session_cfg_float(
+                redis_conn, "trailing_stop_distance", SESSION_DEFAULTS[_sess_floor]["sl"])
+            _floor_mult = float(_floor_raw) if _floor_raw not in (None, "") else 0.0
+            if _floor_mult > 0:
+                _entry_ref = tick.ask if direction == "BUY" else tick.bid
+                _min_dist = atr * _floor_mult
+                _cur_dist = abs(_entry_ref - sl)
+                if _cur_dist < _min_dist:
+                    sl = (_entry_ref - _min_dist) if direction == "BUY" else (_entry_ref + _min_dist)
+                    log.info("SL raised to session floor: dist %.2f→%.2f (session=%s %.1fATR; zone/AI was tighter)",
+                             _cur_dist, _min_dist, _sess_floor, _floor_mult)
+        except Exception as exc:
+            log.debug("session SL floor skip: %s", exc)
+
     # ── P0-1: 封顶止损距离 ≤ max_sl_atr_mult × atr ──
     # 防止 zone/AI 把 SL 拉得过宽（实测均值 2.67ATR），统一风险暴露。
     if sl > 0:
@@ -1646,10 +1668,14 @@ async def _mark_signal_blocked(pool, sid, reason: str) -> None:
         return
     try:
         async with pool.acquire() as conn:
+            # 【2026-08-31 修复】原 SQL 用同一 $2 绑定 fallback_reason(varchar(200)) 与
+            # block_reason(text) 两列 → asyncpg 推断类型不一致 → "inconsistent types deduced
+            # for parameter $2" → 拦截原因从不落库 → 漏斗把"桥冷却/反转护栏/持仓数/下单失败"
+            # 全部归为"过风控未成交"（诊断盲区）。改两个独立参数 + 显式 cast。
             await conn.execute(
-                "UPDATE hcm_signal.signals SET fallback_reason=$2, "
-                "block_reason=$2, updated_at=now() "
-                "WHERE signal_id=$1 AND signal_status<>3", sid, reason)
+                "UPDATE hcm_signal.signals SET fallback_reason=$2::varchar, "
+                "block_reason=$3::text, updated_at=now() "
+                "WHERE signal_id=$1 AND signal_status<>3", sid, reason, reason)
     except Exception as _e:
         log.warning("mark signal %s blocked=%s failed (non-fatal): %s", sid, reason, _e)
 
@@ -4161,6 +4187,16 @@ async def main(dry_run=False):
                         _update_total_trailing_stop(mt5, redis_conn)
                     except Exception as e:
                         log.error(f"total trailing stop update failed: {e}")
+                    # [2026-09-02] 反转头：主号浮亏>0.6ATR 写评分请求 + 消费结论
+                    # （异步双段，绝不在此同步调 AI；内部全异常隔离，失败则不动）
+                    try:
+                        await _rev_request_scores(mt5, redis_conn, pool)
+                    except Exception as e:
+                        log.error(f"reversal head request failed: {e}")
+                    try:
+                        await _rev_apply_verdicts(mt5, redis_conn, pool)
+                    except Exception as e:
+                        log.error(f"reversal head apply failed: {e}")
                 last_trail = now
 
             # [2026-08-25] 毫秒级跟单 SL/TP：每轮消费 hcm:master:sltp（block=50ms 上限），
@@ -4395,6 +4431,485 @@ def _publish_trail_sltp_event(redis_conn, pos, new_sl: float, new_tp: float, acc
         )
     except Exception as e:
         log.error("Trail SL/TP event publish failed ticket=%s: %s", pos.ticket, e)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 反转头（2026-09-02 接入）：主号浮亏 >0.6ATR → AI 判定「反转 vs 回踩」
+# 纪律（缺一即为伪交付）：
+#   1. 仅主号(IS_MASTER)发起 —— SL/TP 唯一真相源是主号，跟单号经镜像继承，
+#      跟单桥本就跳过独立 SL 管理（见上方 trailing 块 IS_FOLLOWER 分支）。
+#   2. 异步双段：桥写请求 → sidecar 算分 → 桥读结论。绝不在桥内同步调 AI
+#      （铁律第五条：异步禁改同步；桥 5s 主循环不得被 HTTP/模型阻塞）。
+#   3. 默认 ai.rev.mode=log：只记日志不改仓；act 需红线授权。
+#      【2026-09-03 红线授权已追认】用户明确授权 act 模式（真实调 SL：
+#      判"反转"→SL 收紧至现价 ∓0.15×ATR；判"回踩"→SL 放宽至
+#      entry ∓(close.<session>.trailing_stop_distance × ATR)）。TP 始终不动。
+#      回退方式：ai.rev.mode 改回 log（配置热调，无需改码/重启进程）。
+#   4. 每仓冷却 15min：防 MODIFY 刷屏 / 防 SL 被棘轮式越收越紧 /
+#      防分数在 cutoff 附近横跳导致"收紧→放宽→收紧"。
+#      台阶重触发：浮亏较上次评估再加深 >=0.5ATR 立即重评（绕过冷却）。
+#   5. 已保本/已盈利(profit>=0)的仓不触发 —— 风险已锁，不该砍。
+#   6. 失败安全：模型未启用/无结论/异常 → 一律不动作。
+# ══════════════════════════════════════════════════════════════════════
+_REV_TRIGGER_DD_ATR = 0.6     # 触发：浮亏 > 0.6 ATR
+_REV_COOLDOWN_SEC = 900.0     # 每仓最小重评间隔 15 分钟
+_REV_STEP_ATR = 0.5           # 台阶：浮亏再加深 0.5ATR 立即重评
+_REV_TIGHTEN_BUF_ATR = 0.15   # 反转时收紧 SL 的缓冲（×ATR）
+
+
+def _rev_decode(v):
+    """redis-py 默认返回 bytes；str(b'true') 会得到 "b'true'" 致布尔判断恒假。"""
+    if v is None:
+        return None
+    return v.decode("utf-8", "ignore") if isinstance(v, (bytes, bytearray)) else str(v)
+
+
+def _rev_bool_cfg(redis_conn, key, default=False):
+    try:
+        v = _rev_decode(redis_conn.hget("hcm:config:v2", key))
+        if v is None:
+            return default
+        return v.strip().lower() in ("true", "1", "yes", "on")
+    except Exception:
+        return default
+
+
+def _rev_float_cfg(redis_conn, key, default):
+    try:
+        v = _rev_decode(redis_conn.hget("hcm:config:v2", key))
+        return float(v) if v is not None else float(default)
+    except Exception:
+        return float(default)
+
+
+def _rev_str_cfg(redis_conn, key, default):
+    try:
+        v = _rev_decode(redis_conn.hget("hcm:config:v2", key))
+        return v if v is not None else default
+    except Exception:
+        return default
+
+
+def _rev_sess_float(redis_conn, suffix: str, default: float) -> float:
+    """【会话化 2026-09-04】反转头会话优先浮点配置：
+    ai.rev.{suffix}.{session} → ai.rev.{suffix} → default。
+    使触发深度/收紧缓冲/确认阈值随 asia/europe/us 时段自适应。"""
+    if redis_conn is not None:
+        sess = _current_session()
+        for key in (f"ai.rev.{suffix}.{sess}", f"ai.rev.{suffix}"):
+            try:
+                v = _rev_decode(redis_conn.hget("hcm:config:v2", key))
+            except Exception:
+                v = None
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+    return float(default)
+
+
+async def _rev_request_scores(mt5, redis_conn, pool):
+    """主号：为浮亏 >0.6ATR 的持仓写入 AI 评分请求（带冷却与台阶重触发）。"""
+    if not IS_MASTER or ACCOUNT_ID_MODE is None:
+        return
+    if not _rev_bool_cfg(redis_conn, "ai.rev.enabled", False):
+        return
+    try:
+        positions = mt5.positions_get()
+    except Exception:
+        return
+    if not positions:
+        return
+    cooldown = _rev_float_cfg(redis_conn, "ai.rev.cooldown_sec", _REV_COOLDOWN_SEC)
+    step = _rev_float_cfg(redis_conn, "ai.rev.step_atr", _REV_STEP_ATR)
+    trig = _rev_sess_float(redis_conn, "trigger_dd_atr", _REV_TRIGGER_DD_ATR)
+    now = time.time()
+    for pos in positions:
+        try:
+            sym = getattr(pos, "symbol", "") or ""
+            atr = await _compute_atr14(pool, sym)
+            if not atr or atr <= 0:
+                continue
+            # 已保本/已盈利 → 不触发（风险已锁或本就无浮亏）
+            if float(getattr(pos, "profit", 0) or 0) >= 0:
+                continue
+            direction = "BUY" if int(pos.type) == 0 else "SELL"
+            entry, cur = float(pos.price_open), float(pos.price_current)
+            sign = 1.0 if direction == "BUY" else -1.0
+            dd = sign * (entry - cur) / atr
+            if dd <= trig:
+                continue
+            ticket = int(pos.ticket)
+            lkey = f"hcm:ai:rev:last:{ticket}"
+            last_ts, last_dd = 0.0, 0.0
+            try:
+                raw = redis_conn.get(lkey)
+                if raw:
+                    d = json.loads(raw)
+                    last_ts, last_dd = float(d.get("ts", 0)), float(d.get("dd", 0))
+            except Exception:
+                pass
+            deepened = (dd - last_dd) >= step
+            if (now - last_ts) < cooldown and not deepened:
+                continue
+            payload = {
+                "ticket": ticket, "account_id": int(ACCOUNT_ID_MODE),
+                "symbol": sym, "direction": direction,
+                "open_price": entry, "sl": float(getattr(pos, "sl", 0) or 0),
+                "tp": float(getattr(pos, "tp", 0) or 0),
+                "open_time": datetime.fromtimestamp(int(pos.time), tz=timezone.utc).isoformat(),
+                "dd_atr": round(dd, 4), "ts": now,
+            }
+            redis_conn.set(f"hcm:ai:rev:req:{int(ACCOUNT_ID_MODE)}:{ticket}",
+                           json.dumps(payload), ex=900)
+            redis_conn.set(lkey, json.dumps({"ts": now, "dd": round(dd, 4)}), ex=86400)
+            log.info("[REV] request ticket=%s %s dd=%.2fATR (%s)", ticket, direction, dd,
+                     "台阶重触发" if deepened else "冷却已过")
+        except Exception as e:
+            log.error("[REV] request loop failed: %s", e)
+
+
+async def _rev_target_sl(redis_conn, pool, pos, sym, is_rev):
+    """计算反转头的「假设动作目标 SL」——纯计算，零交易副作用。
+
+    log / log_skip / act 三个分支共用同一口径，杜绝两份实现各自演化导致的
+    行为分叉（铁律 13.1.2）。ATR 不可用 → 返回 None（调用方 continue，失败安全）。
+    """
+    atr = await _compute_atr14(pool, sym)
+    if not atr or atr <= 0:
+        return None
+    direction = "BUY" if int(pos.type) == 0 else "SELL"
+    entry, cur = float(pos.price_open), float(pos.price_current)
+    sign = 1.0 if direction == "BUY" else -1.0
+    if is_rev:
+        # 反转 → 收紧 SL 至现价 ± 缓冲（兑现小亏离场）
+        buf = _rev_sess_float(redis_conn, "tighten_buf_atr",
+                              _REV_TIGHTEN_BUF_ATR) * atr
+        new_sl = cur - sign * buf
+    else:
+        # 回踩 → SL 移到平仓配置时段系数：close.<session>.trailing_stop_distance × ATR
+        mult = _session_cfg_float(redis_conn, "trailing_stop_distance", 2.0)
+        new_sl = entry - sign * (mult * atr)
+    return atr, direction, entry, cur, round(float(new_sl), 2)
+
+
+def _rev_seen(redis_conn, tag: str, ticket: int, ts) -> bool:
+    """同一份评分结论(ts)在 tag 分支是否已落过归因行（幂等，防每 5s 刷行）。
+
+    tag: 'logged'（log/log_skip 假设动作）/ 'acted'（act 实改）——两者键空间隔离，
+    避免"假设动作"污染"实改"的动作价值统计（文档 §9-4）。
+    返回 True = 首次见到该结论，本轮应落行。
+
+    注：act 分支的幂等键是「检查但不写、动作成功后才写」（见 _rev_apply_verdicts），
+    与本函数的「检查即写」语义不同（前者要保证动作失败可重试），故不共用。
+    Redis 异常时返回 False：落行属观测行为，宁可少样本，也不让重复行污染统计。
+    """
+    try:
+        key = f"hcm:ai:rev:{tag}:{int(ACCOUNT_ID_MODE)}:{ticket}"
+        prev = redis_conn.get(key)
+        prev_s = (prev.decode("utf-8", "ignore") if isinstance(prev, (bytes, bytearray))
+                  else (str(prev) if prev else ""))
+        if prev_s == str(ts or ""):
+            return False
+        redis_conn.set(key, str(ts or ""), ex=86400)
+        return True
+    except Exception:
+        return False
+
+
+async def _rev_log_adjust(pool, acct, ticket, sym, direction, entry, cur,
+                          old_sl, new_sl, atr, score, cutoff, is_rev, mode):
+    """【P3 2026-09-04】记录一次 SL 调整，供后续反事实归因。
+
+    只写入、绝不干预交易；任何异常仅告警，不向上传播（失败安全）。
+    """
+    try:
+        dd = (abs(float(cur) - float(entry)) / float(atr)) if atr else 0.0
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO hcm_ai.reversal_attribution "
+                "(account_id, ticket, symbol, direction, entry_price, price_at_adj, "
+                " old_sl, new_sl, atr, score, cutoff, is_reversal, mode, dd_atr) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                int(acct), int(ticket), sym, direction,
+                float(entry), float(cur), float(old_sl), float(new_sl),
+                float(atr), float(score), float(cutoff), bool(is_rev),
+                str(mode), float(dd),
+            )
+    except Exception as e:
+        log.warning("[REV] attribution insert failed ticket=%s: %s", ticket, e)
+
+
+async def _rev_settle_closed(mt5, pool, open_tk: set):
+    """【P3 2026-09-04】结算已平仓持仓的反事实归因。
+
+    对每条未结算记录：若 ticket 已不在当前持仓中，说明已平仓 →
+      实际盈亏 = (平仓价 - 开仓价) × 方向符号
+      反事实   = 假设保持 old_sl：用「调整 → 平仓」区间的 M5 极值判断是否会被触及
+                 触及 → 反事实在 old_sl 止损；未触及 → 持仓继续，以实际平仓价离场
+      delta    = 实际 - 反事实（>0 表示反转头净贡献为正 = 减亏/增利）
+
+    open_tk：调用方已获取的当前持仓 ticket 集合（避免重复调用 MT5）。
+    """
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, ticket, symbol, direction, entry_price, old_sl, "
+                "       new_sl, adj_ts "
+                "FROM hcm_ai.reversal_attribution "
+                "WHERE account_id=$1 AND closed_ts IS NULL "
+                "ORDER BY adj_ts LIMIT 50",
+                int(ACCOUNT_ID_MODE))
+    except Exception as e:
+        log.warning("[REV] attribution fetch failed: %s", e)
+        return
+    for r in rows:
+        tk = int(r["ticket"])
+        if tk in open_tk:
+            continue          # 仍持仓，未到结算时机
+        try:
+            # ① 实际平仓价：取该持仓的出场成交（DEAL_ENTRY_OUT = 1）
+            exit_px, deal_time = None, None
+            try:
+                for d in (mt5.history_deals_get(position=tk) or []):
+                    if int(getattr(d, "entry", 0)) == 1:
+                        exit_px = float(getattr(d, "price", 0) or 0)
+                        deal_time = datetime.fromtimestamp(
+                            int(getattr(d, "time", 0)), tz=timezone.utc)
+            except Exception:
+                pass
+            if not exit_px:
+                continue      # 查不到出场成交，留待下轮重试（不误标结算）
+            direction = r["direction"] or "BUY"
+            sym = r["symbol"] or "XAUUSD"
+            entry_px = float(r["entry_price"] or 0)
+            old_sl = float(r["old_sl"] or 0)
+            adj_ts = r["adj_ts"]
+            sign = 1.0 if direction == "BUY" else -1.0
+            realized = (exit_px - entry_px) * sign
+            # ② 反事实：区间 M5 极值 vs old_sl
+            cf_exit = exit_px
+            if old_sl > 0:
+                try:
+                    if deal_time is not None:
+                        q = ("SELECT MIN(low) AS lo, MAX(high) AS hi "
+                             "FROM hcm_market.klines "
+                             "WHERE symbol=$1 AND time_frame='M5' "
+                             "AND open_time >= $2 AND open_time <= $3")
+                        args = (sym, adj_ts, deal_time)
+                    else:
+                        q = ("SELECT MIN(low) AS lo, MAX(high) AS hi "
+                             "FROM hcm_market.klines "
+                             "WHERE symbol=$1 AND time_frame='M5' AND open_time >= $2")
+                        args = (sym, adj_ts)
+                    async with pool.acquire() as c2:
+                        row = await c2.fetchrow(q, *args)
+                    if row:
+                        lo = float(row["lo"]) if row["lo"] is not None else None
+                        hi = float(row["hi"]) if row["hi"] is not None else None
+                        if direction == "BUY" and lo is not None and lo <= old_sl:
+                            cf_exit = old_sl
+                        elif direction == "SELL" and hi is not None and hi >= old_sl:
+                            cf_exit = old_sl
+                except Exception:
+                    pass
+            cf_pnl = (cf_exit - entry_px) * sign
+            delta = realized - cf_pnl
+            verdict = ("saved" if delta > 1e-6
+                       else ("killed" if delta < -1e-6 else "neutral"))
+            async with pool.acquire() as c3:
+                await c3.execute(
+                    "UPDATE hcm_ai.reversal_attribution SET closed_ts=now(), "
+                    "exit_price=$1, realized_pnl=$2, cf_exit_price=$3, cf_pnl=$4, "
+                    "delta=$5, verdict=$6 WHERE id=$7",
+                    exit_px, realized, cf_exit, cf_pnl, delta, verdict, int(r["id"]))
+            log.info("[REV] settle ticket=%s %s exit=%.2f realized=%.2f "
+                     "cf=%.2f delta=%.2f (%s)",
+                     tk, direction, exit_px, realized, cf_pnl, delta, verdict)
+        except Exception as e:
+            log.warning("[REV] settle failed ticket=%s: %s", tk, e)
+
+
+async def _rev_apply_verdicts(mt5, redis_conn, pool):
+    """主号：消费 AI 评分结论。log=仅记录；act=按判定调整 SL。"""
+    if not IS_MASTER or ACCOUNT_ID_MODE is None:
+        return
+    try:
+        positions = mt5.positions_get() or []
+    except Exception:
+        return
+    # 【P3·归因 2026-09-04】先结算已平仓持仓的归因（复用上面已取的持仓快照，
+    # 避免重复调用 MT5）。刻意放在 enabled 判断之前：即使反转头被禁用，
+    # 历史调整记录也必须闭环结算，否则归因样本永远残缺。
+    try:
+        await _rev_settle_closed(mt5, pool, {int(p.ticket) for p in positions})
+    except Exception as _se:
+        log.warning("[REV] settle loop failed: %s", _se)
+    if not _rev_bool_cfg(redis_conn, "ai.rev.enabled", False):
+        return
+    mode = _rev_str_cfg(redis_conn, "ai.rev.mode", "log").strip().lower()
+    for pos in positions:
+        ticket = int(pos.ticket)
+        try:
+            raw = redis_conn.get(f"hcm:ai:reversal:{int(ACCOUNT_ID_MODE)}:{ticket}")
+            if not raw:
+                continue
+            vd = json.loads(raw)
+            score = float(vd.get("score", 0) or 0)
+            cutoff = float(vd.get("cutoff", 1.1) or 1.1)
+            is_rev = bool(score > cutoff)
+            sym = getattr(pos, "symbol", "") or ""
+            if mode != "act":
+                # log（默认）：只记录"若启用会怎么做"，绝不改仓。
+                # 【A1 采集补强 2026-09-04】与 act 分支同口径落归因行，mode='log'，
+                # new_sl 为"假设动作目标值"——不 MODIFY、不占用 acted 幂等键。
+                # 目的：shadow 期即可产出"假设动作"归因样本，否则日报恒空（文档 §1.4-3）。
+                log.info("[REV] verdict ticket=%s score=%.4f cutoff=%.4f → %s "
+                         "mode=%s (仅记录，不改仓)", ticket, score, cutoff,
+                         "反转/及时止损" if is_rev else "回踩/放宽至时段系数", mode)
+                _tg = await _rev_target_sl(redis_conn, pool, pos, sym, is_rev)
+                if _tg and _rev_seen(redis_conn, "logged", ticket, vd.get("ts", "")):
+                    _atr, _dir, _entry, _cur, _nsl = _tg
+                    try:
+                        await _rev_log_adjust(
+                            pool, int(ACCOUNT_ID_MODE), ticket, sym, _dir,
+                            entry=_entry, cur=_cur,
+                            old_sl=float(getattr(pos, "sl", 0) or 0), new_sl=_nsl,
+                            atr=_atr, score=score, cutoff=cutoff,
+                            is_rev=is_rev, mode="log")
+                    except Exception as _le:
+                        log.warning("[REV] shadow attribution failed ticket=%s: %s",
+                                    ticket, _le)
+                continue
+            # ── act 模式（需红线授权）──
+            # 同一份结论只允许动作一次：SL 目标随现价重算，若每 5s 都执行，
+            # 价格有利移动时会反复 MODIFY（SL 棘轮跟随），违背冷却防刷屏初衷。
+            # 以"结论 ts"为幂等键：新一次评分产出新 ts 才会再次动作。
+            try:
+                _acted_key = f"hcm:ai:rev:acted:{int(ACCOUNT_ID_MODE)}:{ticket}"
+                _prev = redis_conn.get(_acted_key)
+                _prev_s = _prev.decode("utf-8", "ignore") \
+                    if isinstance(_prev, (bytes, bytearray)) else (str(_prev) if _prev else "")
+                if _prev_s == str(vd.get("ts", "")):
+                    continue
+            except Exception:
+                pass
+            # 目标 SL 口径与 log 分支共用 _rev_target_sl，杜绝两份实现行为分叉
+            _tg = await _rev_target_sl(redis_conn, pool, pos, sym, is_rev)
+            if not _tg:
+                continue
+            atr, direction, entry, cur, new_sl = _tg
+            sign = 1.0 if direction == "BUY" else -1.0
+            cur_sl = float(getattr(pos, "sl", 0) or 0)
+            # 【反转确认 v0·2026-09-04】判「反转」不立即收紧 → pending 待价格确认，
+            # 避免 V 型反弹误杀（当日实证：408393352 收紧即被扫、价格随后反弹）。
+            # 仅 is_rev=True 生效；回踩(放宽)或 confirm_enabled=false 走原立即动作。
+            if is_rev and _rev_bool_cfg(redis_conn, "ai.rev.confirm_enabled", True):
+                _pk = f"hcm:ai:rev:pending:{int(ACCOUNT_ID_MODE)}:{ticket}"
+                _confirm_atr = _rev_sess_float(redis_conn, "confirm_atr", 0.6)
+                try:
+                    _pend_raw = redis_conn.get(_pk)
+                except Exception:
+                    _pend_raw = None
+                _now_ts = time.time()
+                if not _pend_raw:
+                    # 首次判反转：记基准现价，本轮不动
+                    try:
+                        redis_conn.set(_pk, json.dumps({"ts": _now_ts, "base": cur}),
+                                       ex=900)
+                    except Exception:
+                        pass
+                    log.info("[REV] rev-pending ticket=%s base=%.2f score=%.4f "
+                             "(待确认≥%.1fATR，本轮不动作)", ticket, cur, score,
+                             _confirm_atr)
+                    continue
+                try:
+                    _pend = json.loads(_pend_raw)
+                except Exception:
+                    _pend = {}
+                _base = float(_pend.get("base", cur))
+                _drop = sign * (cur - _base)          # BUY 为负=下跌(确认方向)
+                _tmo = float(_rev_float_cfg(redis_conn, "ai.rev.confirm_timeout_sec", 900))
+                if _now_ts - float(_pend.get("ts", 0)) > _tmo:
+                    try:
+                        redis_conn.delete(_pk)
+                    except Exception:
+                        pass
+                    log.info("[REV] rev-timeout ticket=%s base=%.2f (超时未确认，保原SL)",
+                             ticket, _base)
+                    continue
+                if _drop < 0:
+                    if _drop <= -_confirm_atr * atr:
+                        # 确认反转（逆行≥confirm_atr×ATR）→ 落入下方收紧执行
+                        try:
+                            redis_conn.delete(_pk)
+                        except Exception:
+                            pass
+                        log.info("[REV] rev-confirmed ticket=%s base=%.2f cur=%.2f "
+                                 "drop=%.2fATR → 执行收紧", ticket, _base, cur,
+                                 -_drop / atr)
+                    else:
+                        continue        # 逆行不足 confirm_atr → 继续等待
+                else:
+                    # 反弹(回到基准价及以上)=V型 → 取消动作，保原 SL
+                    try:
+                        redis_conn.delete(_pk)
+                    except Exception:
+                        pass
+                    log.info("[REV] rev-cancel ticket=%s base=%.2f cur=%.2f "
+                             "(V型反弹，取消动作)", ticket, _base, cur)
+                    continue
+            # 只朝有利方向改：反转时只允许收紧（更靠近现价），回踩时只允许放宽。
+            # 【A2 2026-09-04】"想动没动成"也落归因行，mode='log_skip'——与 act 行
+            # 区分标签，供日报漏斗对账，且不得污染"动作价值"统计（文档 §9-4）。
+            _skip = None
+            if is_rev and cur_sl > 0 and sign * (new_sl - cur_sl) <= 0:
+                _skip = "rev_not_tighter"     # 新 SL 未比原 SL 更紧 → 不改
+            elif (not is_rev) and cur_sl > 0 and sign * (cur_sl - new_sl) <= 0:
+                _skip = "pull_not_wider"      # 新 SL 未比原 SL 更宽 → 不改
+            elif cur_sl > 0 and abs(new_sl - cur_sl) < 1e-6:
+                _skip = "no_change"
+            if _skip:
+                if _rev_seen(redis_conn, "logged", ticket, vd.get("ts", "")):
+                    try:
+                        await _rev_log_adjust(
+                            pool, int(ACCOUNT_ID_MODE), ticket, sym, direction,
+                            entry=entry, cur=cur, old_sl=cur_sl, new_sl=new_sl,
+                            atr=atr, score=score, cutoff=cutoff,
+                            is_rev=is_rev, mode="log_skip")
+                    except Exception as _sk:
+                        log.warning("[REV] skip attribution failed ticket=%s (%s): %s",
+                                    ticket, _skip, _sk)
+                continue
+            req = {
+                "action": _mt5_global.TRADE_ACTION_SLTP,
+                "position": ticket, "symbol": sym,
+                "sl": new_sl, "tp": float(getattr(pos, "tp", 0) or 0),
+            }
+            ret = _mt5_global.order_send(req)
+            if ret is None or getattr(ret, "retcode", None) != _mt5_global.TRADE_RETCODE_DONE:
+                log.warning("[REV] SL modify failed ticket=%s retcode=%s", ticket,
+                            getattr(ret, "retcode", None))
+                continue
+            try:
+                redis_conn.set(_acted_key, str(vd.get("ts", "")), ex=86400)
+            except Exception:
+                pass
+            log.info("[REV] act ticket=%s %s SL %.2f→%.2f (score=%.4f %s)", ticket,
+                     direction, cur_sl, new_sl, score,
+                     "反转收紧" if is_rev else "回踩放宽")
+            # 【P3·归因 2026-09-04】记录本次调整为后续反事实归因留痕。
+            # 纯写入、不干预交易；失败仅告警，不得影响主链路。
+            try:
+                await _rev_log_adjust(
+                    pool, int(ACCOUNT_ID_MODE), ticket, sym, direction,
+                    entry=entry, cur=cur, old_sl=cur_sl, new_sl=new_sl,
+                    atr=atr, score=score, cutoff=cutoff, is_rev=is_rev, mode=mode)
+            except Exception as _ae:
+                log.warning("[REV] attribution log failed ticket=%s: %s", ticket, _ae)
+        except Exception as e:
+            log.error("[REV] apply failed ticket=%s: %s", ticket, e)
 
 
 async def _update_trailing_stops(mt5, redis_conn, pool):

@@ -145,6 +145,7 @@ from signal_tower.signal_publisher import SignalData, SignalPublisher
 from signal_tower.watchdog import WatchdogManager
 from signal_tower.quality_gate import decide as ai_quality_decide
 from signal_tower.quality_gate import log_gate_decision as ai_log_gate_decision
+from signal_tower.rev_daily import aggregate_rev_daily as _aggregate_rev_daily
 from signal_tower.ai_async_client import (
     calibrate_lm_score,
     read_ds_out,
@@ -259,6 +260,11 @@ class SymbolState:
     # 一旦 _produce_signal 产出任何决策(BUY/SELL 或 NO_TRADE/filtered)即归零。
     bars_without_decision: int = 0
     decision_stall_warned: bool = False
+
+    # 【2026-09-01 方案D·入场时机闸门】因「M5 动量与信号方向相反」被 hexp 拦下的信号，
+    # 挂起等待（pending）而非作废：{direction, since_ts, mm}。棒间(3s)重评中若动量
+    # 转向则放行执行；超过 entry_pending_ttl_sec 则放弃（不再追），避免反弹顶/回调底追单。
+    momentum_pending: Optional[dict] = None
 
     # ── Bar confirmation state ──
     prev_bar_open: float = 0.0
@@ -645,6 +651,10 @@ class Scheduler:
             "ai.cpl.enabled", "ai.cpl.w_trend", "ai.cpl.w_neutral", "ai.cpl.w_range",
             "ai.cpl.k_trend_min", "ai.cpl.k_range_max", "ai.cpl.tier_high",
             "ai.cpl.tier_mid", "ai.cpl.tier_low", "ai.cpl.lot_high", "ai.cpl.lot_low",
+            # 【2026-08-31 方向共振生效修复】补白名单：quality_gate 阶段1方向共振消费
+            # ai.lm.direction_fuse / ai.lm.dir_veto_prob，此前漏进白名单 → cfg 恒缺键 →
+            # quality_gate 读 fallback False → 反向否决/同向增强形同虚设（配置了≠生效）。
+            "ai.lm.direction_fuse", "ai.lm.dir_veto_prob",
         ]
         out: dict = {}
         for k in keys:
@@ -1372,6 +1382,40 @@ class Scheduler:
                     state.live_edge_armed = True
                     continue
                 _cur_bar = klines[-1].get("open_time") if klines else None
+                # 【2026-09-01 方案D·入场时机闸门】挂起等待(pending)处理：
+                #  · 超过 TTL → 放弃（不再追，防长时间无效挂单）
+                #  · 动量已转向（本轮 hexp 不再判 momentum_pending 且方向回到原方向）→ 放行
+                #  · 动量仍与方向相反 → 抑制本轮触发（挂起等待，绝不市价追顶/追底）
+                _pend = getattr(state, "momentum_pending", None)
+                # 【2026-09-04 配置化】挂起开关与超时原为 getattr 硬编码默认
+                # （面板不可见、无法热调），现改为读配置中心；默认值沿用原
+                # 行为(True / 900s)，未 seed 的环境与改动前完全一致。
+                _pend_on = await self._config.get_bool(
+                    "signal_tower.entry_pending_enabled", True) if self._config else True
+                _pend_ttl = 900.0
+                if self._config is not None:
+                    try:
+                        _pend_ttl = float(await self._config.get_float(
+                            "signal_tower.entry_pending_ttl_sec", 900.0))
+                    except (TypeError, ValueError):
+                        _pend_ttl = 900.0
+                if _pend and _pend_on:
+                    _age = time.time() - float(_pend.get("since_ts", 0.0) or 0.0)
+                    if _age > _pend_ttl:
+                        logger.info(
+                            "MOMENTUM PENDING TIMEOUT: %s dir=%s age=%.0fs → 放弃(不再追)",
+                            state.symbol, _pend.get("direction"), _age)
+                        state.momentum_pending = None
+                    elif (not getattr(score_result, "momentum_pending", False)
+                          and score_result.direction == _pend.get("direction")):
+                        logger.info(
+                            "MOMENTUM PENDING RELEASED: %s dir=%s age=%.0fs → 动量已转向, 放行",
+                            state.symbol, _pend.get("direction"), _age)
+                        state.momentum_pending = None
+                    else:
+                        # 动量仍与方向相反 → 本轮不触发（挂起等待）
+                        stable_dir, stable_count = "", 0
+                        continue
                 if score_result.direction in ("BUY", "SELL"):
                     if score_result.direction == stable_dir:
                         stable_count += 1
@@ -1651,6 +1695,10 @@ class Scheduler:
         #   此处初始化为 1.0，防止 AI block 早期 return 时引用未绑定变量。
         ai_lot_tier: str = "none"
         suggested_lot: float = 1.0
+        # 2026-08-31 纠偏：耦合模式判定与闸门决策暂存（默认非耦合/无决策）。
+        # 耦合模式下手数档位不预选、改由风控面板 risk.score_tier_* 按 confidence 裁决。
+        _ai_coupled: bool = False
+        _decision: Optional[dict] = None
 
         # ── P2c: suppress-reason aggregation ──
         # Each gating layer records its reason with a priority so the final
@@ -1858,9 +1906,20 @@ class Scheduler:
             # 和乘幂独立信号源：异步多周期管线（内部自拉 H1/H4/D1/M1 K 线），
             # 输出 ScoreResult 契约 + hexp 元数据（grade/hp_score/k/period_states/…）。
             # 下游 Step4b co_source.apply 对非 co_source 模型原样透传，无需特判。
+            # 【2026-09-01 AI 方向头快翻·选项B】produce 前读 dir_lm 传入，供 hexp 方向裁决
+            # 在"dir_lm 高置信反向持续确认"时强制翻向（hexp.dir_lm_flip_enabled 灰度关）。
+            _ai_dir_h, _ai_dir_p_h = None, None
+            try:
+                _aiq_h = await self._read_ai_quality(state.symbol)
+                if _aiq_h:
+                    _ai_dir_h = _aiq_h.get("ai_direction")
+                    _ai_dir_p_h = _aiq_h.get("ai_dir_prob")
+            except Exception:
+                pass
             score_result = await self._hexp_engine.produce(
                 state.symbol, indicators, regime_result, live=False,
                 zone_level=zone_level, zone_type=zone_type, zone_strength=zone_strength,
+                ai_direction=_ai_dir_h, ai_dir_prob=_ai_dir_p_h,
             )
         else:
             _engine = getattr(self, profile["engine"], self._scoring_engine)
@@ -2048,6 +2107,20 @@ class Scheduler:
                 "direction": _direction,
             }
             _ai_cfg = await self._ai_cfg_dict()
+            # 【会话化 2026-09-04】三头共振参数按当前 session(asia/europe/us) 覆盖：
+            # ai.lm.{dir_veto_prob,entry_veto_prob,entry_boost_prob}.{session} 优先于全局键。
+            # 会话上下文由此真正参与 gate 裁决（用户需求：方向/买入/反转头会话化）。
+            try:
+                _cur_sess = _current_session_utc()
+                for _sk in ("ai.lm.dir_veto_prob", "ai.lm.entry_veto_prob",
+                            "ai.lm.entry_boost_prob"):
+                    _sv = _ai_cfg.get(f"{_sk}.{_cur_sess}")
+                    if _sv is not None:
+                        _ai_cfg[_sk] = _sv
+            except Exception:
+                pass
+            # 2026-08-31 纠偏：耦合模式判定（手数档位改交风控面板 risk.score_tier_* 裁决）。
+            _ai_coupled = str(_ai_cfg.get("ai.mode", "decoupled")) == "coupled"
             # 【阶段 1·方向共振】把 sidecar 的 dir_lm 传给 gate，与 _snap.direction(dir_hexp)共振。
             # 【阶段 2·买点共振】把 sidecar 的 entry_lm(ai_entry 好买点概率)传给 gate，
             # 与 hexp entry_quality 共振(增强好点位/否决差点位)。两者默认 None → 不共振。
@@ -2090,13 +2163,17 @@ class Scheduler:
             # 手数分档透传：AI 只选档(low/mid/high)，实际倍率由风控面板动态手数决定
             # （不再在 signal_tower 侧乘固定倍率，避免双重倍率叠加）。
             ai_lot_tier = _q_tier
-            # 【2026-08-28 口径修正】lot_tier_for 输入已是 scorecard_total(0~1 口径)，阈值
-            # 已对齐为 0.65/0.55/0.45（见 quality_gate.py 默认值与 DB 热调）。若返回 none，
-            # 表示 scorecard_total < 0.45（真实极弱信号），此处归一为 "low"（最小档）作为
-            # 回退兜底：风控 _apply_dynamic_lot 走 ai_tier="low" 分支 → risk.lot_multiplier_low
-            # （0.5）→ 最小手数 0.01，避免回退到 confidence 分档造成口径漂移。
-            # 注：这是有意的兜底（弱信号最小档），非掩盖 bug——阈值已正确，none 即真弱。
-            if ai_lot_tier == "none":
+            # 【2026-08-31 纠偏·贴合用户指令】耦合模式手数档位【不】在信号塔预选、
+            # 也【不】新增任何配置键；改为把触发下单的耦合分 total(0–100，「下单分」)
+            # 作为 confidence 透传给风控引擎，由【既有】风控面板动态手数规则裁决：
+            #   risk.score_tier_low/mid/high(生产=0.50/0.80/0.95) 对 confidence 分档 →
+            #   下单分<80→low(×0.5) / 80≤下单分≤95→mid(×1.0) / 下单分>95→high(×1.5)，
+            #   倍率由 risk.lot_multiplier_{low|mid|high}(0.5/1.0/1.5) 决定（均风控面板既有参数）。
+            #   故耦合路径显式置 ai_lot_tier="none"（交风控按 confidence 现算档位），不归一为 low。
+            #   解耦/HEXP 独立：沿用既有 tier_*(65/55/45) 预选档位（历史机制），none 归一为 low 作最小档兜底。
+            if _ai_coupled:
+                ai_lot_tier = "none"
+            elif ai_lot_tier == "none":
                 ai_lot_tier = "low"
             # 【2026-08-31】趋势启动单：手数改由 lot_tier 分档链动风控动态手数，
             # 不再依赖固定的 lot_mult 折减（禁用硬编码倍率）。实际倍率由风控
@@ -2126,23 +2203,28 @@ class Scheduler:
                     float(_decision.get("total_score") or 0.0),
                 )
 
-            # 2026-08-27 修订：耦合总分(coupling_total)仅用于手数链动(lot_tier，见 quality_gate 275
-            # 行的 lot_tier_for(total))，不再作为下单闸门——下单严格由 HEXP 6 维 passed 决定。
-            # 此处仅观测耦合分是否低于 hexp.coupling_pass_threshold（供报表/诊断），绝不改写
-            # threshold_passed（不拦下单）。AI 耦合时"总分链动"=手数倍率用耦合总分；解耦时
-            # 总分只计 hp_score（quality_gate 解耦分支 total_score=hp_score）。两种情况下单闸门
-            # 均回归 6 维综合(scorecard_total)。
+            # 2026-08-31 耦合分下单闸门（B 叠加式）：HEXP 6 维过闸 且 耦合分过闸 才下单。
+            # 此前（2026-08-27）该分支仅观测耦合分（COUPLING-BELOW-MIN(obs)），不拦单；
+            # 现按需求改为真正抑制：HEXP 已过闸但耦合总分低于 hexp.coupling_pass_threshold
+            # → 不下单（AI 对 HEXP 过闸信号做低耦合分否决，绝不抬开 HEXP 未过信号）。
+            # 解耦 / HEXP 未过闸信号 decide 透传 coupling_pass=True，不命中此分支（铁律友好）。
             if _decision.get("coupling_pass") is False and score_result.threshold_passed:
                 _cp_thr = float(_ai_cfg.get("hexp.coupling_pass_threshold", 50.0))
                 _cp_total = float(_decision.get("total_score") or 0.0)
                 self._stats["ai_gate_rejects"] += 1
                 logger.info(
-                    "AI quality gate COUPLING-BELOW-MIN(obs) %s %s: total=%.2f < threshold=%.2f "
-                    "(c_ai=%.2f hp=%.1f) — NOT suppressed (6-dim hexp gate honored, coupling drives lot only)",
+                    "AI quality gate COUPLING-BELOW-MIN %s %s: total=%.2f < threshold=%.2f "
+                    "(c_ai=%.2f hp=%.1f) — SUPPRESSED (coupled order gate: hexp passed but coupling score below min)",
                     state.symbol, _direction, _cp_total, _cp_thr,
                     ai_q["c_ai"], getattr(score_result, "hp_score", 0.0),
                 )
-                # 不修改 threshold_passed：耦合分只影响手数档，不影响放行闸门
+                suppress_chain.append((11, "ai_coupling_below"))
+                await self._publish_filtered_signal(
+                    state, indicators, regime_result, score_result, trace_id,
+                    zone_level=zone_level, zone_type=zone_type, zone_strength=zone_strength,
+                    suppress_reason=_format_suppress_reason(suppress_chain),
+                )
+                return
 
         if not score_result.threshold_passed:
             logger.info(
@@ -2261,7 +2343,14 @@ class Scheduler:
         # （0–100）及手数分档(score_tier_low/mid)口径对齐。pre_score 是 0–1 制，
         # 原样填入会让满分(A类100分)信号被风控误判 confidence=1.00<60 → REJECT。
         # 改用 6 维综合分 scorecard_total（0–100，放行强度权威口径）。
-        final_confidence = float(getattr(score_result, "scorecard_total", 0.0) or 0.0)
+        # 2026-08-31 纠偏：耦合模式 confidence 改用"触发下单的耦合分 total"(0–100，即
+        # 「下单分」)，使风控面板 risk.score_tier_{low,mid,high}(0.50/0.80/0.95) 对
+        # confidence 分档生效（下单分<80→low / 80≤≤95→mid / >95→high），倍率由
+        # 既有 risk.lot_multiplier_* 决定；零新增配置键（贴合用户指令）。
+        if _ai_coupled and _decision is not None:
+            final_confidence = float(_decision.get("total_score") or 0.0)
+        else:
+            final_confidence = float(getattr(score_result, "scorecard_total", 0.0) or 0.0)
         self._stats["signals_bypassed"] += 1
 
         # ── 【2026-08-26 反向单】momentum_flip 高位动量反向候选真下单路径 ──
@@ -2289,6 +2378,39 @@ class Scheduler:
             elif _rc_dir in ("BUY", "SELL"):
                 # 原评分已给出方向（非 flip 拦下）→ 反向候选不再覆写，避免与正常信号冲突
                 _reverse_order = False
+
+        # ── P1-2（2026-09-02）：live_override 禁止在「已大幅单边延伸」后追单 ──
+        # 实证 2026-09-02：多笔 live_override 亏损单是在一段已运行多根、单边延伸的
+        # 行情末端即时追入（棒内极值），随后回归打满原始止损。
+        # 措施：仅对 live_override 路径（bar-close 常规信号不拦，避免误杀趋势延续单），
+        #   计算近 N 根收盘价相对 N 根前的同向累计位移；超过 X×ATR 即判「行情已单边延伸」，
+        #   将 final_direction 置 NO_TRADE（不追延伸末端）。反向接刀单(_reverse_order)豁免。
+        # 开关：hexp.live_extend_guard_enabled(默认 True) / _bars(默认 6) / _atr(默认 1.5)
+        if (live_override
+                and final_direction in ("BUY", "SELL")
+                and (not _reverse_order)):
+            _leg_on = (await self._config.get_bool("hexp.live_extend_guard_enabled", True)
+                       if self._config else True)
+            if _leg_on and len(closes) > 7:
+                _leg_bars = (await self._config.get_int("hexp.live_extend_bars", 6)
+                             if self._config else 6)
+                _leg_atr = (await self._config.get_float("hexp.live_extend_atr", 1.5)
+                            if self._config else 1.5)
+                _atr14 = float(getattr(indicators, "atr_14", 0.0) or 0.0)
+                if _atr14 > 0 and len(closes) > _leg_bars + 1:
+                    _ref = float(closes[-(_leg_bars + 1)])
+                    _now = float(closes[-1])
+                    _leg = (_now - _ref) if final_direction == "BUY" else (_ref - _now)
+                    _leg_atr_ratio = _leg / _atr14
+                    if _leg_atr_ratio > _leg_atr:
+                        logger.info(
+                            "P1-2 live_extend GUARD NO_TRADE %s/%s %s: recent %.0f-bar leg %.2f = %.2f×ATR "
+                            "(chasing extended move → skip live_override)",
+                            state.symbol, state.timeframe, final_direction,
+                            _leg_bars, _leg, _leg_atr_ratio,
+                        )
+                        final_direction = "NO_TRADE"
+                        suppress_chain.append((18, f"live_extend_guard(leg={_leg_atr_ratio:.2f}atr)"))
 
         # 【2026-08-17 修复】bypass_reason 缺失定义：原代码在 SignalData.fallback_reason
         # 与最终日志均引用 bypass_reason，但函数内从未赋值 → live override 触发路径每
@@ -2743,6 +2865,10 @@ class Scheduler:
                 # 综合裁决方向（多因子加权和+EMA平滑+迟滞），面板方向箭头唯一正确来源。
                 "direction": getattr(score_result, "direction", "NO_TRADE"),
                 "grade": getattr(score_result, "grade", None),
+                # 2026-09-01：grade 被安全护栏否决（纯观测）。统计等级胜率时须排除
+                # grade_vetoed=True 的样本，否则 A/S 级会被 NO_TRADE 信号污染。
+                "grade_vetoed": bool(getattr(score_result, "grade_vetoed", False)),
+                "grade_veto_by": getattr(score_result, "grade_veto_by", ""),
                 "factor_scores": getattr(score_result, "factor_scores", None),
                 "trend_scores": getattr(score_result, "trend_scores", None),
                 "period_states": getattr(score_result, "period_states", None),
@@ -2907,6 +3033,24 @@ class Scheduler:
         """
         if self._signal_publisher is None:
             return
+
+        # 【2026-09-01 方案D·入场时机闸门】信号因「M5 动量与方向相反」被 hexp 拦下 →
+        # 登记挂起等待(pending)，棒间重评中动量转向即放行执行，超时则放弃。此处不下单。
+        # 【2026-09-04 配置化】同上：挂起总开关改读配置中心（默认 True 保持原行为）。
+        _pend_on_reg = await self._config.get_bool(
+            "signal_tower.entry_pending_enabled", True) if self._config else True
+        if getattr(score_result, "momentum_pending", False) and _pend_on_reg:
+            _pdir = str(getattr(score_result, "momentum_pending_dir", "") or "")
+            if _pdir in ("BUY", "SELL"):
+                state.momentum_pending = {
+                    "direction": _pdir,
+                    "since_ts": time.time(),
+                    "mm": float(getattr(score_result, "momentum_pending_mm", 0.0) or 0.0),
+                }
+                logger.info(
+                    "MOMENTUM PENDING: %s dir=%s mm=%.4f → 挂起等动量转向(不市价追)",
+                    state.symbol, _pdir, state.momentum_pending["mm"],
+                )
 
         signal_id = await self._signal_publisher.generate_signal_id()
 
@@ -3782,17 +3926,25 @@ class Scheduler:
         return (prev_h, prev_l, prev_c)
 
     async def _fetch_and_build_zones(
-        self, state: "SymbolState", current_price: float
+        self, state: "SymbolState", current_price: float,
+        tf_hint: Optional[str] = None,
     ) -> list:
         """Fetch klines and build the full confluence-zone list for the symbol.
 
-        Shared by _compute_entry_zone (nearest zone) and _compute_target_zone
-        (next profit-direction zone for TP anchoring). Returns [] on any failure
+        Shared by _compute_entry_zone (nearest zone), _compute_target_zone
+        (next profit-direction zone for TP anchoring) and
+        _resolve_entry_zone_for_direction. Returns [] on any failure
         so callers never block signal production.
+
+        tf_hint: 指定单一时间框架（默认 None → 按 H1→M15→M5 取首个够数者）。
         """
         # H1 preferred, falls back to M15 then M5. Dynamic limit covers the
         # previous UTC day for daily-pivot derivation.
-        tf_chain = ("H1", "M15", "M5")
+        # 【2026-09-01】tf_hint 让调用方可跨 tf 回退：原逻辑 H1 一有结果即 break，
+        # 但 H1 的 zone 可能全落在现价一侧（无方向适配），此时低层 tf 的近端适配
+        # 位永远取不到（实测：现价 4435，H1 仅输出 4396/4400 均在下方，SELL 需要
+        # 上方阻力 → 恒 None；而 M5 有 4440.31 上方 5.4 点却从未被使用）。
+        tf_chain = (tf_hint,) if tf_hint else ("H1", "M15", "M5")
         tf_limit = {"H1": 200, "M15": 400, "M5": 600}
         tf_params = {
             "H1":  {"cm": 0.3, "ms": 3},
@@ -3907,32 +4059,40 @@ class Scheduler:
         if direction not in ("BUY", "SELL"):
             return None
         try:
-            zones = await self._fetch_and_build_zones(state, current_price)
-            if not zones:
-                return None
-            if direction == "SELL":
-                cands = [z for z in zones
-                         if z.ztype in ("RESISTANCE", "PIVOT")
-                         and z.level >= current_price]
-            else:
-                cands = [z for z in zones
-                         if z.ztype in ("SUPPORT", "PIVOT")
-                         and z.level <= current_price]
-            if not cands:
-                return None
-            near = min(cands, key=lambda z: abs(z.level - current_price))
-            gap = abs(near.level - current_price)
-            _max_gap = (atr * max_gap_mult) if atr and atr > 0 else 30.0
-            if gap > _max_gap:
-                # 方向对齐但离现价过远（如远处 RESISTANCE）→ 不值得等触达，
-                # 返回 None 让调用方直接市价成交，避免牺牲利润/超时丢单。
-                logger.info(
-                    "Entry zone %s/%s %s skipped (too far): %.2f gap=%.2f > max=%.2f",
-                    state.symbol, state.timeframe, direction,
-                    near.level, gap, _max_gap,
-                )
-                return None
-            return (float(near.level), near.ztype, near.strength)
+            # 【2026-09-01 修复】跨时间框架回退。原实现只取 _fetch_and_build_zones
+            # 的单一结果(H1 优先)，当 H1 的 zone 全落在现价一侧时无方向适配候选
+            # → 恒返回 None，zone 相关逻辑(入场等待 / hexp_zone_blocked 硬闸门)
+            # 全部空转。现按 H1→M15→M5 依次尝试，首个给出「方向对齐且在近端」
+            # 的 tf 胜出；某 tf 候选过远则继续尝试下一个，而非直接放弃。
+            for _tf in ("H1", "M15", "M5"):
+                zones = await self._fetch_and_build_zones(state, current_price, tf_hint=_tf)
+                if not zones:
+                    continue
+                if direction == "SELL":
+                    cands = [z for z in zones
+                             if z.ztype in ("RESISTANCE", "PIVOT")
+                             and z.level >= current_price]
+                else:
+                    cands = [z for z in zones
+                             if z.ztype in ("SUPPORT", "PIVOT")
+                             and z.level <= current_price]
+                if not cands:
+                    continue
+                near = min(cands, key=lambda z: abs(z.level - current_price))
+                gap = abs(near.level - current_price)
+                _max_gap = (atr * max_gap_mult) if atr and atr > 0 else 30.0
+                if gap > _max_gap:
+                    # 方向对齐但离现价过远（如远处 RESISTANCE）→ 不值得等触达，
+                    # 换下一个 tf；都太远则返回 None 让调用方直接市价成交，
+                    # 避免牺牲利润/超时丢单。
+                    logger.info(
+                        "Entry zone %s/%s %s skipped via %s (too far): %.2f gap=%.2f > max=%.2f",
+                        state.symbol, state.timeframe, direction, _tf,
+                        near.level, gap, _max_gap,
+                    )
+                    continue
+                return (float(near.level), near.ztype, near.strength)
+            return None
         except Exception as exc:  # noqa: BLE001
             logger.warning("Entry zone resolve failed for %s/%s: %s",
                            state.symbol, direction, exc)
@@ -4353,14 +4513,18 @@ class Scheduler:
                     for d in range(_backfill_days, 0, -1):
                         _day = (datetime.now().date() - timedelta(days=d))
                         await self._aggregate_daily_kpi(db, _day)
+                        # 2026-09-04 反转头日报同节拍回填（空表天然安全）
+                        await _aggregate_rev_daily(db, _day)
                     _last_backfilled = True
                 # 2) 每日补算：仅当"昨天"已完整过去（now >= 昨天+1天 的 00:05）
                 _now = datetime.now()
                 _yesterday = (_now.date() - timedelta(days=1))
                 if _now.hour >= 0 and _now.minute >= 5:  # 跨日且已过 00:05
                     await self._aggregate_daily_kpi(db, _yesterday)
+                    await _aggregate_rev_daily(db, _yesterday)
                 # 3) 当天实时聚合（upsert，供前端当日进度查看）
                 await self._aggregate_daily_kpi(db, _now.date())
+                await _aggregate_rev_daily(db, _now.date())
             except Exception as exc:  # noqa: BLE001
                 logger.warning("AI daily KPI loop failed: %s", exc)
             await asyncio.sleep(interval_sec)

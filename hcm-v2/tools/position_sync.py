@@ -178,7 +178,7 @@ async def sync_positions(mt5, pool, redis_conn, account_id_mode: Optional[int] =
     # 修复「幽灵持仓」核心缺陷：原逻辑只同步活持仓，从不把已平持仓清出 PG，
     # 导致 hcm_trading.positions 永远残留 open → 风险引擎限仓计数虚高 → 不下单。
     try:
-        await _close_stale_positions(pool, self_account, live_tickets, redis_conn)
+        await _close_stale_positions(pool, self_account, live_tickets, redis_conn, mt5)
     except Exception as e:
         log.error(f"Stale position reconciliation failed: {e}")
 
@@ -793,7 +793,68 @@ def _record_after_close_cooldown(redis_conn, symbol: str) -> None:
         log.warning("after_close_cooldown set failed for %s: %s", symbol, e)
 
 
-async def _close_stale_positions(pool, account_id: int, live_tickets: set[int], redis_conn) -> None:
+# ── 2026-09-01：平仓归因（替代硬编码 'sync_reconcile'）──
+# 原实现把 orders.close_reason 恒写 'sync_reconcile'，无法区分 SL / TP / 保本(BE) /
+# 手动 / 强平 → 扫损、提前止盈等归因完全不可做（hcm-web ai_report.py 已标注此缺陷）。
+# MT5 deal.reason 取值：0=CLIENT 1=MOBILE 2=WEB 3=EXPERT 4=SL 5=TP 6=SO(stop out)
+_CLOSE_REASON_BY_DEAL = {
+    0: "manual",     # DEAL_REASON_CLIENT（客户端手动平仓）
+    1: "manual",     # DEAL_REASON_MOBILE
+    2: "manual",     # DEAL_REASON_WEB
+    3: "expert",     # DEAL_REASON_EXPERT（EA/程序主动平仓：移动止损、强制平仓等）
+    4: "sl",         # DEAL_REASON_SL
+    5: "tp",         # DEAL_REASON_TP
+    6: "stop_out",   # DEAL_REASON_SO（保证金不足强平）
+}
+
+
+def _infer_close_reason(mt5, ticket: int, open_price, logger=None) -> tuple:
+    """从 MT5 成交历史推断真实平仓原因。
+
+    BE 判定：reason=SL 且成交价与开仓价之差在容差内 → 移动止损已推至保本。
+    容差取 max(0.05, |开仓价| * 1e-4)，对 XAUUSD(约 4500) 约 0.45 美元。
+
+    Returns:
+        (reason_str, deal_close_price)；无法判定时返回 ('sync_reconcile', 0.0)。
+        任何异常都被吞掉并回退原值，绝不影响对账主流程。
+    """
+    if mt5 is None:
+        return "sync_reconcile", 0.0
+    try:
+        deals = mt5.history_deals_get(position=int(ticket))
+        if not deals:
+            return "sync_reconcile", 0.0
+        def _fld(obj, name, default=None):
+            """MT5 官方返回 namedtuple，但部分封装/代理返回 dict，两种形态都要能读。"""
+            v = getattr(obj, name, None)
+            if v is None and isinstance(obj, dict):
+                v = obj.get(name)
+            return default if v is None else v
+
+        out = None
+        for d in deals:
+            if _fld(d, "entry") == 1:  # DEAL_ENTRY_OUT = 离场
+                out = d
+                break
+        if out is None:
+            return "sync_reconcile", 0.0
+        reason_id = _fld(out, "reason")
+        price = float(_fld(out, "price", 0.0) or 0.0)
+        reason = _CLOSE_REASON_BY_DEAL.get(reason_id)
+        if reason is None:
+            return "sync_reconcile", price
+        if reason == "sl" and open_price:
+            tol = max(0.05, abs(float(open_price)) * 1e-4)
+            if abs(price - float(open_price)) <= tol:
+                reason = "be"
+        return reason, price
+    except Exception as e:
+        if logger is not None:
+            logger.warning("close reason infer failed #%s: %s", ticket, e)
+        return "sync_reconcile", 0.0
+
+
+async def _close_stale_positions(pool, account_id: int, live_tickets: set[int], redis_conn, mt5=None) -> None:
     """对账：将 PG 中记着 open、但 MT5 已不存在的持仓标记 closed，并落库订单。
 
     根因修复：原 sync_positions 只遍历 mt5.positions_get() 返回的活持仓，
@@ -852,22 +913,27 @@ async def _close_stale_positions(pool, account_id: int, live_tickets: set[int], 
                         _sid = r["signal_id"]
                         if not _sid and redis_conn is not None:
                             _sid = _redis_ticket_signal(redis_conn, tid)
+                        # 2026-09-01：平仓归因——回查 MT5 成交历史取真实 deal.reason，
+                        # 替代原硬编码 'sync_reconcile'。close_price 仍沿用最后同步价
+                        # （保持既有语义；如需精确成交价可改用 _deal_px）。
+                        _close_reason, _deal_px = _infer_close_reason(
+                            mt5, tid, r["open_price"], log)
                         await conn.execute(
                             """
                             INSERT INTO hcm_trading.orders
                                 (signal_id, account_id, mt5_ticket, symbol, direction,
                                  open_price, close_price, lot, sl, tp, profit,
                                  order_status, open_time, close_time, close_reason)
-                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,2,$12,$13,'sync_reconcile')
+                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,2,$12,$13,$14)
                             """,
                             _sid, account_id, tid, r["symbol"], r["direction"],
                             r["open_price"], r["current_price"], r["lot"],
                             r["sl"], r["tp"], r["float_profit"],
-                            r["open_time"], now,
+                            r["open_time"], now, _close_reason,
                         )
                         log.info(
                             f"P2-1 orders write #{tid}: profit={r['float_profit']} "
-                            f"close={r['current_price']} signal={_sid}"
+                            f"close={r['current_price']} signal={_sid} reason={_close_reason}"
                         )
                 except Exception as e:
                     log.error(f"P2-1 orders write failed for #{tid}: {e}")

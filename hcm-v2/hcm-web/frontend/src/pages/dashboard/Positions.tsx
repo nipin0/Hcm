@@ -8,6 +8,7 @@ import { CanvasRenderer } from 'echarts/renderers';
 import client from '../../api/client';
 import { ENDPOINTS } from '../../api/endpoints';
 import { useSymbol } from '../../contexts/SymbolContext';
+import RevReportCard from './RevReportCard';
 
 echarts.use([LineChart, BarChart, GridComponent, TooltipComponent, LegendComponent, DataZoomComponent, CanvasRenderer]);
 
@@ -31,12 +32,29 @@ interface EquityCurve {
   balance: number;
 }
 
+// 反转头每日绩效报表（设计方案 20260904）——全品种聚合口径，不随 symbol 筛选
+export interface RevBucket { bucket: string; n: number; n_rev_call: number; rev_rate: number; saved_rate: number; }
+export interface RevSlice { verdict: string; mode: string; session: string; dd: string; n: number; sum_delta_r: number; n_saved: number; }
+export interface RevRecent { ticket: number; symbol: string; direction: string; dd_atr: number; score: number; verdict: string; old_sl: number; new_sl: number; realized: number; cf: number; delta: number; delta_r: number; }
+export interface RevDetail { buckets?: RevBucket[]; slices?: RevSlice[]; recent?: RevRecent[]; note?: string; }
+export interface RevDay {
+  date: string;
+  n_scored: number; n_rev_call: number; n_pull_call: number;
+  n_act: number; n_shadow: number;
+  n_settled: number; n_saved: number; n_killed: number; n_neutral: number;
+  sum_delta: number; sum_delta_r: number; avg_delta_r: number | null;
+  detail: RevDetail;
+}
+
 const Positions: React.FC = () => {
   const { selectedSymbol } = useSymbol();
   const [positions, setPositions] = useState<Position[]>([]);
   const [equityCurve, setEquityCurve] = useState<EquityCurve[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [totalPnl, setTotalPnl] = useState<number>(0);
+  // 反转头日报：全品种聚合口径，不随上方 symbol 筛选（归因按 account/ticket 全局）
+  const [revDays, setRevDays] = useState<RevDay[]>([]);
+  const [revLoading, setRevLoading] = useState<boolean>(false);
 
   const fetchData = useCallback(async (): Promise<void> => {
     if (!selectedSymbol) return;
@@ -72,6 +90,24 @@ const Positions: React.FC = () => {
     window.addEventListener('symbolChanged', handler);
     return () => window.removeEventListener('symbolChanged', handler);
   }, [fetchData]);
+
+  // 反转头日报加载：进页面即拉，不随 symbolChanged 刷新（全品种口径）
+  useEffect(() => {
+    let cancelled = false;
+    const loadRev = async (): Promise<void> => {
+      setRevLoading(true);
+      try {
+        const res = await client.get(ENDPOINTS.ai.report.reversal);
+        if (!cancelled) setRevDays((res.data?.data?.days as RevDay[]) || []);
+      } catch {
+        if (!cancelled) setRevDays([]);
+      } finally {
+        if (!cancelled) setRevLoading(false);
+      }
+    };
+    loadRev();
+    return () => { cancelled = true; };
+  }, []);
 
   const equityOption = useMemo(() => ({
     backgroundColor: 'transparent',
@@ -216,6 +252,9 @@ const Positions: React.FC = () => {
           </Box>
         )}
       </Box>
+
+      {/* 反转头日报：全品种 · 不随上方品种筛选（设计方案 20260904 §5） */}
+      <RevReportCard days={revDays} loading={revLoading} />
     </Box>
   );
 };

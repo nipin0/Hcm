@@ -30,7 +30,9 @@ import psycopg2
 import redis
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from quality_features import enrich_klines, session_onehot, _as_naive_utc  # noqa: E402
+from quality_features import (  # noqa: E402
+    enrich_klines, session_onehot, _as_naive_utc, h1_trend_dir_at,
+)
 # 【阶段2·数据契约单一真值】FEATURE_COLS 来自共享模块 _model_feature_cols，
 # 训练侧(train_signal_quality.py)与推理侧必须严格一致，消除双份数据源导致的
 # 列错位风险（详见 _model_feature_cols.py 注释）。
@@ -566,24 +568,50 @@ def build_features(snapshot: dict, kl: pd.DataFrame,
     row["rsi_14"] = snapshot.get("factor_raws", {}).get("rsi")
     row["macd"] = None
     row["atr_14"] = snapshot.get("atr")
+    # 【2026-09-02】verdict 多周期共识分：推理侧直接用 hexp 实时 snap["verdict"]（同源于引擎，最准）。
+    # 与训练侧 _compute_verdict 重算同分布；键名兼容 live 快照(resonance_verdict)与落库(_hexp.verdict)。
+    _verdict = snapshot.get("verdict")
+    if _verdict is None:
+        _verdict = snapshot.get("resonance_verdict")
+    row["verdict"] = float(_verdict) if _verdict is not None else 0.0
     h1f = h1_feats or {}
     if align_m5 and kl is not None and not kl.empty:
         # 周期对齐(2026-08-15)：h1_adx/h1_trend_strength 改由 M5 K线(与 ai_score 其余
         # 特征同源、与 hp_score 取值周期一致)重算 ADX/趋势强度，使整条 25 维特征向量
         # 同周期(M5)一口径 —— LightGBM 输出才有与 hp_score 对齐的校准价值。
+        # 【2026-09-02】h1f 先浅拷贝再 update：保留 h1_trend_dir（来自真实 H1 K线，
+        # 方向头感知 H1 主趋势的关键输入，不可被 M5 近似覆盖）。
         try:
             pdi = kl["plus_di"].astype(float)
             mdi = kl["minus_di"].astype(float)
             dx = 100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0, float("nan"))
             _m5 = dx.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1]
             if not pd.isna(_m5):
-                h1f = {"h1_adx": float(_m5), "h1_trend_strength": float(_m5) / 100.0}
+                h1f = dict(h1f)
+                h1f["h1_adx"] = float(_m5)
+                h1f["h1_trend_strength"] = float(_m5) / 100.0
         except Exception:
             pass
     row["h1_adx"] = h1f.get("h1_adx")
     row["h1_trend_strength"] = h1f.get("h1_trend_strength")
+    # 【2026-09-02 h1_trend_dir 特征注入】H1 主趋势方向(±1/0)，与训练侧同源(quality_features
+    # h1_trend_dir_at)；方向头靠它区分"H1 UP 回调(标签压 FLAT)" vs "震荡顶反转(保留 SELL)"。
+    row["h1_trend_dir"] = h1f.get("h1_trend_dir")
+    # 【2026-09-01 bar 对齐修复·推理侧】只用已收盘 bar 构造特征：kl 末根是桥写入的
+    # "形成中 bar"(未收盘)，其 mm/close_mom_atr/body_ratio 等每 5s 随 tick 变化；
+    # 训练侧(quality_features)对应的是已收盘 bar → 用未收盘 bar 推理会造成训练-推理
+    # 分布不一致，是实盘方向判反/追顶的根因之一。此处过滤后统一取最后一根已收盘 bar。
+    _klc = kl
+    try:
+        if kl is not None and not kl.empty:
+            _now = pd.Timestamp.now(tz="UTC")
+            _closed = kl[kl["open_time"] + pd.Timedelta(seconds=300) <= _now]
+            if not _closed.empty:
+                _klc = _closed
+    except Exception:
+        _klc = kl
     if kl is not None and not kl.empty:
-        bar = kl.iloc[-1]
+        bar = _klc.iloc[-1]
         for c in ["plus_di", "minus_di", "er", "bbw", "bbw_pct", "hurst", "mm",
                   "ema20_dist_atr", "body_ratio", "pullback_depth", "atr_pct",
                   "spread_num", "spread_atr",
@@ -593,7 +621,7 @@ def build_features(snapshot: dict, kl: pd.DataFrame,
             row[c] = bar.get(c)
         # MACD 柱状（EMA12-26 差值的 9 周期信号线之差）
         try:
-            close = kl["close"].astype(float)
+            close = _klc["close"].astype(float)
             macd_line = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
             sig9 = macd_line.ewm(span=9, adjust=False).mean()
             row["macd"] = float((macd_line - sig9).iloc[-1])
@@ -605,7 +633,7 @@ def build_features(snapshot: dict, kl: pd.DataFrame,
     # 全部用比值/归一化/对数/ATR 归一，消除绝对值漂移盲区。
     if kl is not None and not kl.empty:
         try:
-            _bar = kl.iloc[-1]
+            _bar = _klc.iloc[-1]
             _atr = float(_bar.get("atr") or 0.0) or 1e-9
             _pdi = float(_bar.get("plus_di") or 0.0)
             _mdi = float(_bar.get("minus_di") or 0.0)
@@ -615,7 +643,7 @@ def build_features(snapshot: dict, kl: pd.DataFrame,
             # spread_atr_log: 压缩点差极值
             row["spread_atr_log"] = float(np.log1p(max(0.0, _bar.get("spread_atr") or 0.0)))
             # close_mom_atr: 近 N 根收盘动量 / ATR(尺规归一, 反映实时动能)
-            _cl = kl["close"].astype(float)
+            _cl = _klc["close"].astype(float)
             _mom = (float(_cl.iloc[-1]) - float(_cl.iloc[-6])) if len(_cl) >= 6 else 0.0
             row["close_mom_atr"] = _mom / _atr
             # trend_aligned: 收盘是否站上 EMA20(顺趋势)
@@ -701,7 +729,11 @@ def _cached_slow(key: str, ttl_sec: float, fn):
 
 
 def _h1_features(conn, symbol: str) -> dict:
-    """PG H1 K线 → h1_adx / h1_trend_strength（Wilder DX 的 14 周期平滑）。"""
+    """PG H1 K线 → h1_adx / h1_trend_strength / h1_trend_dir（Wilder DX 14 平滑 + 趋势态）。
+
+    【2026-09-02】h1_trend_dir：H1 主趋势方向(±1/0)，与训练侧 quality_features.h1_trend_dir_at
+    同函数同口径（已收盘棒、无泄露）；方向头靠它感知 H1 主趋势，否则趋势对齐标签无法被模型学习。
+    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT open_time, open, high, low, close, spread FROM hcm_market.klines "
@@ -721,9 +753,11 @@ def _h1_features(conn, symbol: str) -> dict:
     mdi = kl["minus_di"].astype(float)
     dx = 100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0, float("nan"))
     adx = dx.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1]
-    if pd.isna(adx):
-        return {}
-    return {"h1_adx": float(adx), "h1_trend_strength": float(adx) / 100.0}
+    _out = {"h1_trend_dir": h1_trend_dir_at(kl, pd.Timestamp.now(tz="UTC"))}
+    if not pd.isna(adx):
+        _out["h1_adx"] = float(adx)
+        _out["h1_trend_strength"] = float(adx) / 100.0
+    return _out
 
 
 def _env_features(conn) -> dict:
@@ -767,8 +801,18 @@ def _env_features(conn) -> dict:
     return out
 
 
+# ── 2026-09-01 dir_head 防抖参数与状态（模块级，sidecar 单 symbol 场景安全）──
+# DIR_EMA_ALPHA：概率 EMA 权重，0.5 → 半衰约 2 采样（@5s 刷新 ≈ 10s）
+# DIR_MARGIN   ：间隙带，top1-top2 低于此视为"不确定"，维持前值不跳
+# _DIR_STATE   ：跨采样状态（proba=EMA 后向量 / dir=当前防抖方向 / raw=原始 argmax）
+DIR_EMA_ALPHA = 0.5
+DIR_MARGIN = 0.15
+_DIR_STATE: dict = {"proba": None, "dir": None, "raw": None}
+
+
 def score_one(model, iso, feats: dict, state_model=None, state_classes=None,
-              dir_model=None, dir_calibs=None, entry_model=None, entry_calib=None):
+              dir_model=None, dir_calibs=None, entry_model=None, entry_calib=None,
+              _probe: bool = False):
     """用模型的 feature_name() 对齐列（train/inference 同构，禁硬编码列序）。
 
     【路线①·状态粒度优化 2026-08-18】去离散 state one-hot，质量头纯靠连续结构
@@ -835,10 +879,12 @@ def score_one(model, iso, feats: dict, state_model=None, state_classes=None,
                         _cal = dir_calibs.get(_c)
                         if _cal is not None:
                             _cp = float(_cal.predict([_raw_p])[0])
-                            # 【阶段 1·校准裁决】该类别校准器退化 → 与 raw 混合恢复分辨率
+                            # 【阶段 1·校准裁决】该类别校准器退化 → 直接退回 raw 概率。
+                            # 退化校准器是分段常数/ERROR，与 raw 混合仍残留常数偏置
+                            # （如 v54 的 BUY/SELL 校准器），导致方向头恒 HOLD 塌缩；
+                            # 退回 raw 才能恢复方向头随行情变化，解除恒 BUY/恒 HOLD。
                             if _calib_is_degenerate(_cal):
-                                _cp = (CALIB_BLEND_W * _cp
-                                       + (1.0 - CALIB_BLEND_W) * _raw_p)
+                                _cp = _raw_p
                             _cal_proba.append(_cp)
                         else:
                             _cal_proba.append(_raw_p)
@@ -849,6 +895,35 @@ def score_one(model, iso, feats: dict, state_model=None, state_classes=None,
                 ai_direction = ("BUY" if _classes[_best] == 1
                                 else "SELL" if _classes[_best] == -1 else "HOLD")
                 ai_dir_prob = float(_proba[_best])
+                # ── 2026-09-01 dir_head 防抖：概率 EMA + 间隙带 ──
+                # 背景（实测）：三分类 BUY/SELL 概率长期接近（探针 gap=0.077），argmax
+                # 随 M5 实时特征噪声瞬间跳转；isotonic 校准分段常数使概率档位跳变
+                # (0.5714↔0.6↔0.6667↔0.8571↔0.9)。本块两层稳定：
+                #   ① EMA 平滑（抑制单次采样噪声，DIR_EMA_ALPHA=0.5）
+                #   ② 间隙带：top1-top2 < DIR_MARGIN → 判定"不确定"，维持前值不跳
+                # 原始 argmax 保留到 ai_direction_raw 供观测/面板，裁决用 ai_direction。
+                _ai_dir_raw = ai_direction
+                if _probe:
+                    # probe（self-check / 配置重载探针）用全 0 特征，不应更新防抖状态，
+                    # 否则 30s 周期探针会污染 EMA/方向状态，导致防抖间歇性失效。
+                    pass
+                else:
+                    _p_sm = list(_proba)
+                    if _DIR_STATE["proba"] is not None:
+                        _p_sm = [DIR_EMA_ALPHA * a + (1.0 - DIR_EMA_ALPHA) * b
+                                 for a, b in zip(_proba, _DIR_STATE["proba"])]
+                    _DIR_STATE["proba"] = _p_sm
+                    _top1, _top2 = sorted(_p_sm, reverse=True)[:2]
+                    if _top1 - _top2 >= DIR_MARGIN:
+                        _best_sm = int(max(range(3), key=lambda i: _p_sm[i]))
+                        _dir_sm = ("BUY" if _classes[_best_sm] == 1
+                                   else "SELL" if _classes[_best_sm] == -1 else "HOLD")
+                    else:
+                        _dir_sm = _DIR_STATE["dir"] if _DIR_STATE["dir"] else "HOLD"
+                    _DIR_STATE["dir"] = _dir_sm
+                    _DIR_STATE["raw"] = _ai_dir_raw
+                    ai_direction = _dir_sm
+                    ai_dir_prob = float(_top1)
             except Exception as exc:
                 print(f"[warn] direction head predict failed: {exc}", file=sys.stderr)
                 ai_direction = None
@@ -876,7 +951,8 @@ def score_one(model, iso, feats: dict, state_model=None, state_classes=None,
             except Exception as exc:
                 print(f"[warn] entry head predict failed: {exc}", file=sys.stderr)
                 ai_entry = None
-        return (float(max(0.0, min(1.0, p))), predicted_state, ai_direction, ai_dir_prob, ai_entry)
+        return (float(max(0.0, min(1.0, p))), predicted_state, ai_direction,
+                ai_dir_prob, ai_entry, _DIR_STATE.get("raw"))
     except Exception as exc:
         print(f"[warn] score failed (feature mismatch?): {exc}", file=sys.stderr)
         return (None, None)
@@ -935,6 +1011,158 @@ def _persist(conn, out, feats, snap):
             pass
 
 
+# ══════════════════════════════════════════════════════════════════════
+# 反转头（独立 head，2026-09-02 接入）
+#   消费主号桥写入的持仓风险评分请求 hcm:ai:rev:req:*，用 300 根 M5 窗口
+#   装配 22 维特征 → 反转头推理 → 写回 hcm:ai:reversal:{acct}:{ticket}。
+# 纪律：
+#   - 只算分、绝不改仓；SL 执行权唯一归主号桥。
+#   - 全程 try/except：本模块异常绝不影响 quality 主链路（AI 评分）。
+#   - 取数窗口 300 根（平价校验结论：<300 会截断持仓历史致特征失真）。
+#   - 默认 ai.rev.enabled=false；未启用时零开销（不查库、不 scan Redis）。
+# ══════════════════════════════════════════════════════════════════════
+_REV_WINDOW = 300
+_REV_CATS = {"direction": ["BUY", "SELL"], "session": ["asia", "europe", "us"]}
+_rev_booster = None
+_rev_calib = None
+_rev_meta = None
+_rev_loaded = False
+
+try:
+    from reversal_features import assemble as _rev_assemble, \
+        build_indicators as _rev_build_indicators
+except Exception as _rev_imp_err:      # 缺模块不得拖垮主链路
+    _rev_assemble = _rev_build_indicators = None
+    print(f"[warn] reversal_features import failed: {_rev_imp_err}", file=sys.stderr)
+
+
+def _rev_load():
+    """加载反转头模型+校准器+元数据。失败置 None，_rev_tick 静默降级。"""
+    global _rev_booster, _rev_calib, _rev_meta, _rev_loaded
+    try:
+        if _rev_assemble is None:
+            return False
+        import lightgbm as lgb
+        _d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+        _m, _c = os.path.join(_d, "lgbm_reversal_v1.txt"), os.path.join(_d, "calib_reversal_v1.pkl")
+        _j = os.path.join(_d, "reversal_v1_meta.json")
+        if not (os.path.exists(_m) and os.path.exists(_c)):
+            print("[info] reversal head absent (model/calib missing) → 不启用", file=sys.stderr)
+            return False
+        _rev_booster = lgb.Booster(model_file=_m)
+        with open(_c, "rb") as f:
+            _rev_calib = pickle.load(f)
+        if os.path.exists(_j):
+            with open(_j, encoding="utf-8") as f:
+                _rev_meta = json.load(f)
+        _rev_loaded = True
+        print(f"[info] reversal head loaded cutoff={(_rev_meta or {}).get('cutoff')} "
+              f"pct={(_rev_meta or {}).get('score_pct')}", file=sys.stderr)
+        return True
+    except Exception as _e:
+        print(f"[warn] reversal head load failed: {_e}", file=sys.stderr)
+        _rev_booster = _rev_calib = _rev_meta = None
+        _rev_loaded = False
+        return False
+
+
+def _rev_hget(r, key, default=""):
+    """读配置项并解码为 str。
+
+    ⚠️ redis-py 默认 decode_responses=False，hget 返回 bytes；
+    直接 str(b'true') 会得到 "b'true'"（含 b'' 外壳），导致布尔判断恒假、
+    功能静默失效。必须先 decode。
+    """
+    try:
+        v = r.hget("hcm:config:v2", key)
+        if v is None:
+            return default
+        return v.decode("utf-8", "ignore") if isinstance(v, (bytes, bytearray)) else str(v)
+    except Exception:
+        return default
+
+
+def _rev_tick(conn, r, symbol):
+    """处理待评分的持仓请求。幂等、可重入、绝不抛出。"""
+    if not _rev_loaded or _rev_calib is None or _rev_meta is None:
+        return
+    try:
+        if _rev_hget(r, "ai.rev.enabled", "false").strip().lower() \
+                not in ("true", "1", "yes", "on"):
+            return
+        keys = r.keys("hcm:ai:rev:req:*")
+        if not keys:
+            return
+        # 惰性取 300 根（仅当有待评分请求），不动 quality 主链路的 150 根取数
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT open_time, open, high, low, close FROM hcm_market.klines "
+                "WHERE symbol=%s AND time_frame='M5' ORDER BY open_time DESC LIMIT %s",
+                (symbol, _REV_WINDOW))
+            rows = cur.fetchall()
+        if not rows or len(rows) < 60:
+            return
+        kdf = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close"])
+        for _c in ("open", "high", "low", "close"):
+            kdf[_c] = kdf[_c].astype(float)
+        kdf["open_time"] = pd.to_datetime(kdf["open_time"], utc=True)
+        kdf = kdf.sort_values("open_time").reset_index(drop=True)
+        ind = _rev_build_indicators(kdf)
+        T = len(kdf) - 1
+        times = kdf["open_time"].dt.tz_convert("UTC").dt.tz_localize(None).to_numpy()
+        cutoff = float(_rev_meta.get("cutoff", 1.1))
+        order = _rev_meta.get("features") or []
+        mode = _rev_hget(r, "ai.rev.mode", "log").strip().lower()
+
+        for k in keys:
+            try:
+                raw = r.get(k)
+                if not raw:
+                    continue
+                req = json.loads(raw)
+                direction = req.get("direction")
+                entry = float(req.get("open_price") or 0)
+                if direction not in ("BUY", "SELL") or entry <= 0:
+                    continue
+                pos = {"direction": direction, "open_price": entry,
+                       "sl": float(req.get("sl") or 0), "tp": float(req.get("tp") or 0)}
+                et = pd.Timestamp(req.get("open_time"))
+                if et.tzinfo is None:
+                    et = et.tz_localize("UTC")
+                eidx = min(int(np.searchsorted(
+                    times, et.tz_convert("UTC").tz_localize(None).to_datetime64(),
+                    side="left")), T)
+                f = _rev_assemble(pos, kdf, ind, T, eidx)
+                if f is None:
+                    continue
+                X = pd.DataFrame([f])[order]
+                for _cc, _cats in _REV_CATS.items():
+                    if _cc in X.columns:
+                        X[_cc] = pd.Categorical(X[_cc], categories=_cats)
+                score = float(_rev_calib.predict_proba(X)[:, 1][0])
+                acct, tick = req.get("account_id", 0), req.get("ticket", 0)
+                vd = {"score": round(score, 6), "cutoff": round(cutoff, 6),
+                      "is_reversal": bool(score > cutoff), "mode": mode,
+                      "symbol": symbol, "ticket": tick, "account_id": acct,
+                      "ts": time.time()}
+                r.set(f"hcm:ai:reversal:{acct}:{tick}", json.dumps(vd), ex=600)
+                # 【2026-09-04 修复·重复算分】算分成功后删除请求键。
+                # 桥侧 req 键 TTL=900s(mt5_bridge.py:4545)，若消费后不删除，主循环
+                # 每轮都会重新扫到并重算重打日志（实测同 ticket 1 秒内重复 10 次）。
+                # 异常路径不删，保留请求待下轮重试（失败安全）。
+                try:
+                    r.delete(k)
+                except Exception:
+                    pass
+                print(f"[info] rev score ticket={tick} score={score:.4f} "
+                      f"cutoff={cutoff:.4f} reversal={vd['is_reversal']} mode={mode}",
+                      file=sys.stderr)
+            except Exception as _e:
+                print(f"[warn] rev score failed {k}: {_e}", file=sys.stderr)
+    except Exception as _e:
+        print(f"[warn] rev tick failed: {_e}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbol", default="XAUUSD")
@@ -946,6 +1174,9 @@ def main():
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
     print(f"[boot] main entered: symbol={args.symbol} redis={args.redis_url} db={args.db_url}", file=sys.stderr, flush=True)
+
+    # 反转头模型加载（失败仅告警，不影响 quality 主模型与 AI 评分）
+    _rev_load()
 
     # 连接建立包进重试循环：PG/Redis 短暂不可用时每 5s 重试，不退出进程。
     while True:
@@ -1099,8 +1330,21 @@ def main():
                     _new_entry = _e_cand
                     if _ec_cand and os.path.exists(_ec_cand):
                         _new_entry_calib = _ec_cand
+            # 【滚动校准热加载 A 2026-09-04】模型/校准文件 mtime 指纹：路径不变但
+            # 内容被原子替换（滚动校准新产物）时也触发重载（无需重启进程）。
+            _mtime_sig = ""
+            try:
+                _sig_parts = []
+                for _fp in (_new_calib, _new_dir_calib, _new_entry_calib,
+                            _new_model, _new_dir, _new_entry, _new_state):
+                    if _fp and os.path.exists(_fp):
+                        _sig_parts.append(f"{os.path.getmtime(_fp):.0f}")
+                _mtime_sig = "|".join(_sig_parts)
+            except Exception:
+                pass
             if ((_new_model, _new_calib) != (_model_path, _calib_path)
-                    or model is None or (_new_state != getattr(_reload_cfg, "_state_path", None))
+                    or model is None or _mtime_sig != getattr(_reload_cfg, "_mtime_sig", None)
+                    or (_new_state != getattr(_reload_cfg, "_state_path", None))
                     or (_new_dir, _new_dir_calib) != (getattr(_reload_cfg, "_dir_path_loaded", None),
                                                      getattr(_reload_cfg, "_dir_calib_loaded", None))
                     or (_new_entry, _new_entry_calib) != (getattr(_reload_cfg, "_entry_path_loaded", None),
@@ -1111,6 +1355,7 @@ def main():
                 _reload_cfg._dir_calib_loaded = _new_dir_calib
                 _reload_cfg._entry_path_loaded = _new_entry
                 _reload_cfg._entry_calib_loaded = _new_entry_calib
+                _reload_cfg._mtime_sig = _mtime_sig
                 if _model_path and os.path.exists(_model_path):
                     model, iso, state_model, state_classes, dir_model, dir_calibs, entry_model, entry_calib = load_model(
                         _model_path, _calib_path, _new_state, _new_dir, _new_dir_calib,
@@ -1135,8 +1380,9 @@ def main():
                     _model_status = "ready"
                     try:
                         _probe = {c: 0.0 for c in (model.feature_name() if hasattr(model, "feature_name") else FEATURE_COLS)}
-                        _p, _ps, _pd, _pdp, _pe = score_one(model, iso, _probe, state_model, state_classes,
-                                                           dir_model, dir_calibs, entry_model, entry_calib)
+                        _p, _ps, _pd, _pdp, _pe, _pr = score_one(
+                            model, iso, _probe, state_model, state_classes,
+                            dir_model, dir_calibs, entry_model, entry_calib, _probe=True)
                         if _p is None or not (float("-inf") < float(_p) < float("inf")):
                             _model_status = "degraded"
                             model, iso, state_model, state_classes = None, None, None, None
@@ -1191,11 +1437,11 @@ def main():
                         kdf["open_time"] = pd.to_datetime(kdf["open_time"], utc=True)
                         kdf = kdf.sort_values("open_time").reset_index(drop=True)
                         kl = enrich_klines(kdf)
-                        if _align_m5:
-                            _h1f = None
-                        else:
-                            _h1f = _cached_slow("h1", 60.0,
-                                                lambda: _h1_features(conn, args.symbol.upper()))
+                        # 【2026-09-02 h1_trend_dir 特征注入】无论 align_m5 都加载 H1 特征(60s 缓存)：
+                        # align_m5 时 build_features 仍会用 M5 同源覆盖 h1_adx/h1_trend_strength，
+                        # 但 h1_trend_dir 必须来自真实 H1 K线（方向头感知 H1 主趋势的关键输入）。
+                        _h1f = _cached_slow("h1", 60.0,
+                                            lambda: _h1_features(conn, args.symbol.upper()))
                         _envf = _cached_slow("env", 60.0, lambda: _env_features(conn))
                         # 【DeepSeek 训练特征增强 2026-08-17】读 DeepSeek 异步票作为特征输入。
                         # 同步读 ai:ds:out:{symbol}（与主循环 r 同句柄）；缺失/损坏→None→三特征 0.0。
@@ -1227,7 +1473,7 @@ def main():
                         _tmf_out = _load_tmf_for_bar(conn, args.symbol.upper(), _bar_time)
                         feats = build_features(snap, kl, _h1f, _envf, align_m5=_align_m5,
                                                audit=_feature_audit, ds_out=_ds_out, tmf_out=_tmf_out)
-                        _raw, _pred_state, _ai_dir, _ai_dir_prob, _ai_entry = score_one(
+                        _raw, _pred_state, _ai_dir, _ai_dir_prob, _ai_entry, _ai_dir_raw = score_one(
                             model, iso, feats, state_model, state_classes, dir_model, dir_calibs,
                             entry_model, entry_calib)
                         ai_score = None
@@ -1329,6 +1575,9 @@ def main():
                         # 灰度过期：dir_enabled=false 时 dir_model=None → 两字段恒 None，完全不影响现有逻辑。
                         "ai_direction": _ai_dir if (_ai_dir is not None) else None,
                         "ai_dir_prob": round(float(_ai_dir_prob), 4) if _ai_dir_prob is not None else None,
+                        # 【阶段 1·防抖观测 2026-09-01】ai_direction_raw = argmax 原始方向（未防抖），
+                        # 供对比防抖前后差异与面板实时跳动；裁决统一用 ai_direction。
+                        "ai_direction_raw": _ai_dir_raw if _ai_dir_raw is not None else None,
                         # 【阶段 2·买点头】entry_lm 输出：好买点概率(0-1)，供信号塔与 hexp entry_quality 共振
                         # （boost_good_entry 增强好点位 / veto_bad_entry 否决差点位）。灰度过期恒 None。
                         "ai_entry": round(float(_ai_entry), 4) if _ai_entry is not None else None,
@@ -1372,6 +1621,11 @@ def main():
                             "mode": _ai_mode, "model_loaded": bool(model is not None),
                             "symbol": args.symbol.upper(), "ts": time.time(),
                         }), ex=_health_ttl)
+                    except Exception:
+                        pass
+                    # 反转头：处理持仓风险评分请求（内部全异常隔离，不影响 AI 评分主链路）
+                    try:
+                        _rev_tick(conn, r, args.symbol.upper())
                     except Exception:
                         pass
                     _key = (out.get("ai_score"), out.get("total_score"), out.get("ext_factor_score"), out.get("mode"))

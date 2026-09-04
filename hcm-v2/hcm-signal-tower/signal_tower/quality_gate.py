@@ -96,6 +96,15 @@ CFG_FALLBACK: dict[str, Any] = {
     "ai.cpl.tier_high": 65.0,
     "ai.cpl.tier_mid": 55.0,
     "ai.cpl.tier_low": 45.0,
+    # 【2026-08-31 动态手数链动·纠偏】耦合模式手数档位【不】在 quality_gate 预选、
+    # 也【不】新增任何配置键；改为把触发下单的耦合分 total(0–100，即「下单分」)作为信号
+    # confidence 透传给风控引擎，由【既有】风控面板动态手数规则裁决：
+    #   risk.score_tier_low/mid/high(生产=0.50/0.80/0.95) 对 confidence 分档 →
+    #   下单分<80→low(×0.5) / 80≤下单分≤95→mid(×1.0) / 下单分>95→high(×1.5)，
+    #   倍率由 risk.lot_multiplier_{low|mid|high}(0.5/1.0/1.5) 决定。
+    # 上述 risk.score_tier_* / risk.lot_multiplier_* 均为风控面板既有参数，零新增键。
+    # quality_gate 在耦合路径只返回 lot_tier="none"（交风控按 confidence 现算档位）；
+    # 解耦/HEXP 独立路径仍用本 tier_*(65/55/45) 经 lot_tier_for 选档(历史口径)。
     "ai.cpl.lot_high": 1.5,
     "ai.cpl.lot_low": 0.5,
 }
@@ -167,33 +176,41 @@ def coupling_weight(k: float, cfg: dict) -> float:
 
 
 def coupling_total(hp_score: float, c_ai: float, k: float, cfg: dict) -> float:
-    """总分 = w(k)·S_hp + (1-w(k))·C_ai。"""
+    """耦合总分 = w(k)·S_hp + (1-w(k))·C_ai。
+
+    hp_score: HEXP 综合评分；decide 调用方传入 scorecard_total（HEXP 6 维综合分，
+    0–100），不再用强度单维 hp_score（详见 2026-08-31 耦合分下单需求）。
+    c_ai: LightGBM 单源分（0–100）= ai_score。
+    两者同 0–100 口径，故总分亦 0–100，与 hexp.coupling_pass_threshold 同口径可比。
+    """
     w = coupling_weight(k, cfg)
     return w * hp_score + (1.0 - w) * c_ai
 
 
-def lot_tier_for(total: float, cfg: dict) -> str:
-    """综合分 scorecard_total（**0–100 口径**）→ 手数分档（low/mid/high/none）。
+def lot_tier_for(total: float, cfg: dict, prefix: str = "tier") -> str:
+    """综合分 → 手数分档（low/mid/high/none）。
 
-    【2026-08-31 口径修正】输入 scorecard_total 自 2026-08-28 起为 0–100 口径
-    （此前为 0~1，见上方 CFG_FALLBACK 注释的迁移轨迹）。本函数阈值必须与其同口径，
-    否则 0~1 阈值会被 0–100 输入恒越过 → 恒 high。
+    **0–100 口径**。prefix 选择阈值键集：
+      - "tier"（默认/唯一在用）：ai.cpl.tier_high/mid/low（65/55/45），用于【解耦 / HEXP 独立】
+        模式，基准=scorecard_total（HEXP 6 维综合分，旧规则）。
 
-    仅当 ai.cpl.enabled=true 时启用；否则 caller 侧 fallback 为 "none"。
-    tier 分界（0–100 口径，2026-08-31 按 0–100 真实分布标定）：
-      total >= ai.cpl.tier_high(65) → "high"
-      total >= ai.cpl.tier_mid(55)  → "mid"
-      total >= ai.cpl.tier_low(45)  → "low"
-      否则                          → "none"（极弱：不发）
+    【2026-08-31 纠偏】耦合模式【不再】经本函数预选档位、也【不】新增任何配置键。
+    耦合路径在 decide() 中固定返回 lot_tier="none"，由 scheduler 把耦合分 total 透传为
+    信号 confidence，最终交【既有】风控面板 risk.score_tier_{low,mid,high} 规则裁决
+    （下单分<80→low / 80≤≤95→mid / >95→high，倍率 risk.lot_multiplier_*）。故 "lot_tier"
+    前缀分支已废弃、不再被调用。
     返回的是「档位语义」而非固定倍率——实际倍率由风控面板的动态手数
-    配置（risk.lot_multiplier_{low|mid|high} + risk.lot_base）决定，
+    配置（risk.lot_multiplier_{low|mid|high} = 0.5/1.0/1.5）决定，
     实现「AI 只选档、风控定准确下单值」的链动设计（2026-08-14 需求）。
     """
-    if total >= _g(cfg, "ai.cpl.tier_high"):
+    hk = f"ai.cpl.{prefix}_high"
+    mk = f"ai.cpl.{prefix}_mid"
+    lk = f"ai.cpl.{prefix}_low"
+    if total >= _g(cfg, hk):
         return "high"
-    if total >= _g(cfg, "ai.cpl.tier_mid"):
+    if total >= _g(cfg, mk):
         return "mid"
-    if total >= _g(cfg, "ai.cpl.tier_low"):
+    if total >= _g(cfg, lk):
         return "low"
     return "none"
 
@@ -281,7 +298,7 @@ def decide(
         _lot_tier = ("none", False)
         if _hexp_lot_enabled:
             # 手数链动用 6 维综合分（scorecard_total），不用强度单维 hp_score
-            _tier = lot_tier_for(scorecard_total, cfg)
+            _tier = lot_tier_for(scorecard_total, cfg, "tier")
             _lot_tier = (_tier, bool(_tier != "none"))
         else:
             _lot_tier = ("none", False)
@@ -300,8 +317,10 @@ def decide(
 
     c_ai = float(max(0.0, min(100.0, c_ai)))
 
-    # 耦合总分（方向恒定 HEXP，此分仅用于等级裁决 + 手数分档）
-    total = coupling_total(hp_score, c_ai, k, cfg)
+    # 耦合总分（方向恒定 HEXP）：融合 S_hp=scorecard_total(HEXP 6维综合) + C_ai(ai_score)。
+    # 2026-08-31：S_hp 改用 scorecard_total（6维）而非 hp_score（强度单维），
+    # 满足"用 LightGBM ai_score 和 scorecard_total(HEXP 6维) 耦合分下单"。
+    total = coupling_total(scorecard_total, c_ai, k, cfg)
 
     # 1) 等级裁决（否决/降级/保持/升级）——门槛用 0-1 归一（c_ai/100）
     #    铁律：HEXP 闸门是开仓唯一总开关。passed=False（hexp 已拦）的信号，
@@ -351,10 +370,16 @@ def decide(
                 final_grade = GRADE_ORDER[min(len(GRADE_ORDER) - 1, _idx + 1)]
                 entry_resonance = "boost_good_entry"
 
-    # 2) 手数分档（low/mid/high/none）：统一用 6 维综合分 scorecard_total 决定，
-    #    禁止用耦合总分 total（含 hp_score 强度权重，不稳定）或 hp_score 单维。
-    #    none 表示极弱（不发）；实际倍率由风控面板动态手数决定（链动需求）。
-    lot_tier = lot_tier_for(scorecard_total, cfg) if _g(cfg, "ai.cpl.enabled") else "none"
+    # 2) 手数分档（low/mid/high/none）：耦合模式【不再】在信号塔预选档位、
+    #    【不】新增任何配置键（贴合用户 2026-08-31 指令）。改为把触发下单的耦合分
+    #    total(0–100，即「下单分」) 经 decide 返回为 total_score，由 scheduler 透传为信号
+    #    confidence，最终交【既有】风控面板动态手数规则裁决：
+    #      risk.score_tier_low/mid/high(生产=0.50/0.80/0.95) 对 confidence 分档 →
+    #      下单分<80→low(×0.5) / 80≤下单分≤95→mid(×1.0) / 下单分>95→high(×1.5)，
+    #      倍率由 risk.lot_multiplier_{low|mid|high}(0.5/1.0/1.5) 决定（均风控面板既有参数）。
+    #    故此处固定返回 lot_tier="none"，交风控按 confidence 现算档位（零新增键）。
+    #    none 表示"档位交由风控"；实际倍率由风控面板动态手数决定（链动需求）。
+    lot_tier = "none"
 
     # 否决 → 手数分档置 none（不发信号）
     if action == "VETO":

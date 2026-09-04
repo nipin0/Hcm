@@ -164,6 +164,8 @@ services:
       # [2026-08-14 闭环] quality_gate 融合闸门 + ai_async_client(DeepSeek 校准融合)：LightGBM+DeepSeek 闭环裁决，跨 recreate 持久
       - ./hcm-signal-tower/signal_tower/quality_gate.py:/app/signal_tower/quality_gate.py
       - ./hcm-signal-tower/signal_tower/ai_async_client.py:/app/signal_tower/ai_async_client.py
+      # [2026-09-04] 反转头每日绩效聚合（新文件非镜像烘焙，缺则 ModuleNotFoundError 崩溃）：绑定挂载跨 recreate 持久
+      - ./hcm-signal-tower/signal_tower/rev_daily.py:/app/signal_tower/rev_daily.py
       # [P1] 轻量 DeepSeek 客户端：供校准诊断生成自然语言报告（shared 包镜像内置，单文件挂载跨 recreate 持久）
       - ./shared/llm_client.py:/app/shared/llm_client.py
       # [2026-08-17 B7] RedisClient 封装类补 exists 方法（DeepSeek run_loop 检测触发标志依赖），

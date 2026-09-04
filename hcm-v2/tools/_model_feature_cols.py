@@ -33,9 +33,10 @@ hcm:live:hexp:ai:{sym} 的实际入模特征）交叉验证，发现 **live_base
       ds_continuity                     :662-664  读 Redis ai:ds:out:{sym}，实测有票
       entry_atr_ratio                   :643      (entry - close均值)/atr
 
-  - 暂不加 tmf_* 13 维：表 hcm_ai.timesfm_features 存在且有 1865 行，但最新
-    停在 2026-08-28 23:35（TimesFM 管线停更）→ 按当前 bar_time 查不到 → 恒 0。
-    待 TimesFM 调度器恢复产出后，训练+生产同步加回即可。
+  - 【2026-09-01 已加回】tmf_* 13 维：TimesFM 抽取已恢复（hcm_ai.timesfm_features
+    最新 2026-08-31 19:00 UTC，1924 行；训练产物 features.csv 实测 tmf nonzero≈0.66），
+    原"管线停更→恒 0"判断已过时。现加回 MODEL_FEATURE_COLS（35→48 维），
+    训练+推理契约同步。
 
 【方法论教训（务必记住）】
   判断"某特征在生产是否真有信息"，判据应是**分位数有无跨度 / 方差是否为零**，
@@ -89,17 +90,38 @@ MODEL_FEATURE_COLS = [
     # 注：dev_z_ema200 / entry_atr_ratio 已于 2026-08-31 移除——
     # 经 lm_features 连续采样复核，两者在生产恒为 0.0（推理侧取不到对应数据），
     # 入模只会引入常数维度与噪声。
+    # ── 【2026-09-01 加回】TimesFM 离线特征 13 维（管线已恢复，非恒 0）──
+    # 训练侧 quality_features.load_tmf_features 与推理侧 quality_scorer._load_tmf_for_bar
+    # 均按 (symbol, M5 bar_time) 精确 join hcm_ai.timesfm_features（tmf_version=tfm25_pca_v1_sig），
+    # 缺省全 0.0 保证训练-推理同分布。PCA 8 维 + 5 派生特征。
+    "tmf_pc00", "tmf_pc01", "tmf_pc02", "tmf_pc03", "tmf_pc04", "tmf_pc05", "tmf_pc06", "tmf_pc07",
+    "tmf_trend_cont", "tmf_rev_prob", "tmf_vol_cycle", "tmf_mtf_resonance", "tmf_hist_sim",
+    # ── 【2026-09-02 新增】verdict（多周期 MTF 加权共识分 ∈[-1,1]，hexp 实时产出）──
+    # dir_head 长期缺"多周期共振方向"这一最强方向信号（见对话复盘：dir_hit 仅 0.52、系统性偏多
+    # 的根因之一）。verdict 由 hexp_engine 用 M30/H1/H4/D1 按 weight_* 加权算出，含趋势/震荡反向
+    # 共识，正是最该喂给方向头的新鲜信息。
+    # 训练侧：quality_features._compute_verdict 从多周期 K 线按截至 signal 时刻的已收盘 bar 重算
+    #         （与 hexp 同构近似，无迟滞状态机连续性、无未来泄露，HEXP+live_override 全覆盖）。
+    # 推理侧：quality_scorer.build_features 直接读 hexp 实时 snap["verdict"]（同源于引擎，最准）。
+    # 两侧分布同构。注意：本列必须出现在 MODEL_FEATURE_COLS 且不能被 train 的 drop_cols 丢弃。
+    "verdict",
+    # ── 【2026-09-02 新增】h1_trend_dir（H1 主趋势方向 ±1/0）──
+    # 与 verdict 互补但口径不同：verdict 是多周期加权连续共识分，h1_trend_dir 是**单 H1**
+    # 周期明确趋势态(TREND_UP=+1 / TREND_DOWN=-1 / RANGE·TRANSITION·缺失=0，_period_trend_state
+    # 口径)。方向头靠它区分"H1 上升趋势中的回调(标签被 dir_trend_align 压 FLAT)"与
+    # "震荡顶反转(标签保留 SELL)"——否则模型无 H1 方向输入，趋势对齐标签无法被学习，
+    # 超买处仍系统性判 SELL(实证 v79 探针)。绝不能被 train 的 drop_cols 丢弃。
+    # 训练侧: quality_features 从 H1 K线 h1_trend_dir_at 重算(已收盘棒,无泄露)。
+    # 推理侧: quality_scorer._h1_features 从 PG H1 K线同函数重算(60s 缓存)。
+    "h1_trend_dir",
 ]
 
 # 【TimesFM 特征 2026-08-30】独立导出，供 quality_features / quality_scorer 在 join / 注入时
 # 按名遍历，避免与 MODEL_FEATURE_COLS 全表耦合。
 #
-# 【2026-08-31】tmf_* 13 维当前不在 MODEL_FEATURE_COLS：表数据停在 2026-08-28 23:35，
-# 推理侧按当前 bar_time 查不到 → 实际恒 0（与 A1 的判定一致，但原因是"管线停更"而非"无数据源"）。
-# 本列表予以保留：
-#   - quality_features.py / quality_scorer.py 仍 import 它，删除会致 ImportError；
-#   - 推理侧即便查表注入 row，也会被 `for c in FEATURE_COLS` 过滤，不入模；
-#   - 待 TimesFM 调度器恢复产出后，把列名加回 MODEL_FEATURE_COLS 即可（训练+生产同步）。
+# 【2026-09-01 已加回】tmf_* 13 维已纳入 MODEL_FEATURE_COLS（35→48 维）：TimesFM 抽取已恢复
+# （hcm_ai.timesfm_features 最新 2026-08-31 19:00 UTC），训练/推理同表同口径 join 注入、非恒 0。
+# 本列表仍保留独立导出，供 join/注入时按名遍历使用。
 TMF_FEATURE_COLS = [
     "tmf_pc00", "tmf_pc01", "tmf_pc02", "tmf_pc03", "tmf_pc04", "tmf_pc05", "tmf_pc06", "tmf_pc07",
     "tmf_trend_cont", "tmf_rev_prob", "tmf_vol_cycle", "tmf_mtf_resonance", "tmf_hist_sim",

@@ -413,6 +413,44 @@ async def _write_config_fields(
     return updated, errors
 
 
+def _parse_ai_stack_status(_txt: Any) -> dict:
+    """解析主机守护回写的 hcm:ai:{comp}:status。
+
+    2026-09-02 起 ai_stack_guard.ps1 写「管道分隔文本」(name=X|pid=N|running=True|...)
+    而非 JSON——PowerShell 5.1 原生传参(docker exec→redis-cli)会剥双引号使旧版 JSON
+    落库成无引号键无法 json.loads。本函数兼容管道格式并回退 JSON；解析失败返回
+    {"alive": False, "running": False, "note": "状态解析失败"}，绝不抛异常。
+    """
+    try:
+        _txt = (_txt if isinstance(_txt, str)
+                else _txt.decode("utf-8", "ignore")).strip()
+        if not _txt:
+            return {"alive": False, "running": False, "note": "守护未上报(键过期)"}
+        if "=" in _txt and "|" in _txt:
+            _d: dict = {}
+            for _kv in _txt.split("|"):
+                _k, _sep, _v = _kv.partition("=")
+                if not _sep:
+                    continue
+                _k = _k.strip()
+                if _k in ("running", "readable", "alive", "healed", "dry"):
+                    _v = str(_v).strip().lower() in ("1", "true", "yes")
+                elif _k in ("pid", "beat_age_s", "ts"):
+                    try:
+                        _v = int(float(_v))
+                    except Exception:
+                        pass
+                _d[_k] = _v
+            return _d
+        import json as _json
+        _st = _json.loads(_txt)
+        if not isinstance(_st, dict):
+            return {"alive": False, "running": False, "note": "状态解析失败(非对象)"}
+        return _st
+    except Exception:
+        return {"alive": False, "running": False, "note": "状态解析失败"}
+
+
 # ── Router Factory ──────────────────────────────
 
 def create_system_router(
@@ -3908,8 +3946,6 @@ def create_system_router(
             "fix": "" if cal_ok else "calibrate_config",
             "data": {"total": cal["total"], "drifts": cal["drifts"]},
         })
-        if not cal_ok:
-            suggestions.append("执行「🔧 校准配置」或「⚡ 自愈」以把全部漂移的配置键从 PG 覆盖写回 Redis。")
 
         # ── 7.87 K线写入源标识（D4 2026-08-05）──
         # 诊断"谁在写 K线"：生产环境唯一真实写入源应为 bridge(mt5_bridge 主机进程)。
@@ -4135,6 +4171,67 @@ def create_system_router(
         bridge-order-group and HSETNX-backfill missing config keys.
         """
         return {"code": 0, "data": await _diagnose(auto_heal=auto_heal), "message": "ok"}
+
+    @router.post("/api/v1/system/ai/heal")
+    async def ai_stack_heal_v1(
+        request: Request,
+        component: str = Query("all", description="lightgbm | timesfm | auto_retrain | all"),
+        user=Depends(auth_handler.require_auth),
+    ):
+        """下发 AI 组件自愈信令（TimesFM / LightGBM sidecar / auto_retrain 守护）。
+
+        关键架构约束：hcm-web 是 Linux 容器，无法启动 Windows 主机进程。
+        本端点只写 Redis 信令 ai:heal:request:{comp}，由主机计划任务
+        HCM_AIStackGuard 每 3 分钟调用 tools/ai_stack_guard.ps1 消费并拉起，
+        与既有 restart_bridge 信令范式同构。component=all 覆盖
+        lightgbm + timesfm + auto_retrain 三个组件。
+        """
+        comps = ["lightgbm", "timesfm", "auto_retrain"] if component == "all" else [component]
+        if any(c not in ("lightgbm", "timesfm", "auto_retrain") for c in comps):
+            return {"code": 1, "data": None, "message": "component 必须是 lightgbm|timesfm|auto_retrain|all"}
+        if redis_client is None or not redis_client.is_initialized:
+            return {"code": "SYS_REDIS_001", "data": None, "message": "Redis 不可用"}
+        import time as _time
+        written = []
+        try:
+            for c in comps:
+                payload = str(int(_time.time()))
+                try:
+                    await redis_client.raw.set(f"ai:heal:request:{c}", payload, ex=300)
+                except Exception:
+                    await redis_client.set(f"ai:heal:request:{c}", payload, ex=300)
+                written.append(c)
+        except Exception as e:
+            return {"code": 1, "data": None, "message": f"信令写入失败: {e}"}
+        return {
+            "code": 0,
+            "data": {"signaled": written, "guard_task": "HCM_AIStackGuard",
+                     "note": "主机守护将在 3 分钟内消费信令并拉起组件"},
+            "message": f"已下发自愈信令: {','.join(written)}",
+        }
+
+    @router.get("/api/v1/system/ai/status")
+    async def ai_stack_status_v1(
+        request: Request,
+        user=Depends(auth_handler.require_auth),
+    ):
+        """读取 AI 组件存活状态（守护每轮回写 hcm:ai:{comp}:status，TTL 180s）。
+
+        键过期 = 守护停摆，此时 alive 一律判 False，不会误报存活。
+        """
+        out = {}
+        for c in ("lightgbm", "timesfm", "auto_retrain"):
+            raw = None
+            if redis_client is not None and redis_client.is_initialized:
+                try:
+                    raw = await redis_client.get(f"hcm:ai:{c}:status")
+                except Exception:
+                    raw = None
+            if not raw:
+                out[c] = {"alive": False, "running": False, "note": "守护未上报(键过期)"}
+                continue
+            out[c] = _parse_ai_stack_status(raw)
+        return {"code": 0, "data": out, "message": "ok"}
 
     # ══════════════════════════════════════════════════════════
     # Legacy backward-compatible routes
@@ -4456,6 +4553,33 @@ def create_system_router(
         except Exception as e:
             ai_ok = False; ai_msg = str(e)[:80]; ai_fix = "set_deepseek_key"
         nodes.append({"id": "ai", "name": "AI增强", "ok": ai_ok, "msg": ai_msg, "fix": ai_fix})
+
+        # ── Node 6b/6c: AI 主机组件（TimesFM / LightGBM sidecar）──
+        # 存活判据 = 主机守护回写的 hcm:ai:{comp}:status（TTL 180s）。
+        # 键过期即视为守护停摆/失联，alive 判 False，不会误报存活。
+        for _comp, _label in (("lightgbm", "LightGBM sidecar"), ("timesfm", "TimesFM 调度器")):
+            _ok, _msg = False, "守护未上报（键过期）"
+            try:
+                if redis_client and redis_client.is_initialized:
+                    _rawst = await redis_client.get(f"hcm:ai:{_comp}:status")
+                    if _rawst:
+                        # 状态键为守护回写的「管道分隔文本」(ai_stack_guard.ps1 新格式)
+                        # 或旧版 JSON，统一走 _parse_ai_stack_status 兼容解析，勿在此 json.loads
+                        _st = _parse_ai_stack_status(_rawst)
+                        _alive = bool(_st.get("alive"))
+                        _run = bool(_st.get("running"))
+                        _age = _st.get("beat_age_s", -1)
+                        _ok = _alive
+                        if not _run:
+                            _msg = f"{_label}: 进程缺失"
+                        elif not _alive:
+                            _msg = f"{_label}: 进程在但心跳过期({_age}s)→假死"
+                        else:
+                            _msg = f"{_label}: 正常 pid={_st.get('pid')} 心跳{_age}s"
+            except Exception as _e:
+                _msg = f"{_label}: 状态读取失败 {str(_e)[:40]}"
+            nodes.append({"id": f"ai_{_comp}", "name": _label, "ok": _ok,
+                          "msg": _msg, "fix": "ai_stack_heal"})
 
         # ── Node 7: Risk Engine ──
         risk_ok, risk_msg, risk_fix = True, "", ""

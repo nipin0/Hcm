@@ -82,6 +82,13 @@ _REASON_EXACT: dict[str, str] = {
 _REASON_PREFIX: tuple[tuple[str, str], ...] = (
     ("hexp_extreme_reversal", "极值反转保护（顶部接刀/底部抄底：极值区+动量反转被拦截）"),
     ("hexp_extreme_guard", "极值保护（极值区动量回撤，不追原趋势单）"),
+    # ── HEXP 生产路径的真实护栏（此前缺映射，落库为英文原串，漏斗明细无法归色）──
+    ("hexp_zone_guard", "逆结构护栏（贴脸逆 S/R/枢轴/整数关口，不追单）"),
+    ("hexp_cycle_pos_guard", "周期位置硬守护（极值位接刀/摸顶拦截）"),
+    ("hexp_momentum_drain", "动量枯竭保护（高位动量枯竭，不追单）"),
+    ("hexp_momentum_flip", "动量方向否决（微动量明确反向，逆动量单拦截）"),
+    ("hexp_range_hurst", "区间 Hurst 护栏（横盘低波动反转追单拦截）"),
+    ("hexp_trend_start_order", "趋势抢跑成单（顺势突破轻仓单）"),
     ("hexp_coupling_below_min", "共振耦合分不足（多周期未共振）"),
     ("hexp_grade_below_min", "评分等级不足（低于可下单评级）"),
     # AI 耦合闸门（历史数据；当前 ai.mode=decoupled 已不再产生）
@@ -110,6 +117,7 @@ _REASON_CONTAINS: tuple[tuple[str, str], ...] = (
     # 评分门槛
     ("below_threshold", "评分未达门槛（低于当前体制评分门槛）"),
     ("grade_below", "评分等级不足（低于可下单评级）"),
+    ("ai_coupling_below", "耦合分未过闸（AI 低耦合分否决，HEXP 已过闸但耦合总分低于阈值）"),
     # ADX
     ("adx_floor", "ADX 地板（趋势强度不足，禁止交易）"),
     ("min_adx", "ADX 地板（趋势强度不足，禁止交易）"),
@@ -222,6 +230,80 @@ def map_funnel_reason(raw: Optional[str]) -> str:
         return "未标记"
     return " + ".join(mapped)
 
+
+# ── 漏斗「拦截/触发原因」8+1 语义分类（与前端 funnelReasons.classifyReason 对齐）──
+# 把引擎英文 fallback_reason 经 map_funnel_reason 翻译成中文卡点名后，归到 9 个语义类别
+# + 1 个 neutral（无卡点）。前端 SignalFunnel 的 reasonColor / REASON_CATEGORIES 按同一套
+# key 着色，故此处分类 key 必须与 funnelReasons.ts 完全一致：
+#   trigger/strategic/extreme/momentum/score/structure/cooldown/risk/engine/neutral
+# 纯展示层聚合，不改变任何拦截逻辑与落库值。
+_FUNNEL_CATEGORY_KEYS = (
+    "trigger", "strategic", "extreme", "momentum",
+    "score", "structure", "cooldown", "risk", "engine",
+)
+
+
+def classify_funnel_reason_category(raw: Optional[str]) -> str:
+    """把 fallback_reason 归到 8+1 语义类别（key 同前端 funnelReasons.ts）。
+
+    分类字面规则移植自前端 classifyReason：先取 map_funnel_reason 的中文卡点名，
+    再按优先级做子串匹配。多原因拼接串（" + " 连接）整体匹配，与前端一致。
+    """
+    cn = (map_funnel_reason(raw) or "").strip()
+    if not cn or cn == "未标记" or cn.startswith("无（"):
+        return "neutral"
+
+    # 1) 触发成单（绿）优先
+    if "趋势抢跑成单" in cn:
+        return "trigger"
+    # 2) 风控硬拦（红）
+    if "最大订单" in cn or "亏损熔断" in cn or "置信度" in cn or "点差过大" in cn:
+        return "risk"
+    # 3) 冷却节流（紫）
+    if "冷却" in cn or "保本闸门" in cn:
+        return "cooldown"
+    # 4) 极值/接刀防护（琥珀）—— 须在动量之前，避免「动量枯竭」被动量类误吞
+    if "极值" in cn or "动量枯竭" in cn or "接刀" in cn or "摸顶" in cn or "Hurst" in cn:
+        return "extreme"
+    # 5) 动量/逆势裁决（玫红）
+    if "动量" in cn or "逆势" in cn:
+        return "momentum"
+    # 6) 评分类（黄）
+    if "评分" in cn or "耦合" in cn or "校准" in cn or "门槛" in cn or "等级" in cn:
+        return "score"
+    # 7) 结构/位置（青）
+    if "结构" in cn or "突破" in cn or "震荡市拦截" in cn:
+        return "structure"
+    # 8) 数据/引擎/质量异常（深橙）
+    if "未就绪" in cn or "已关闭" in cn or "地板" in cn or "过滤" in cn or re.search(r"F[1-6]", cn):
+        return "engine"
+    # 9) 策略主动放弃（天蓝）
+    if ("无明确方向" in cn or "策略放弃" in cn or "不做均值回归" in cn
+            or "回撤刹车" in cn or "试探单已用" in cn or "震荡市拦截" in cn):
+        return "strategic"
+
+    return "neutral"
+
+
+def build_funnel_category_breakdown(rows) -> dict:
+    """把 (fallback_reason, cnt) 行聚合为 8+1 类别计数。
+
+    Args:
+        rows: asyncpg fetch 结果，每行含 "fallback_reason" 与 "cnt" 字段。
+    Returns:
+        {category_key: count}，仅含计数>0 的类别，按 _FUNNEL_CATEGORY_KEYS 顺序构造。
+    """
+    agg: dict[str, int] = {}
+    for r in rows:
+        raw = r["fallback_reason"]
+        cnt = int(r["cnt"])
+        if not raw or cnt <= 0:
+            continue
+        cat = classify_funnel_reason_category(raw)
+        agg[cat] = agg.get(cat, 0) + cnt
+    return {k: agg[k] for k in _FUNNEL_CATEGORY_KEYS if k in agg}
+
+
 # ── Constants ───────────────────────────────────
 
 # Threshold panel config keys & defaults — SOURCE OF TRUTH for BOTH the
@@ -301,6 +383,12 @@ THRESHOLD_CONFIG_DEFAULTS: dict[str, Any] = {
     #                            （micro_state.py / precision_entry.py 已改读新键），
     #                            此处 13 个旧键全库无引用 → 纯死键，一并移除。
     "co.v2_shadow_enabled": True,
+    # ── ⑫ 入场时机闸门（方案D 挂起）— scheduler.py:1388-1405 重评 / :3014 登记 ──
+    # 【2026-09-04 配置化】原为 getattr 硬编码默认(True / 900s)，面板不可见且无法
+    # 热调；现纳入配置中心，默认值与改动前行为完全一致。
+    # TTL 单位=秒：挂起超过此时长仍未等来动量转向 → 放弃(不再追)。
+    "signal_tower.entry_pending_enabled": True,
+    "signal_tower.entry_pending_ttl_sec": 900,
 }
 
 # Cooldown endpoint = SUBSET of THRESHOLD_CONFIG_DEFAULTS (the 6 regime
@@ -1889,6 +1977,16 @@ def create_signal_tower_router(
                   {sym_filter}
                 GROUP BY layer
             """
+            # 按原始 fallback_reason 分组（供 8+1 类别聚合，更细粒度）
+            intercept_cat_sql = f"""
+                SELECT fallback_reason, COUNT(*) AS cnt
+                FROM hcm_signal.signals
+                WHERE signal_mode = 'filtered'
+                  AND signal_dir = 'NO_TRADE'
+                  AND created_at >= now() - ($1::int || ' hours')::interval
+                  {sym_filter}
+                GROUP BY fallback_reason
+            """
             # 已发风控（通过 HEXP 闸门）的总数
             published_sql = f"""
                 SELECT COUNT(*) AS cnt
@@ -1930,6 +2028,7 @@ def create_signal_tower_router(
             if symbol:
                 cand_row = await db_pool.fetchrow(candidate_sql, hours, symbol)
                 intercept_rows = await db_pool.fetch(intercept_sql, hours, symbol)
+                intercept_cat_rows = await db_pool.fetch(intercept_cat_sql, hours, symbol)
                 published_row = await db_pool.fetchrow(published_sql, hours, symbol)
                 risk_reject_row = await db_pool.fetchrow(risk_reject_sql, hours, symbol)
                 filled_row = await db_pool.fetchrow(filled_sql, hours, symbol)
@@ -1937,6 +2036,7 @@ def create_signal_tower_router(
             else:
                 cand_row = await db_pool.fetchrow(candidate_sql, hours)
                 intercept_rows = await db_pool.fetch(intercept_sql, hours)
+                intercept_cat_rows = await db_pool.fetch(intercept_cat_sql, hours)
                 published_row = await db_pool.fetchrow(published_sql, hours)
                 risk_reject_row = await db_pool.fetchrow(risk_reject_sql, hours)
                 filled_row = await db_pool.fetchrow(filled_sql, hours)
@@ -1944,6 +2044,8 @@ def create_signal_tower_router(
 
             candidate = int(cand_row["cnt"]) if cand_row else 0
             intercept = {r["layer"]: int(r["cnt"]) for r in intercept_rows}
+            # 8+1 语义类别聚合（替代粗分桶 grade/extreme/direction/cooldown/other）
+            intercept_cat = build_funnel_category_breakdown(intercept_cat_rows)
             published = int(published_row["cnt"]) if published_row else 0
             risk_rejected = int(risk_reject_row["cnt"]) if risk_reject_row else 0
             filled = int(filled_row["cnt"]) if filled_row else 0
@@ -2070,7 +2172,7 @@ def create_signal_tower_router(
                 "no_trade": other_blocked,
                 "conversion": round(filled / candidate, 4) if candidate else 0.0,
                 "layers": layers,
-                "block_reason_breakdown": intercept,
+                "block_reason_breakdown": intercept_cat,
                 "marked_breakdown": {},
                 "thresholds": thresholds,
                 "latest_adx": latest_adx,
@@ -2125,6 +2227,7 @@ def create_signal_tower_router(
                         WHEN fallback_reason LIKE '%calib_block%'
                              OR fallback_reason LIKE '%calib_unknown%'
                              OR fallback_reason LIKE '%calib_missing%' THEN 'calibration'
+                        WHEN fallback_reason LIKE '%ai_coupling_below%' THEN 'ai_coupling'
                         ELSE 'direction'
                     END AS layer,
                     COUNT(*) AS cnt
@@ -2150,6 +2253,7 @@ def create_signal_tower_router(
                         WHEN fallback_reason LIKE '%calib_block%'
                              OR fallback_reason LIKE '%calib_unknown%'
                              OR fallback_reason LIKE '%calib_missing%' THEN 'calibration'
+                        WHEN fallback_reason LIKE '%ai_coupling_below%' THEN 'ai_coupling'
                         ELSE 'direction'
                     END AS layer,
                     COUNT(*) AS cnt
@@ -2159,6 +2263,25 @@ def create_signal_tower_router(
                   AND created_at >= now() - ($1::int || ' hours')::interval
                   {sym_filter} {dir_filter}
                 GROUP BY layer
+            """
+            # 按原始 fallback_reason 分组（供 8+1 类别聚合，更细粒度）
+            block_cat_sql = f"""
+                SELECT fallback_reason, COUNT(*) AS cnt
+                FROM hcm_signal.signals
+                WHERE signal_status = 2
+                  AND signal_dir NOT IN ('MODIFY', 'CLOSE', 'PARTIAL_CLOSE', 'ADD')
+                  AND created_at >= now() - ($1::int || ' hours')::interval
+                  {sym_filter} {dir_filter}
+                GROUP BY fallback_reason
+            """
+            marked_cat_sql = f"""
+                SELECT fallback_reason, COUNT(*) AS cnt
+                FROM hcm_signal.signals
+                WHERE signal_status = 3 AND fallback_reason IS NOT NULL AND fallback_reason <> ''
+                  AND signal_dir NOT IN ('MODIFY', 'CLOSE', 'PARTIAL_CLOSE', 'ADD')
+                  AND created_at >= now() - ($1::int || ' hours')::interval
+                  {sym_filter} {dir_filter}
+                GROUP BY fallback_reason
             """
             # 真实成交 = 桥成功下到 MT5 (signal_status=3)，而非平仓归档表
             traded_sql = f"""
@@ -2200,6 +2323,8 @@ def create_signal_tower_router(
             if symbol:
                 rows = await db_pool.fetch(layer_sql, hours, symbol)
                 marked_rows = await db_pool.fetch(marked_sql, hours, symbol)
+                block_cat_rows = await db_pool.fetch(block_cat_sql, hours, symbol)
+                marked_cat_rows = await db_pool.fetch(marked_cat_sql, hours, symbol)
                 traded_row = await db_pool.fetchrow(traded_sql, hours, symbol)
                 cand_row = await db_pool.fetchrow(candidates_sql, hours, symbol)
                 detail_rows = await db_pool.fetch(detail_sql, hours, symbol)
@@ -2207,6 +2332,8 @@ def create_signal_tower_router(
             else:
                 rows = await db_pool.fetch(layer_sql, hours)
                 marked_rows = await db_pool.fetch(marked_sql, hours)
+                block_cat_rows = await db_pool.fetch(block_cat_sql, hours)
+                marked_cat_rows = await db_pool.fetch(marked_cat_sql, hours)
                 traded_row = await db_pool.fetchrow(traded_sql, hours)
                 cand_row = await db_pool.fetchrow(candidates_sql, hours)
                 detail_rows = await db_pool.fetch(detail_sql, hours)
@@ -2214,6 +2341,9 @@ def create_signal_tower_router(
 
             block: dict[str, int] = {r["layer"]: int(r["cnt"]) for r in rows}
             marked: dict[str, int] = {r["layer"]: int(r["cnt"]) for r in marked_rows}
+            # 8+1 语义类别聚合（替代粗分桶 grade/extreme/direction/cooldown/...）
+            block_cat = build_funnel_category_breakdown(block_cat_rows)
+            marked_cat = build_funnel_category_breakdown(marked_cat_rows)
             traded = int(traded_row["cnt"]) if traded_row else 0
             candidates = int(cand_row["cnt"]) if cand_row else 0
             no_trade = int(no_trade_row["cnt"]) if no_trade_row else 0
@@ -2337,8 +2467,8 @@ def create_signal_tower_router(
                 "no_trade": no_trade,
                 "conversion": round(traded / candidates, 4) if candidates else 0.0,
                 "layers": layers,
-                "block_reason_breakdown": block,
-                "marked_breakdown": marked,
+                "block_reason_breakdown": block_cat,
+                "marked_breakdown": marked_cat,
                 "thresholds": thresholds,
                 "latest_adx": latest_adx,
                 "latest_regime": latest_regime,

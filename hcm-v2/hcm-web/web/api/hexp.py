@@ -98,6 +98,12 @@ HEXP_KEYS: dict[str, Any] = {
     # 1.0=不额外罚（默认，向后兼容）；<1.0=逆风时 total 乘性下压，使 grade 更难达 min_grade。
     # 2026-08-21 补入白名单：此前仅在引擎 _DEFAULTS，面板无控件 → 改代码默认重启复原。
     "hexp.resonance.pullback_penalty": 1.0,
+    # 【2026-09-02 方案1·分级处理】强共振逆风硬拦阈值：|verdict| >= 此值且方向与共振
+    # 相反 → NO_TRADE；低于阈值（弱共振/震荡/反转初期）仍走降分，保留柔性。
+    # 0.5 由 2026-09-01 实测标定（当日 10 笔逆势 BUY 的 verdict 全为 -1.0，
+    # 亏 -72.06、胜率 30%、盈亏比 1:8；而 penalty=0.3 仅降分 21~27% 拦不住）。
+    # <=0 表示关闭硬拦、退回纯降分，可热回退。与引擎 _DEFAULTS 对齐。
+    "hexp.resonance.counter_block_threshold": 0.5,
     # 已删除的弃用键（2026-08-11 清理）：hexp.resonance.bonus /
     # hexp.mtf.long_threshold / hexp.mtf.short_threshold —— 方案 B 已废除 verdict 硬封，
     # 引擎侧无读取点；保留在白名单只会让面板误以为可调且仍生效。
@@ -139,9 +145,43 @@ HEXP_KEYS: dict[str, Any] = {
     "hexp.direction_min_score": 0.20,
     # 2026-08-27 方向迟滞死区：dir_sum 在 0 附近微动跨阈值翻转 → direction 闪烁（防抖）。
     "hexp.direction_hysteresis": 0.06,
+    # 2026-09-01 按市况提高评分门槛：逗号分隔 "regime:grade"，如 "RANGE:A,NEUTRAL:A"，
+    # 命中当前 regime 时用该档覆盖全局 hexp.min_grade（震荡/中性市更挑剔）。空串=不覆盖。
+    "hexp.regime_min_grade": "",
+    # 2026-09-01 AI 方向头快翻（选项B）：dir_lm 高置信反向持续确认时强制 hexp 翻向。
+    # enabled 默认 False（先观测后启用）；prob=置信门槛；bars=连续确认棒数。
+    "hexp.dir_lm_flip_enabled": False,
+    "hexp.dir_lm_flip_prob": 0.65,
+    "hexp.dir_lm_flip_bars": 2,
     # 2026-08-27 方向强制翻转阈值：|dir_sum|>=此值或 MTF 周期共识反向 → 绕过死区立即翻，
     # 避免迟滞"死黏"首次方向（如下跌趋势被位置因子顶在小幅 → 永久 BUY 死标签）。
     "hexp.direction_hysteresis_strong": 0.20,
+    # 2026-08-31 周期位置硬守护(cycle_pos_guard)的顺势趋势单豁免开关：主周期明确趋势且
+    # 方向顺势(TREND_UP+BUY / TREND_DOWN+SELL)时，位置极值(低位禁空/高位禁多)不再硬封
+    # （趋势延续中位置极值是常态，硬封=错杀顺势趋势单）；非顺势仍执行接刀/摸顶防护。
+    # False→退回旧硬封行为。
+    "hexp.cycle.trend_exempt": True,
+    # 2026-09-01 庚方案 Step1：周期位置硬守护(cycle_pos_guard)的低位空/高位多豁免，
+    # 在「主周期顺势(trend_exempt)」基础上额外要求微动量尚未反向(与 momentum_flip 同口径)。
+    # 动量已明确反向(真接刀) → 不豁免仍硬封；动量仍顺势(顺势低位空/高位多) → 放行交风控。
+    # 默认 True（已接入裁决）；设为 False 退回纯趋势态豁免旧行为（热可回退）。
+    "hexp.cycle.mm_confirm_enabled": True,
+    # 2026-09-02 P0：保本豁免(cycle_pos_guard 的极端_pending 路径)总开关。
+    # 保本不再【单独】构成豁免低位禁空的理由——须与 mm_confirm 同向(动量未反向)叠加才放行。
+    # False→退回"保本必放行"旧行为（仅保留趋势豁免）。默认 True。
+    "hexp.cycle.be_exempt": True,
+    # 2026-09-02 P1-1：超卖做空/超买做多 → 评级封顶。逆 RSI 方向时把评级压到
+    # rsi_guard_max_grade（默认 C，当前 hexp.min_grade=B → C<B 直接被拦下）。
+    # 想"降档但放行"设 B；想完全硬封设 RED；关闭用 rsi_guard_enabled=false。
+    "hexp.rsi_guard_enabled": True,
+    "hexp.rsi_guard_oversold": 30.0,
+    "hexp.rsi_guard_overbought": 70.0,
+    "hexp.rsi_guard_max_grade": "C",
+    # 2026-09-02 P1-2：live_override 禁止在「已大幅单边延伸」后追单。仅 live_override 路径，
+    # 计算近 live_extend_bars 根收盘价同向累计位移，超 live_extend_atr×ATR 即 NO_TRADE。
+    "hexp.live_extend_guard_enabled": True,
+    "hexp.live_extend_bars": 6,
+    "hexp.live_extend_atr": 1.5,
     # 位置因子（BUG-1 修复 2026-08-13）：Donchian 分位→均值回归方向因子参与方向裁决，
     # 底部托 BUY / 顶部压 SELL / 中部无影响，根治"高多低空"。
     "hexp.pos_factor.enabled": True,
@@ -205,6 +245,10 @@ HEXP_KEYS: dict[str, Any] = {
     "hexp.momentum_flip_trend_enabled": True,
     "hexp.momentum_flip_trend_adx": 25.0,
     "hexp.momentum_flip_trend_mm": 0.15,
+    # 【2026-09-01 方案B】辅助判据(ADX+ma)仅在「主周期非 RANGE」时生效：主周期 RANGE 时
+    # ADX 高只反映此前趋势强度、ma 滞后，不足以证明当下顺势 → 回退基础 flip_mm，
+    # 敏捷拦逆动量追单（根治反弹中追空）。与引擎 _DEFAULTS 对齐；False→退回旧行为。
+    "hexp.momentum_flip_trend_require_trend_state": True,
     # 2026-08-28 闸门清除：G5b 高位微正枯竭加固(momentum_hi_weak_*) 已移除。
     # 2026-08-26 P0-2 震荡市均值回归校验：NEUTRAL/RANGE 市 + hurst<阈值(均值回归态) + 高位
     # 顺势追单 → 拦（实证 sig=388640598 pos=0.846 hurst=0.449 regime=NEUTRAL 高位追多被止损）。

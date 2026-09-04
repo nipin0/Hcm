@@ -133,6 +133,12 @@ class RiskStreamConsumer:
             # 共源 G3 / AI 动态手数倍率：scheduler 已将 co_exec_lot_mult 与 suggested_lot_ratio 合并进此字段
             co_ai_mult = float(signal_data.get("suggested_lot_ratio", 1.0) or 1.0)
             score = float(signal_data.get("confidence", 0.0))
+            # 【2026-08-31 口径修复】confidence 为 0–100 制（2026-08-28 迁移，耦合分/scorecard_total），
+            # 而 risk.score_tier_{low,mid,high} 为 0–1 制（生产=0.50/0.80/0.95）。直接比较会让任意
+            # 0–100 分值恒 ≥ 0.95 → 恒判 high 档(×1.5)，低耦合分(62/67/72)本应 <80→low(×0.5) 却被放大。
+            # 归一为 0–1 后再分档（若输入已是 0–1 制则原样保留，兼容历史），零新增配置键。
+            if score > 1.0:
+                score = score / 100.0
             high_threshold = await get("risk.score_tier_high", 0.85)
             mid_threshold = await get("risk.score_tier_mid", 0.65)
             low_threshold = await get("risk.score_tier_low", 0.50)

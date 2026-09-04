@@ -13,9 +13,11 @@
        session 亚/欧/美 one-hot / spread / spread_atr /
        event_proximity_min / macro_risk_score / sentiment_risk_score
 
-缺失的 HEXP 专属特征（hp_score/hp_strength/dir_sum/k/verdict/trend_phase/多周期趋势）
+缺失的 HEXP 专属特征（hp_score/hp_strength/dir_sum/k/trend_phase/多周期趋势）
 当前引擎未落库，本脚本以 NaN 占位并在列尾 `missing_hexp_features` 元数据中显式标注。
 → 补齐需引擎在 hexp 路径把 factor_raws 持久化到 signals.indicator_values（红线改动，另行确认）。
+【2026-09-02】verdict 已不再缺失：训练侧由 _compute_verdict 从多周期 K 线重算、推理侧由
+build_features 读 hexp 实时 snap["verdict"]，故已从 MISSING_HEXP 占位名单移除并纳入 MODEL_FEATURE_COLS。
 
 用法:
   DB_URL=postgresql://hcm:hcm_dev_pwd@localhost:5432/hcm_v2 \
@@ -49,8 +51,10 @@ ATR_PCT_WINDOW = 120
 DI_PERIOD = 14
 MM_PERIOD = 5
 
-# HEXP 专属特征（引擎未落库，NaN 占位）
-MISSING_HEXP = ["hp_score", "hp_strength", "dir_sum", "k", "verdict"]
+# HEXP 专属特征（引擎未落库，NaN 占位）。【2026-09-02】verdict 已不再缺失：
+# 训练侧由 _compute_verdict 从多周期 K 线重算填入，推理侧由 build_features 读 hexp 实时
+# snap["verdict"]，故从占位名单移除（否则会被误当 NaN 占位）。
+MISSING_HEXP = ["hp_score", "hp_strength", "dir_sum", "k"]
 
 
 def load_signals(conn, mode: str) -> pd.DataFrame:
@@ -142,6 +146,11 @@ def enrich_klines(kl: pd.DataFrame) -> pd.DataFrame:
     atr_sm = tr.ewm(alpha=1 / DI_PERIOD, adjust=False).mean()
     plus_di = 100 * plus_dm.ewm(alpha=1 / DI_PERIOD, adjust=False).mean() / atr_sm.replace(0, np.nan)
     minus_di = 100 * minus_dm.ewm(alpha=1 / DI_PERIOD, adjust=False).mean() / atr_sm.replace(0, np.nan)
+    # ADX(14)：DX 的 Wilder 平滑（与推理侧 _h1_features / align_m5 同口径）。
+    # 供多周期 verdict 重算(_compute_verdict)取用；M5 路径仍优先用 indicator_values 的
+    # adx_14（或 period_align=m5 时同源重算），此处补齐不影响 M5 既有口径。
+    _dx = 100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = _dx.ewm(alpha=1 / DI_PERIOD, adjust=False).mean()
 
     # ── ER 效率比 ──
     er = (close.diff(ER_PERIOD).abs() /
@@ -188,7 +197,7 @@ def enrich_klines(kl: pd.DataFrame) -> pd.DataFrame:
     rsi_14 = 100.0 - 100.0 / (1.0 + (gain / loss.replace(0, float("nan"))))
     kl = kl.assign(
         atr=atr, plus_di=plus_di, minus_di=minus_di, er=er,
-        bbw=bbw, bbw_pct=bbw_pct, hurst=hurst, mm=mm,
+        bbw=bbw, bbw_pct=bbw_pct, hurst=hurst, mm=mm, adx_14=adx,
         rsi_14=rsi_14, ema20=ema_fast,
         ema20_dist_atr=ema20_dist_atr, body_ratio=body_ratio,
         pullback_depth=pullback_depth, atr_pct=atr_pct,
@@ -361,6 +370,195 @@ def load_tmf_features(conn, version: str = "tfm25_pca_v1_sig") -> dict:
     return out
 
 
+# ── 【2026-09-02】多周期 MTF 共识分 verdict 重算（与 hexp_engine 同构近似）──
+# 目的：把 hexp 实时算的 M30/H1/H4/D1 加权共识分 verdict 作为方向头特征，让 dir_head
+# 拿到"多周期共振方向"这一最强方向信号。训练侧历史无 verdict 落库（仅 HEXP 信号有、
+# live_override 无）→ 必须从多周期 K 线重算，保证 HEXP+live_override 全覆盖。
+# 关键：仅用截至信号时刻的"已收盘 bar"计算，杜绝未来数据泄露（与推理侧 hexp 口径一致）。
+# 近似说明：hexp 用带连续性的迟滞状态机(_HysteresisState)判各周期趋势态，本函数用"截至
+# 时刻的窗口快照"等效判定（无跨 bar 状态），作为训练特征近似合理、且确定性可复现。
+MTF_WEIGHTS = {"M30": 0.15, "H1": 0.25, "H4": 0.35, "D1": 0.25}
+MTF_PERIODS = ["M30", "H1", "H4", "D1"]
+MTF_ENTER_TS = 60.0   # 对齐 hexp.state.enter_score 默认
+MTF_EXIT_TS = 35.0    # 对齐 hexp.state.exit_score 默认
+MTF_MIN_PERIODS = 2.0  # 对齐 hexp.resonance.min_periods 默认
+
+
+def load_klines_multi_tf(conn, symbols, tfs):
+    """加载并 enrich 多周期 K 线（M30/H1/H4/D1），供 _compute_verdict 重算 verdict。
+
+    与 M5 管线同构（enrich_klines + _add_structure_factors 算出 adx_14/plus_di/minus_di
+    等），按 (symbol, tf) 存于嵌套 dict。时间窗取全量（重算时按 created_at 截断到已收盘 bar）。
+    """
+    out: dict = {}
+    _syms = sorted(set(symbols))
+    for tf in tfs:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT symbol, open_time, open, high, low, close, spread "
+                "FROM hcm_market.klines WHERE symbol = ANY(%s) AND time_frame=%s ORDER BY open_time",
+                (_syms, tf),
+            )
+            rows = cur.fetchall()
+        if not rows:
+            continue
+        kdf = pd.DataFrame(rows, columns=["symbol", "open_time", "open", "high", "low", "close", "spread"])
+        kdf["open_time"] = pd.to_datetime(kdf["open_time"], utc=True)
+        for sym, g in kdf.groupby("symbol"):
+            g = g.sort_values("open_time").reset_index(drop=True)
+            out.setdefault(sym, {})[tf] = _add_structure_factors(enrich_klines(g))
+    return out
+
+
+def _bar_at_or_before(kl: pd.DataFrame, ts) -> int | None:
+    """返回 kl 中 open_time <= ts 的最后一根已收盘 bar 的 index（防未来泄露）。"""
+    if kl is None or kl.empty:
+        return None
+    idx = kl["open_time"].searchsorted(ts, side="right") - 1
+    if idx < 0:
+        return None
+    return int(min(idx, len(kl) - 1))
+
+
+def _period_trend_state(adx, pdi, mdi, close, ema60) -> str:
+    """各周期趋势态判定（与 hexp_engine 同构近似，单点快照版，无迟滞状态机连续性）。
+
+    方向：ma(close vs EMA60) 与 DI 同向取之，矛盾记 0；强度用 ADX 分段近似 TrendScore；
+    方向确定且 ts>=enter→TREND；ts<exit→RANGE；否则 TRANSITION。
+    """
+    if adx is None or pdi is None or mdi is None or close is None or ema60 is None:
+        return "RANGE"
+    di_dir = 1 if pdi >= mdi else -1
+    ma_dir = 1 if close > ema60 else (-1 if close < ema60 else 0)
+    if ma_dir == 0:
+        pdir = di_dir
+    elif ma_dir == di_dir:
+        pdir = ma_dir
+    else:
+        pdir = 0
+    if adx >= 50:
+        ts = 85.0
+    elif adx >= 25:
+        ts = 60.0
+    elif adx >= 15:
+        ts = 45.0
+    else:
+        ts = 20.0
+    if pdir != 0 and ts >= MTF_ENTER_TS:
+        return "TREND_UP" if pdir > 0 else "TREND_DOWN"
+    elif ts < MTF_EXIT_TS:
+        return "RANGE"
+    return "TRANSITION"
+
+
+def h1_trend_dir_at(h1kl, ts) -> float:
+    """返回 ts 时刻**已收盘** H1 棒的主趋势方向：+1.0=TREND_UP / -1.0=TREND_DOWN / 0.0=其它。
+
+    【2026-09-02 方向头特征注入】供 direction head 感知"H1 主趋势方向"，使趋势对齐标签
+    (build_labels dir_trend_align)能被模型真正学习 —— 否则方向头特征集无 H1 方向输入，
+    即便标签把逆 H1 运动压 FLAT，模型也无法区分"H1 UP 的回调"与"震荡顶的反转"，仍在超买处判 SELL。
+
+    与 _compute_verdict 同口径（quality_features 训练侧 / build_labels / quality_scorer 推理侧三方复用）：
+      - 复用 _period_trend_state（ma close vs EMA60 与 DI 同向 + ADX 分段 TrendScore≥enter）；
+      - ema60 现算（累计含至 i 的 EWM，与 _compute_verdict 一致）；
+      - 只读过去已收盘棒 → 无未来泄露。
+    """
+    if h1kl is None or h1kl.empty:
+        return 0.0
+    i = _bar_at_or_before(h1kl, ts)
+    if i is None:
+        return 0.0
+    try:
+        row = h1kl.iloc[i]
+        _adx = float(row["adx_14"])
+        _pdi = float(row["plus_di"])
+        _mdi = float(row["minus_di"])
+        _close = float(row["close"])
+    except Exception:
+        return 0.0
+    _ema60 = float(h1kl["close"].astype(float).iloc[: i + 1]
+                   .ewm(span=60, adjust=False).mean().iloc[i])
+    if any(pd.isna(v) for v in (_adx, _pdi, _mdi, _close, _ema60)):
+        return 0.0
+    _st = _period_trend_state(_adx, _pdi, _mdi, _close, _ema60)
+    if _st == "TREND_UP":
+        return 1.0
+    if _st == "TREND_DOWN":
+        return -1.0
+    return 0.0
+
+
+def _compute_verdict(kl_mtf: dict, kl_m5: pd.DataFrame, created_at) -> float:
+    """从多周期 K 线重算 hexp 的 MTF 加权共识分 verdict ∈[-1,1]。
+
+    同构 hexp_engine 第 6 步：M30/H1/H4/D1 按 weight_* 加权，RANGE 周期按主周期位置/RSI
+    推导反向共识，单周期弱信号置信折扣(conf)。仅用截至 created_at 的已收盘 bar，无未来泄露。
+    返回 float（-1~1），缺数据→0.0（与推理侧 hexp 缺省一致）。
+    """
+    if kl_m5 is None or kl_m5.empty:
+        return 0.0
+    i5 = _bar_at_or_before(kl_m5, created_at)
+    if i5 is None:
+        return 0.0
+    # 主周期(M5) pos_pct（Donchian 60 分位）与 rsi，供 RANGE 周期反向共识推导
+    _hi60 = kl_m5["high"].iloc[: i5 + 1].rolling(60).max()
+    _lo60 = kl_m5["low"].iloc[: i5 + 1].rolling(60).min()
+    _close = float(kl_m5["close"].iloc[i5])
+    _hi = _hi60.iloc[i5]
+    _lo = _lo60.iloc[i5]
+    _rng = (_hi - _lo)
+    _pos_pct = 0.5 if _rng == 0 else float((_close - _lo) / _rng)
+    _rsi = kl_m5["rsi_14"].iloc[i5]
+    _rsi = float(_rsi) if pd.notna(_rsi) else 50.0
+
+    verdict = 0.0
+    wsum_r = 0.0
+    n_eff = 0
+    for p in MTF_PERIODS:
+        kl = kl_mtf.get(p)
+        i = _bar_at_or_before(kl, created_at)
+        if i is None:
+            continue
+        _adx = kl["adx_14"].iloc[i]
+        _pdi = kl["plus_di"].iloc[i]
+        _mdi = kl["minus_di"].iloc[i]
+        if pd.isna(_adx) or pd.isna(_pdi) or pd.isna(_mdi):
+            continue
+        _c = float(kl["close"].iloc[i])
+        _ema60 = float(kl["close"].iloc[: i + 1].ewm(span=60, adjust=False).mean().iloc[i])
+        st = _period_trend_state(float(_adx), float(_pdi), float(_mdi), _c, _ema60)
+        wp = MTF_WEIGHTS.get(p, 0.0)
+        if wp <= 0:
+            continue
+        if st == "TREND_UP":
+            pv = 1.0
+        elif st == "TREND_DOWN":
+            pv = -1.0
+        elif st == "RANGE":
+            # 方案 A：区间震荡反向共识（与 hexp 同口径）——高位/超买→一致做空(-1)，
+            # 低位/超卖→一致做多(+1)，中位→无共识(0)
+            if _pos_pct > 0.7 or _rsi > 70.0:
+                pv = -1.0
+            elif _pos_pct < 0.3 or _rsi < 35.0:
+                pv = 1.0
+            else:
+                pv = 0.0
+        else:  # TRANSITION
+            pv = 0.0
+        if pv == 0:
+            continue
+        verdict += pv * wp
+        wsum_r += wp
+        n_eff += 1
+    if wsum_r > 0:
+        verdict /= wsum_r
+    # 最小有效周期数约束（防单周期拉满 verdict 假象），与 hexp 同口径
+    if MTF_MIN_PERIODS > 0 and n_eff > 0:
+        _conf = min(1.0, n_eff / MTF_MIN_PERIODS)
+        verdict *= _conf
+    return float(verdict)
+
+
 def _row_tmf(tmf_sym, bar):
     """返回 tmf_* 13 列：命中则填真实值，未命中(无 bar / 无覆盖)→全 0.0（与推理侧缺省一致）。"""
     if bar is not None:
@@ -463,6 +661,10 @@ def main():
         # 推理侧在 build_features 内计算，训练侧必须同步，否则推理独有列被忽略 → 根因 B）。
         klines_by_sym = {s: _add_structure_factors(enrich_klines(g)) for s, g in kdf.groupby("symbol")}
 
+        # 【2026-09-02】多周期 K 线加载（M30/H1/H4/D1），供 _compute_verdict 重算 verdict 特征。
+        # 与 M5 同构 enrich；每 symbol 嵌套 {tf: kl}。仅离线重算用，运行期不占内存常驻。
+        klines_mtf = load_klines_multi_tf(conn, signals["symbol"].tolist(), MTF_PERIODS)
+
         # 【A+B 同源对齐 2026-08-17】训练特征集严格对齐推理侧 build_features 输出列。
         # 推理时不可得的特征(pre_score/regime/position_in_range/confidence/lot/
         # h1_regime/h1_trend_direction/ai_sl_mult/suggested_lot_ratio/MISSING_HEXP)一律剔除，
@@ -477,6 +679,18 @@ def main():
             if kl is not None and not kl.empty:
                 idx = kl["open_time"].searchsorted(r["created_at"], side="right") - 1
                 idx = max(0, min(idx, len(kl) - 1))
+                # 【2026-09-01 bar 对齐修复·训练侧】只用已收盘 bar：若信号时刻该 bar
+                # 仍在形成中(open_time + 周期 > created_at)，其特征(mm/close_mom_atr/
+                # body_ratio 等)尚未定型、随 tick 漂移 → 回退到前一根已收盘 bar，
+                # 与推理侧 _last_closed 同口径（否则训练-推理分布不一致 → 实盘判反）。
+                try:
+                    _tf = str(r.get("time_frame") or "M5").upper()
+                    _bar_sec = {"M1": 60, "M5": 300, "M15": 900, "M30": 1800,
+                                "H1": 3600, "H4": 14400}.get(_tf, 300)
+                    if kl.iloc[idx]["open_time"] + pd.Timedelta(seconds=_bar_sec) > r["created_at"]:
+                        idx = max(0, idx - 1)
+                except Exception:
+                    pass
                 _bar = kl.iloc[idx]
             if period_align == "m5" and _bar is not None:
                 # M5 同源重算全部指标因子（与推理 build_features 同口径）
@@ -528,6 +742,16 @@ def main():
             # _bar['open_time'] 即该信号所在 M5 bar 的 open_time，与特征表 bar_time 同义(精确对齐)。
             # 未命中(调度未覆盖的日期/非 XAUUSD)→ 13 列全 0.0，与推理侧缺省同分布。
             row.update(_row_tmf(tmf_by_sym.get(r["symbol"]), _bar))
+            # 【2026-09-02】verdict 多周期共识分：从多周期 K 线重算（截至信号时刻已收盘 bar，无泄露）。
+            # 与 hexp_engine 第 6 步同构近似；HEXP+live_override 全覆盖（落库 verdict 仅 HEXP 有）。
+            # 推理侧 build_features 直接读 hexp 实时 snap["verdict"]（同源），两侧分布一致。
+            _mtf = klines_mtf.get(r["symbol"], {})
+            row["verdict"] = _compute_verdict(_mtf, kl, r["created_at"])
+            # 【2026-09-02 h1_trend_dir 特征注入】H1 主趋势方向(±1/0)：供方向头真正感知
+            # "H1 主趋势"，使趋势对齐标签(dir_trend_align)可被模型学习(否则无 H1 输入，
+            # 模型无法区分"H1 UP 回调" vs "震荡顶反转"→ 超买仍判 SELL)。
+            # 与推理侧 quality_scorer.build_features(h1_feats["h1_trend_dir"]) 同源同口径。
+            row["h1_trend_dir"] = h1_trend_dir_at(_mtf.get("H1"), r["created_at"])
             # 环境
             row.update(session_onehot(r["created_at"]))
             row["event_proximity_min"] = None

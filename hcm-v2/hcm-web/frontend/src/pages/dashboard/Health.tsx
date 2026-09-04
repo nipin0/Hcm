@@ -238,11 +238,44 @@ const Health: React.FC = () => {
     }
   }, []);
 
+  // ── 2026-09-02 AI 组件自愈（TimesFM + LightGBM sidecar + auto_retrain 守护）──
+  // 容器无法启动 Windows 主机进程，本按钮只下发 Redis 信令；
+  // 实际拉起由主机计划任务 HCM_AIStackGuard 每 3 分钟调用 ai_stack_guard.ps1 执行。
+  const [aiHealing, setAiHealing] = useState(false);
+  const [aiStatus, setAiStatus] = useState<Record<string, any> | null>(null);
+  const [aiHealMsg, setAiHealMsg] = useState<string>('');
+
+  const fetchAiStatus = useCallback(async () => {
+    try {
+      const { data } = await client.get(ENDPOINTS.system.aiStatus);
+      if (data.code === 0) setAiStatus(data.data);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const runAiHeal = useCallback(async () => {
+    setAiHealing(true);
+    setAiHealMsg('');
+    try {
+      const { data } = await client.post(`${ENDPOINTS.system.aiHeal}?component=all`);
+      setAiHealMsg(data.code === 0 ? (data.message || '已下发自愈信令')
+                                   : (data.message || '自愈信令下发失败'));
+    } catch {
+      setAiHealMsg('自愈信令下发失败');
+    } finally {
+      setAiHealing(false);
+      // 守护每 3 分钟巡检一轮，稍后回读状态
+      setTimeout(fetchAiStatus, 8000);
+    }
+  }, [fetchAiStatus]);
+
   useEffect(() => {
     fetchHealth();
-    const interval = setInterval(fetchHealth, 15000);
+    fetchAiStatus();
+    const interval = setInterval(() => { fetchHealth(); fetchAiStatus(); }, 15000);
     return () => clearInterval(interval);
-  }, [fetchHealth]);
+  }, [fetchHealth, fetchAiStatus]);
 
   const statusIcon = (status: string): React.ReactNode => {
     switch (status) {
@@ -401,6 +434,19 @@ const Health: React.FC = () => {
           </Button>
           <Button
             variant="contained"
+            onClick={runAiHeal}
+            disabled={aiHealing}
+            title="下发自愈信令，由主机守护 HCM_AIStackGuard 拉起 TimesFM / LightGBM / auto_retrain 守护"
+            sx={{
+              backgroundColor: aiHealing ? '#4b5563' : '#0891b2',
+              '&:hover': { backgroundColor: aiHealing ? '#4b5563' : '#0e7490' },
+              fontWeight: 600,
+            }}
+          >
+            {aiHealing ? '自愈中…' : '🧠 AI 自愈'}
+          </Button>
+          <Button
+            variant="contained"
             onClick={runBackup}
             disabled={backingUp}
             sx={{
@@ -423,6 +469,30 @@ const Health: React.FC = () => {
           >
             {calibrating ? '校准中…' : '🔧 校准配置'}
           </Button>
+          {/* AI 组件存活状态（数据来自主机守护回写的 hcm:ai:{comp}:status） */}
+          {aiStatus && (
+            <Box sx={{ display: 'flex', gap: 1, alignItems: 'center', flexWrap: 'wrap' }}>
+              {[['lightgbm', 'LightGBM'], ['timesfm', 'TimesFM'], ['auto_retrain', '重训守护']].map(([k, label]) => {
+                const st = (aiStatus as Record<string, any>)[k] || {};
+                const alive = !!st.alive;
+                return (
+                  <Chip
+                    key={k}
+                    size="small"
+                    label={`${label}: ${alive ? '存活' : (st.running ? '假死' : '失活')}`}
+                    sx={{
+                      backgroundColor: alive ? '#05966944' : '#ef444444',
+                      color: alive ? '#34d399' : '#f87171',
+                      fontSize: 11,
+                    }}
+                  />
+                );
+              })}
+            </Box>
+          )}
+          {aiHealMsg && (
+            <Chip size="small" label={aiHealMsg} sx={{ backgroundColor: '#0891b244', color: '#67e8f9', fontSize: 11 }} />
+          )}
           {backupInfo && (
             <Chip
               size="small"

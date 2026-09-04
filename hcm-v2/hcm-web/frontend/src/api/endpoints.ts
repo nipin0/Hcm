@@ -51,6 +51,10 @@ export const ENDPOINTS = {
     diagnose: '/api/v1/system/diagnose',
     activate: '/api/v1/system/engine/activate',
     calibrateConfig: '/api/v1/system/calibrate-config',
+    // 2026-09-02 AI 组件自愈：TimesFM + LightGBM sidecar（容器只能写信令，
+    // 实际拉起由主机计划任务 HCM_AIStackGuard 执行）
+    aiHeal: '/api/v1/system/ai/heal',
+    aiStatus: '/api/v1/system/ai/status',
   },
   close: {
     config: '/api/close/config',
@@ -96,6 +100,7 @@ export const ENDPOINTS = {
       snapshot: '/api/v1/ai/report/snapshot',
       daily: '/api/v1/ai/report/daily',
       monitor: '/api/v1/ai/report/monitor',
+      reversal: '/api/v1/ai/report/reversal',
     },
     // [2026-08-29] AI 中枢监控（只读）：三头实时运作 + DeepSeek 工作效果 + 自愈中心
     ops: {

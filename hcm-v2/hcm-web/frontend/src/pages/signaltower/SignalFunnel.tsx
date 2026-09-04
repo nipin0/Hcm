@@ -9,6 +9,7 @@ import { FunnelChart, BarChart } from 'echarts/charts';
 import { TooltipComponent, GridComponent } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
 import client from '../../api/client';
+import { classifyReason, REASON_CATEGORIES } from '../../utils/funnelReasons';
 
 echarts.use([FunnelChart, BarChart, TooltipComponent, GridComponent, CanvasRenderer]);
 
@@ -44,43 +45,13 @@ interface FunnelData {
   model?: string; risk_rejected?: number;
 }
 
-// 卡点类别配色 —— 依据后端 map_funnel_reason() 返回的中文卡点名前缀归色，
-// 让用户一眼区分「策略主动放弃」/「风控硬拦」/「保护性拦截」/「数据异常」。
-const reasonColor = (cn: string): string => {
-  if (!cn || cn === '未标记' || cn.startsWith('无（')) return '#64748b';       // 灰：无卡点
-  if (cn.startsWith('策略放弃') || cn.startsWith('无明确方向')) return '#38bdf8'; // 天蓝：主动放弃
-  if (cn.startsWith('同向最大订单') || cn.startsWith('同向冷却')
-    || cn.startsWith('当日亏损熔断') || cn.startsWith('置信度不足')
-    || cn.startsWith('点差过大')) return '#ef4444';                            // 红：风控硬拦
-  if (cn.startsWith('极值')) return '#f59e0b';                                 // 橙：极值保护
-  if (cn.startsWith('逆势') || cn.startsWith('动量反向')) return '#fb7185';     // 玫红：逆势/动量
-  if (cn.startsWith('信号冷却')) return '#a78bfa';                             // 紫：节流冷却
-  if (cn.startsWith('评分等级') || cn.startsWith('评分未达门槛')
-    || cn.startsWith('共振耦合分不足')) return '#eab308';                       // 黄：评分类
-  if (cn.includes('未就绪') || cn.includes('已关闭')) return '#f97316';         // 深橙：数据/引擎异常
-  return '#94a3b8';                                                            // 默认灰蓝
-};
+// 卡点类别配色 —— 委托给 utils/funnelReasons（按后端 map_funnel_reason 的中文
+// 卡点名归到 8+1 个语义类别：触发成单/策略放弃/极值防护/动量逆势/评分类/
+// 结构/冷却/风控硬拦/数据引擎）。明细表与分布图统一用 REASON_CATEGORIES 着色。
 
-const GATE_HINTS: Record<string, string> = {
-  candidate: '每根 M5 棒进入评分的候选信号',
-  direction: '方向分离清晰 + 非震荡拦截 + 通过 F1-F5 假信号过滤',
-  adx: 'ADX ≥ 下限（排除低波动噪音区）',
-  reverse: '趋势市未逆势硬阻断（ADX≥阈值 时顺向才放行）',
-  threshold: 'pre_score ≥ 共源自适应门槛（强趋势/弱趋势/震荡带不同）',
-  cooldown: '通过同向冷却闸门 → 待成交 / 成交（含在途未回执）',
-};
-
-// HEXP（和乘幂）主生产路径的真实闸门提示 —— 当后端 model==='hexp' 时切换使用
-const HEXP_GATE_HINTS: Record<string, string> = {
-  candidate: 'HEXP 引擎每根 M5 棒产出的全部候选（含发布与拦截，排除 manual_mirror/订单管理方向）',
-  grade: '分级低于 hexp.min_grade 或 RED 档 → 禁发交易（hexp_grade_red / hexp_grade_below_min）',
-  extreme: '极值动量护栏：追单反向空间趋0 / 持仓比例过高 → 拦（hexp_extreme_guard）',
-  direction: '方向分离失败，direction=NO_TRADE（hexp_no_direction）',
-  cooldown: '同向冷却未过，抑制同向下单（cooldown_active）',
-  other: '引擎关闭 / 无数据 / 未分类拦截（filtered 且不匹配上列 hexp_* 原因）',
-  risk: '已发风控且风控未拒绝（signal_status≠2：在途/过风控未成交/成交）',
-  filled: '桥真实下达成交（signal_status=3，MT5）',
-};
+// 8+1 类别固定展示顺序（与 funnelReasons.REASON_CATEGORIES 顺序一致），用于把
+// 闸门链/拦截分布图按语义类别重排（而非原 grade/extreme/direction/cooldown 粗分桶）。
+const CATEGORY_ORDER = ['trigger', 'strategic', 'extreme', 'momentum', 'score', 'structure', 'cooldown', 'risk', 'engine', 'neutral'] as const;
 
 // 分量因子中文名 + 展示顺序（按策略体系）
 const FACTOR_LABELS: Record<string, string> = {
@@ -361,34 +332,47 @@ const SignalFunnel: React.FC = () => {
             </Paper>
           )}
 
-          {/* 漏斗图 + 闸门链 */}
+          {/* 漏斗图（通过量）+ 拦截原因分布（8+1 语义类别重排） */}
           <Box className="flex flex-col lg:flex-row gap-4">
             <Paper className="flex-1 p-3 bg-gray-800 min-h-[360px]">
               <Typography variant="subtitle2" className="text-slate-300 mb-1">逐层漏斗（通过量）</Typography>
               <ReactEChartsCore echarts={echarts} option={funnelOption} style={{ height: 340 }} notMerge />
             </Paper>
             <Paper className="flex-1 p-3 bg-gray-800">
-              <Typography variant="subtitle2" className="text-slate-300 mb-2">闸门链 · 真丢弃分布</Typography>
-              <Typography variant="caption" className="text-slate-500">下列拦截数 = 真实被风控拒绝 (signal_status=1)。被软扣分但照常成交的信号不计入此栏（见上方"被标记仍成交"）。</Typography>
+              <Typography variant="subtitle2" className="text-slate-300 mb-1">拦截原因分布（8+1 语义类别）</Typography>
+              <Typography variant="caption" className="text-slate-500">按「触发成单 / 策略放弃 / 极值防护 / 动量逆势 / 评分类 / 结构 / 冷却 / 风控硬拦 / 数据引擎」固定顺序聚合拦截原因（替代原 grade/extreme/direction/cooldown 粗分桶）。</Typography>
               <Box className="flex flex-col gap-2 mt-2">
-                {data.layers.map((l) => {
-                  const total = data.candidates;
-                  const rate = total > 0 ? (l.blocked / total) * 100 : 0;
+                {CATEGORY_ORDER.filter((k) => (data.block_reason_breakdown[k] || 0) > 0).map((k) => {
+                  const cat = REASON_CATEGORIES[k] || REASON_CATEGORIES.neutral;
                   return (
-                    <Box key={l.key} className="p-2 rounded bg-gray-900 border border-gray-700">
+                    <Box key={k} className="p-2 rounded bg-gray-900 border-l-4" style={{ borderColor: cat.color }}>
                       <Box className="flex justify-between items-center">
-                        <Typography variant="body2" className="text-slate-200">{l.label}</Typography>
-                        <Chip size="small" label={`通过 ${l.passed}`} color="success" variant="outlined" />
-                      </Box>
-                      <Typography variant="caption" className="text-slate-500">{(data.model === 'hexp' ? HEXP_GATE_HINTS : GATE_HINTS)[l.key]}</Typography>
-                      <Box className="flex justify-between mt-1">
-                        <Typography variant="caption" className="text-red-400">拦截 {l.blocked}</Typography>
-                        <Typography variant="caption" className="text-slate-400">拦截率 {rate.toFixed(1)}%</Typography>
+                        <Typography variant="body2" className="text-slate-200">{cat.label}</Typography>
+                        <Typography variant="body2" style={{ color: cat.color }}>{data.block_reason_breakdown[k]}</Typography>
                       </Box>
                     </Box>
                   );
                 })}
+                {CATEGORY_ORDER.filter((k) => (data.block_reason_breakdown[k] || 0) > 0).length === 0 && (
+                  <Typography variant="caption" className="text-slate-500">近 {data.window_hours}h 无拦截记录</Typography>
+                )}
               </Box>
+              {CATEGORY_ORDER.filter((k) => (data.marked_breakdown[k] || 0) > 0).length > 0 && (
+                <Box className="mt-3">
+                  <Typography variant="caption" className="text-slate-400">被标记仍成交</Typography>
+                  <Box className="flex flex-col gap-1 mt-1">
+                    {CATEGORY_ORDER.filter((k) => (data.marked_breakdown[k] || 0) > 0).map((k) => {
+                      const cat = REASON_CATEGORIES[k] || REASON_CATEGORIES.neutral;
+                      return (
+                        <Box key={k} className="flex justify-between items-center text-sm">
+                          <Typography variant="caption" className="text-slate-300">{cat.label}</Typography>
+                          <Typography variant="caption" style={{ color: cat.color }}>{data.marked_breakdown[k]}</Typography>
+                        </Box>
+                      );
+                    })}
+                  </Box>
+                </Box>
+              )}
             </Paper>
           </Box>
 
@@ -418,7 +402,8 @@ const SignalFunnel: React.FC = () => {
                       : d.outcome === '真丢弃' ? '#ef4444'
                       : d.outcome === '过闸门未成交' ? '#94a3b8'
                       : d.outcome === '策略放弃' ? '#38bdf8' : '#64748b';
-                    const isOpen = expanded === i;
+                      const cat = classifyReason(d.reason_cn || d.reason || '');
+                      const isOpen = expanded === i;
                     return (
                       <React.Fragment key={i}>
                         <TableRow
@@ -440,24 +425,27 @@ const SignalFunnel: React.FC = () => {
                             <Chip size="small" label={d.outcome} sx={{ color: oc, borderColor: oc }} variant="outlined" />
                           </TableCell>
                           <TableCell>{d.marked ? <Chip size="small" label="已标记" color="warning" variant="outlined" /> : '-'}</TableCell>
-                          <TableCell className="max-w-[300px]">
+                          <TableCell className="max-w-[320px]">
                             {d.reason_cn || d.reason ? (
-                              <Chip
-                                size="small"
-                                variant="outlined"
-                                label={d.reason_cn || d.reason}
-                                title={d.reason || ''}
-                                sx={{
-                                  color: reasonColor(d.reason_cn || d.reason || ''),
-                                  borderColor: reasonColor(d.reason_cn || d.reason || ''),
-                                  maxWidth: 300,
-                                  '& .MuiChip-label': {
-                                    overflow: 'hidden',
-                                    textOverflow: 'ellipsis',
-                                    whiteSpace: 'nowrap',
-                                  },
-                                }}
-                              />
+                              <Box className="flex items-center gap-2" title={d.reason || ''}>
+                                {/* 类别色条：一眼区分该信号归属的语义类别 */}
+                                <Box component="span" sx={{ width: 4, height: 18, borderRadius: 2, backgroundColor: cat.color, flexShrink: 0 }} />
+                                <Box className="flex flex-col min-w-0">
+                                  <Chip
+                                    size="small"
+                                    variant="outlined"
+                                    label={cat.label}
+                                    sx={{ color: cat.color, borderColor: cat.color, alignSelf: 'flex-start', mb: 0.25 }}
+                                  />
+                                  <Typography
+                                    variant="caption"
+                                    className="text-slate-400"
+                                    sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 270, display: 'block' }}
+                                  >
+                                    {d.reason_cn || d.reason}
+                                  </Typography>
+                                </Box>
+                              </Box>
                             ) : (
                               <span className="text-slate-500">-</span>
                             )}
