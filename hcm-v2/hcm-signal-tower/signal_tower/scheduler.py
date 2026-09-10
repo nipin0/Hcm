@@ -141,10 +141,13 @@ from signal_tower.range_bonus import RangeBonus
 from signal_tower.risk_state_sync import sync_risk_state
 from signal_tower.force_close import ForceCloseDetector
 from signal_tower.manual_mode import ManualModeHandler
-from signal_tower.signal_publisher import SignalData, SignalPublisher
+from signal_tower.signal_publisher import (
+    SignalData, SignalPublisher, magic_for_signal_mode, SIGNAL_MODE_MAGIC,
+)
 from signal_tower.watchdog import WatchdogManager
 from signal_tower.quality_gate import decide as ai_quality_decide
 from signal_tower.quality_gate import log_gate_decision as ai_log_gate_decision
+from signal_tower import range_strategy
 from signal_tower.rev_daily import aggregate_rev_daily as _aggregate_rev_daily
 from signal_tower.ai_async_client import (
     calibrate_lm_score,
@@ -523,6 +526,8 @@ class Scheduler:
             asyncio.create_task(self._live_adx_publisher(st))
             # B 层: 实时评分快照发布 + bar 内阈值穿越触发（贴合实时价格变动）
             asyncio.create_task(self._live_score_publisher(st))
+            # P1: 前瞻价值头正向驱动器（60s 检查，开关 ai.lm.value_drive_enabled 控制）
+            asyncio.create_task(self._value_drive_loop(st))
             # Stagger to avoid all symbols triggering simultaneously
             if i > 0:
                 await asyncio.sleep(1.0)
@@ -779,6 +784,8 @@ class Scheduler:
         ai_direction = None
         ai_dir_prob = None
         ai_entry = None
+        ai_state = None
+        ai_mm = None
         try:
             if self._redis is not None:
                 raw = await self._redis.get(f"hcm:live:hexp:ai:{symbol.upper()}")
@@ -813,6 +820,19 @@ class Scheduler:
                                     ai_entry = _ae_f
                             except (TypeError, ValueError):
                                 ai_entry = None
+                        # 【杠杆1·追单抑制 2026-09-04】读状态头 ai_state 与 lm_features.mm
+                        # （M5 微动量），供 quality_gate 裁决 PULLBACK 逆动量追单。缺失→None。
+                        ai_state = None
+                        _st = obj.get("ai_state")
+                        if isinstance(_st, str) and _st:
+                            ai_state = _st
+                        ai_mm = None
+                        try:
+                            _mm_v = (obj.get("lm_features") or {}).get("mm")
+                            if _mm_v is not None:
+                                ai_mm = float(_mm_v)
+                        except (TypeError, ValueError):
+                            ai_mm = None
                         if _ai is not None:
                             try:
                                 lm_score = float(_ai)
@@ -825,9 +845,14 @@ class Scheduler:
                                 if _ts is not None and _max_age > 0:
                                     _age = time.time() - float(_ts)
                                     if _age > _max_age:
-                                        logger.info(
-                                            "AI LM score stale (symbol=%s): age=%.1fs > max_age=%.1fs "
-                                            "→ treat as missing (pass-through HEXP)",
+                                        # 【2026-09-09 静默失效修复】原为 logger.info：
+                                        # AI 闸门被整体旁路（透传纯 HEXP、AI 否决权消失）却只打
+                                        # 一行 info，运维完全无感 —— 属于静默失效。提为 warning。
+                                        # 注：age 异常大时优先怀疑 sidecar 断流或宿主/容器时钟漂移。
+                                        logger.warning(
+                                            "AI LM score STALE (symbol=%s): age=%.1fs > max_age=%.1fs "
+                                            "→ AI gate BYPASSED (pass-through HEXP, no AI veto). "
+                                            "Check sidecar liveness or host/container clock skew.",
                                             symbol, _age, _max_age,
                                         )
                                         lm_score = None
@@ -961,6 +986,8 @@ class Scheduler:
         fusion["ai_direction"] = ai_direction
         fusion["ai_dir_prob"] = ai_dir_prob
         fusion["ai_entry"] = ai_entry
+        fusion["ai_state"] = ai_state
+        fusion["ai_mm"] = ai_mm
 
         return fusion
 
@@ -1281,6 +1308,62 @@ class Scheduler:
                 break
             except Exception as exc:
                 logger.warning("Live override error (%s): %s", state.symbol, exc)
+
+    async def _value_drive_loop(self, state: SymbolState) -> None:
+        """P1 前瞻价值头正向驱动器（2026-09-05 用户授权实盘试水）。
+
+        每 60s 读 value 快照：ai.lm.value_drive_enabled=true 且 value_world∈{±1} 且
+        value_score≥min_score，且距上次触发≥min_interval_sec → 调 _produce_signal(
+        value_drive=True)，由注入块在引擎本根 bar 无方向时按世界方向正向开单。
+        节流按触发尝试（Redis 键）；AI 闸门/风控链仍可否决。异常全隔离。
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(60)
+                if self._redis is None or self._config is None:
+                    continue
+                if not await self._config.get_bool("ai.lm.value_drive_enabled", False):
+                    continue
+                raw = await self._redis.get(f"hcm:live:hexp:ai:{state.symbol.upper()}")
+                if not raw:
+                    continue
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode("utf-8", "ignore")
+                try:
+                    obj = json.loads(raw) if isinstance(raw, str) else raw
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                vw = obj.get("value_world")
+                vs = obj.get("value_score")
+                if vw not in (1, -1) or vs is None:
+                    continue
+                vs = float(vs)
+                try:
+                    min_score = float(await self._config.get("ai.lm.value_drive_min_score") or 0.5)
+                    interval = float(await self._config.get("ai.lm.value_drive_min_interval_sec") or 900.0)
+                except (TypeError, ValueError):
+                    min_score, interval = 0.5, 900.0
+                if vs < min_score:
+                    continue
+                _lk = f"signal_tower:value_drive_last:{state.symbol}"
+                try:
+                    _last_raw = await self._redis.get(_lk)
+                    _last = float(_last_raw) if _last_raw else 0.0
+                except (TypeError, ValueError):
+                    _last = 0.0
+                if (time.time() - _last) < interval:
+                    continue
+                await self._produce_signal(
+                    state, value_drive=True,
+                    value_drive_info={"world": int(vw), "score": float(vs)})
+                try:
+                    await self._redis.set(_lk, str(time.time()), ex=86400)
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning("value_drive loop error (%s): %s", state.symbol, e)
 
     async def _live_score_publisher(self, state: SymbolState) -> None:
         """B 层: 每 3s 用实时 bar 重算评分快照并发布；C 层护栏下 bar 内即时触发成交。
@@ -1669,6 +1752,8 @@ class Scheduler:
         state: SymbolState,
         live_override: bool = False,
         live_adx_override: Optional[float] = None,
+        value_drive: bool = False,
+        value_drive_info: Optional[dict] = None,
     ) -> None:
         """Execute the full signal production pipeline.
 
@@ -1720,7 +1805,9 @@ class Scheduler:
         # B 修复: live_override 救援在「同一根 M5 bar 内」触发(距上次收盘不足
         # 5 分钟)，必须绕过本 guard 才能发新信号——其自身已有 sustained(30s)+
         # rate_limit(60s)+last_signal_blocked_by_adx_floor 三重限流，不会 spam。
-        if not live_override:
+        # value_drive（P1）：同样须绕过本 bar 幂等 guard（bar-close 已产 NO_TRADE 时仍
+        # 允许在 bar 内按价值头方向注入）；其自身有 60s 轮询 + min_interval_sec 节流。
+        if not (live_override or value_drive):
             current_bar_open = getattr(state, "last_bar_open_time", None)
             guard_key = f"{state.symbol}:{state.timeframe}"
             # D3 (2026-08-04): 幂等闸门外移到 Redis（跨重启持久），内存兜底。
@@ -2058,6 +2145,126 @@ class Scheduler:
                             "(买点分不足，不补方向)",
                             state.symbol, _ms_state.value, _ms_dir, _eq, _theta)
 
+        # ── value_drive：前瞻价值头正向注入（P1 实盘试水，2026-09-05 用户授权）──
+        # 价值头产出「顺向世界(world) + 贴低位高价值(score)」；当引擎本根 bar 未给方向
+        # （NO_TRADE）时，按世界方向正向注入一单并强制过闸 → 走后续 AI 闸门（仍可 VETO）
+        # 与风控链。只注入引擎无方向处，不与 HEXP 已给方向打架；节流在 _value_drive_loop。
+        # 方向语义：world=+1 多头世界做 BUY / world=-1 空头世界做 SELL（顺向）。
+        if value_drive and value_drive_info:
+            try:
+                _vworld = int(value_drive_info.get("world") or 0)
+                _vscore = float(value_drive_info.get("score") or 0.0)
+                if _vworld in (1, -1) and _vscore > 0 and \
+                        str(getattr(score_result, "direction", "") or "") in ("", "NO_TRADE"):
+                    _vdir = "BUY" if _vworld == 1 else "SELL"
+                    score_result.direction = _vdir
+                    score_result.threshold_passed = True  # 注入即放行发布；AI/风控仍可拦
+                    if not getattr(score_result, "fallback_reason", None):
+                        score_result.fallback_reason = (
+                            f"value_drive(world={_vworld}, score={_vscore:.3f})")
+                    logger.info(
+                        "VALUE_DRIVE inject %s: world=%d score=%.3f → %s (正向顺势单)",
+                        state.symbol, _vworld, _vscore, _vdir)
+            except Exception as _ve:
+                logger.warning("value_drive inject failed %s: %s", state.symbol, _ve)
+
+        # ── range_mr：RANGE 均值回归【单仓】注入（2026-09-09 用户批准方案A）──
+        # 震荡市 HEXP 常因共振反向阻断(hexp_resonance_counter_block)把方向封成 NO_TRADE；
+        # 本处在「HEXP 无方向 + 高周期全 RANGE + RSI/%b 极值」时按均值回归反向注入一单。
+        # 实证依据（19137 根 M5）：对称 1:1(止盈/止损各 1ATR) 胜率 70~81%，随机基线 46%。
+        # ⚠️ 刻意【不加仓】：递增摊平需 66.7% 胜率而实测仅 50.3~64.9% → 负期望，
+        #    且摊平只在"已逆势 1.5ATR"的坏路径触发（详见 range_strategy 模块文档）。
+        # 开关 range.enabled（默认 false 影子）；注入后仍走 AI 闸门 + 风控链 + 桥，不绕过。
+        if self._config is not None:
+            try:
+                _rng_on = await self._config.get_bool("range.enabled", False)
+            except Exception:
+                _rng_on = False
+            if _rng_on:
+                try:
+                    _rng_cfg = {}
+                    for _k in range_strategy.DEFAULTS:
+                        try:
+                            _rng_cfg[_k] = await self._config.get(_k)
+                        except Exception:
+                            _rng_cfg[_k] = None
+                    # period_states 来自 HEXP 快照（M5/M30/H1/H4/D1 各自 RANGE/TRANSITION/TREND_*）
+                    _ps = {}
+                    if self._redis is not None:
+                        _ps_raw = await self._redis.get(
+                            f"hcm:live:hexp:{state.symbol.upper()}")
+                        if _ps_raw:
+                            if isinstance(_ps_raw, (bytes, bytearray)):
+                                _ps_raw = _ps_raw.decode("utf-8", "ignore")
+                            _ps_obj = json.loads(_ps_raw) if isinstance(_ps_raw, str) else _ps_raw
+                            _ps = (_ps_obj or {}).get("period_states") or {}
+                    _rsi = getattr(indicators, "rsi_14", None)
+                    _pctb = getattr(indicators, "pct_b", None)
+                    _rng = range_strategy.evaluate(_ps, _rsi, _pctb, _rng_cfg)
+
+                    # ── 突破熔断（2026-09-10 事故新增）──
+                    # 均值回归的致命场景："声称 RANGE、实为突破"。本次事故中
+                    # period_states 五周期全 RANGE，但 M5 实际从 4408 单边拉到 4427(+2.5ATR)，
+                    # 继续反向开空 = 逆势送单 → 4 笔 SELL 全部止损。
+                    # 判定：收盘越过【近 N 根且不含当前 bar】的高低点 → 冷却 N 根 M5。
+                    # （不含当前 bar 是关键：否则极值信号本身常创新高，会自我误封。）
+                    _bg_on = str(_rng_cfg.get("range.break_guard_enabled")
+                                 or "true").strip().lower() in ("1", "true", "yes", "on")
+                    if _bg_on:
+                        try:
+                            _rh = getattr(indicators, "recent_highs", None) or []
+                            _rl = getattr(indicators, "recent_lows", None) or []
+                            _lb = int(float(_rng_cfg.get("range.break_guard_lookback") or 50))
+                            _cd = int(float(_rng_cfg.get("range.break_cooldown_bars") or 12))
+                            if len(_rh) > 1 and len(_rl) > 1:
+                                _hi = max(float(x) for x in _rh[:-1][-_lb:] if x)
+                                _lo = min(float(x) for x in _rl[:-1][-_lb:] if x)
+                                _c = float(indicators.close or 0)
+                                if _c > 0 and (_c > _hi or _c < _lo):
+                                    _until = datetime.now(timezone.utc) + timedelta(
+                                        minutes=5 * _cd)
+                                    state.range_break_until = _until
+                                    logger.info(
+                                        "RANGE_MR break-guard %s: close=%.2f broke prior-%d-bar "
+                                        "range [%.2f, %.2f] → disable %d bars (until %s)",
+                                        state.symbol, _c, _lb, _lo, _hi, _cd,
+                                        _until.strftime("%H:%M:%S"))
+                        except Exception as _bg_e:
+                            logger.warning("range break-guard failed %s: %s",
+                                           state.symbol, _bg_e)
+
+                    _bg_until = getattr(state, "range_break_until", None)
+                    if _bg_until is not None and datetime.now(timezone.utc) < _bg_until:
+                        logger.info("RANGE_MR skip %s: break_cooldown (until %s)",
+                                    state.symbol, _bg_until.strftime("%H:%M:%S"))
+                    elif _rng.get("direction") and \
+                            str(getattr(score_result, "direction", "") or "") in ("", "NO_TRADE"):
+                        _rng_dir = _rng["direction"]
+                        score_result.direction = _rng_dir
+                        score_result.threshold_passed = True   # 注入即放行；AI/风控仍可拦
+                        if not getattr(score_result, "fallback_reason", None):
+                            score_result.fallback_reason = f"range_mr({_rng_dir})"
+                        # 跨段传递 RANGE 标记：供下方 TP/SL 段绕过 R:R 下限（见 _tp_floor）
+                        score_result.range_mode = True
+                        score_result.range_tp_atr = float(_rng_cfg.get("range.tp_atr") or 1.0)
+                        # 置信度：归一后须 ≥ risk_min_confidence(0.10) 才不被风控拒单；
+                        #   55 → 0.55，且远离 score_tier_mid 代码默认值 0.65（防误落 mid 档）。
+                        #   实际手数档位由下方 ai_lot_tier="low" 确定性决定，不依赖本值。
+                        try:
+                            score_result.confidence = float(
+                                _rng_cfg.get("range.confidence") or 55.0)
+                        except Exception:
+                            score_result.confidence = 55.0
+                        logger.info(
+                            "RANGE_MR inject %s: %s (rsi=%.1f pct_b=%.3f periods=%s) 单仓不加仓",
+                            state.symbol, _rng_dir, float(_rsi or 0), float(_pctb or 0.5), _ps)
+                    elif _rng.get("in_range"):
+                        logger.info("RANGE_MR skip %s: %s (rsi=%.1f pct_b=%.3f)",
+                                    state.symbol, _rng.get("reason"),
+                                    float(_rsi or 0), float(_pctb or 0.5))
+                except Exception as _re:
+                    logger.warning("range_mr inject failed %s: %s", state.symbol, _re)
+
         # P2: always expose component breakdown + real raw indicators to dashboard
         await self._publish_component_scores(state, indicators, regime_result, score_result)
         await self._publish_raw_indicators(state, indicators)
@@ -2105,6 +2312,10 @@ class Scheduler:
                 "grade": getattr(score_result, "grade", "C") or "C",
                 "passed": bool(score_result.threshold_passed),
                 "direction": _direction,
+                # 【2026-09-10】RANGE 均值回归标记透传给 quality_gate：
+                # 用于豁免 pullback_chase 逆动量否决（该规则与均值回归根本冲突，
+                # 详见 quality_gate.decide 内注释）。非 RANGE 信号恒为 False。
+                "range_mode": bool(getattr(score_result, "range_mode", False)),
             }
             _ai_cfg = await self._ai_cfg_dict()
             # 【会话化 2026-09-04】三头共振参数按当前 session(asia/europe/us) 覆盖：
@@ -2131,6 +2342,8 @@ class Scheduler:
                 ai_direction=ai_q.get("ai_direction"),
                 ai_dir_prob=ai_q.get("ai_dir_prob"),
                 ai_entry=ai_q.get("ai_entry"),
+                ai_state=ai_q.get("ai_state"),
+                ai_mm=ai_q.get("ai_mm"),
             )
             self._ai_quality_last[state.symbol] = _decision
             # 2026-08-18 变更：AI 闸门决策暂存，待 signal_id 生成后（L2314 之后）补记真实
@@ -2141,7 +2354,7 @@ class Scheduler:
             # AI 手数分档（low/mid/high/none）→ 链动风控面板动态手数（2026-08-14 需求）
             _q_tier = str(_decision.get("lot_tier", "none") or "none")
             logger.info(
-                "AI quality gate %s: action=%s c_ai=%.2f (lm=%.1f ds=%.1f src=%s) "
+                "AI quality gate %s: action=%s c_ai=%.2f (lm=%.1f ds=%s src=%s) "
                 "hexp_passed=%s hexp_grade=%s → final_grade=%s lot_tier=%s",
                 state.symbol, _q_action, ai_q["c_ai"],
                 ai_q.get("lm_score"), ai_q.get("ds_score"), ai_q.get("source"),
@@ -2183,6 +2396,17 @@ class Scheduler:
                 logger.info("trend_start lot tier override: %s → %s (链动风控动态手数)",
                             ai_lot_tier, _ts_tier)
                 ai_lot_tier = _ts_tier
+            # ── RANGE 均值回归：手数恒定最小档（链动风控 risk.lot_multiplier_low）──
+            # 必须显式置 low，而非交 confidence 现算档位（后者在耦合模式下是默认路径）。
+            # 理由：① RANGE 用 2.5ATR 宽止损，单笔风险已达常态 2.5 倍，手数须确定性封顶最小档；
+            #   ② score_tier_mid 的代码默认值为 0.65，若配置读取回退默认值，confidence=65
+            #      会误落 mid(×1.0) → 风险翻倍。置 low 后风控取 risk.lot_multiplier_low=0.5，
+            #      且 co_ai_mult=1.0(不再叠加 suggested_lot_ratio/composite 衰减)，
+            #      得确定性 0.5×，免疫阈值漂移。
+            # ⚠️ 与 2026-08-31「耦合路径置 none 交风控现算」的设计约定不同 —— RANGE 属例外，
+            #    因其宽止损放大了误档代价，确定性优先于一致性。
+            if getattr(score_result, "range_mode", False):
+                ai_lot_tier = "low"
             # 【2026-08-27 修订】放行严格回到 6 维综合(scorecard_total)：lot_tier=none 仅当
             # HEXP 未 passed 时才抑制信号；HEXP 已 passed（6 维达标）时，hp_score 单维低导致的
             # none 不再抑制下单（仅观测），杜绝单维绕过综合闸门。手数档交由风控动态手数兜底。
@@ -2208,7 +2432,15 @@ class Scheduler:
             # 现按需求改为真正抑制：HEXP 已过闸但耦合总分低于 hexp.coupling_pass_threshold
             # → 不下单（AI 对 HEXP 过闸信号做低耦合分否决，绝不抬开 HEXP 未过信号）。
             # 解耦 / HEXP 未过闸信号 decide 透传 coupling_pass=True，不命中此分支（铁律友好）。
-            if _decision.get("coupling_pass") is False and score_result.threshold_passed:
+            # ── RANGE 均值回归：豁免耦合闸（2026-09-09）──
+            # RANGE 的 threshold_passed 是注入时人为置 True（HEXP 本为 NO_TRADE），
+            # 并非 HEXP 真过闸；而耦合分 total = w(k)·scorecard_total + (1-w)·c_ai
+            # 在 RANGE 市况（k≤0.5 → w_range=0.5）下让与 RANGE 无关的 c_ai 占到 50% 权重，
+            # 把总分拽到 ~42.5 < 50 —— 即「在最该做均值回归的市况里反而被抑制」的设计矛盾。
+            # 故 RANGE 豁免此闸。手数不受影响：ai_lot_tier="low" 是独立通道，仍锁 0.5×。
+            if (_decision.get("coupling_pass") is False
+                    and score_result.threshold_passed
+                    and not getattr(score_result, "range_mode", False)):
                 _cp_thr = float(_ai_cfg.get("hexp.coupling_pass_threshold", 50.0))
                 _cp_total = float(_decision.get("total_score") or 0.0)
                 self._stats["ai_gate_rejects"] += 1
@@ -2251,6 +2483,73 @@ class Scheduler:
                 suppress_reason=_format_suppress_reason(suppress_chain),
             )
             return
+
+        # ── value gate：价值头全路径最终仲裁（Step1 2026-09-05 用户授权）──
+        # value_score(=顺向 E[R] 期望) 升级为对【所有】BUY/SELL 候选（HEXP 已放行 /
+        # value_drive 注入 / live_override）的统一最终入场闸门。此处为引擎+AI 均已放行
+        # 后、真正下单前的最后一道仲裁（组件分/AI gate 已先落库诊断）：
+        #   - 顺向世界缺失(world=0)或快照缺失/无效 → 弃权放行（价值头不评无趋势世界，不误杀）
+        #   - 方向与顺向世界相反 → 拦（逆主周期外接刀，接管 direction_fuse 反向否决语义）
+        #   - 同向但 value_score < 门槛 → 拦（末端/低价值点位，接管 entry_fuse 差买点否决语义）
+        # value_drive 注入单本身顺向且 score≥min，天然通过本闸门（仍交风控链）。
+        # 开关 ai.lm.value_gate_enabled（默认 false 灰度）；门槛 ai.lm.value_gate_min_score
+        # （默认 0.5，与 value_drive_min_score 同口径）。异常全隔离 → 弃权放行。
+        _vg_reason: Optional[tuple] = None
+        if (self._config is not None
+                and await self._config.get_bool("ai.lm.value_gate_enabled", False)):
+            _vg_dir = getattr(score_result, "direction", None) or "NO_TRADE"
+            if _vg_dir in ("BUY", "SELL") and self._redis is not None:
+                try:
+                    _vg_raw = await self._redis.get(f"hcm:live:hexp:ai:{state.symbol.upper()}")
+                    if _vg_raw:
+                        if isinstance(_vg_raw, (bytes, bytearray)):
+                            _vg_raw = _vg_raw.decode("utf-8", "ignore")
+                        _vg_obj = json.loads(_vg_raw) if isinstance(_vg_raw, str) else _vg_raw
+                        _vg_o = _vg_obj if isinstance(_vg_obj, dict) else {}
+                        _vw = _vs = None
+                        try:
+                            if _vg_o.get("value_world") is not None:
+                                _vw = int(_vg_o["value_world"])
+                        except (TypeError, ValueError):
+                            _vw = None
+                        try:
+                            if _vg_o.get("value_score") is not None:
+                                _vs = float(_vg_o["value_score"])
+                        except (TypeError, ValueError):
+                            _vs = None
+                        if _vw in (1, -1) and _vs is not None:
+                            _vg_min = 0.5
+                            try:
+                                _m = await self._config.get("ai.lm.value_gate_min_score")
+                                if _m:
+                                    _vg_min = float(_m)
+                            except (TypeError, ValueError):
+                                _vg_min = 0.5
+                            _counter = (
+                                (_vg_dir == "BUY" and _vw == -1)
+                                or (_vg_dir == "SELL" and _vw == 1))
+                            if _counter:
+                                _vg_reason = ("veto_value_counter_world",
+                                              f"world={_vw} vs dir={_vg_dir}")
+                            elif _vs < _vg_min:
+                                _vg_reason = ("veto_value_low_score",
+                                              f"score={_vs:.3f}<min={_vg_min:.2f} world={_vw}")
+                except Exception as _vge:
+                    logger.warning("value gate check failed (%s): %s", state.symbol, _vge)
+                if _vg_reason:
+                    _vg_code, _vg_detail = _vg_reason
+                    self._stats["value_gate_rejects"] += 1
+                    logger.info(
+                        "VALUE_GATE VETO %s %s: %s (%s) → signal suppressed",
+                        state.symbol, _vg_dir, _vg_code, _vg_detail)
+                    suppress_chain.append((31, f"value_gate({_vg_code})"))
+                    await self._publish_filtered_signal(
+                        state, indicators, regime_result, score_result, trace_id,
+                        zone_level=zone_level, zone_type=zone_type,
+                        zone_strength=zone_strength,
+                        suppress_reason=_format_suppress_reason(suppress_chain),
+                    )
+                    return
 
         # ── Step 6: Cooldown Check ──────────────
         # vol_ratio = relative band width (bbw / bbw_ma20) drives P1 adaptive cooldown
@@ -2541,16 +2840,28 @@ class Scheduler:
             )
         # TP 下限用【最终】ai_sl_mult(LightGBM 单源缩放) × min_rr → SL 被校宽时 TP 同步
         # 抬升, 保住 R:R≥min_rr（原按会话值算, 校准加宽后 R:R 会被稀释到 <1.2）。
-        _tp_floor = ai_sl_mult * _min_rr
-        if ai_tp_mult > 0:
-            if ai_tp_mult < _tp_floor:
-                logger.info("[%s] TP mult floor: ai_tp_mult=%.2f < %.2f → raise to %.2f (R:R≥%.2f)",
-                            _sess, ai_tp_mult, _tp_floor, _tp_floor, _min_rr)
-                ai_tp_mult = _tp_floor
+        if getattr(score_result, "range_mode", False):
+            # ── RANGE 均值回归专用：小止盈 + 宽止损（R:R≈0.5，但胜率 84~89%）──
+            # 实证(19143 根 M5, 扣 0.12ATR 点差)：
+            #   时段默认 TP2.5/SL2.0 → 净期望 -0.25ATR【负】；TP2.5/SL1.5 → -0.31ATR【负】；
+            #   TP1.0/SL2.0 → +0.39ATR；TP1.2/SL2.0 → +0.59ATR(RSI 口径)；
+            #   且同一 TP 下 SL 越宽越好(SL 1.0→2.0 净望单调升)。
+            # 故【必须】绕过 R:R 下限，并把 SL 交回时段系数(ai_sl_mult=0 → 桥回落会话 SL)。
+            ai_sl_mult = 0.0
+            ai_tp_mult = float(getattr(score_result, "range_tp_atr", 1.0) or 1.0)
+            logger.info("[range_mr] TP/SL override: tp_mult=%.2f (RANGE 专用小止盈), "
+                        "sl=follow session (R:R 下限 %.2f 已绕过)", ai_tp_mult, _min_rr)
         else:
-            ai_tp_mult = _tp_floor  # AI 未给 TP 倍数 → 下限兜底, 杜绝无 TP
-            logger.info("[%s] TP mult floor: ai_tp_mult unset → use %.2f (R:R≥%.2f)",
-                        _sess, _tp_floor, _min_rr)
+            _tp_floor = ai_sl_mult * _min_rr
+            if ai_tp_mult > 0:
+                if ai_tp_mult < _tp_floor:
+                    logger.info("[%s] TP mult floor: ai_tp_mult=%.2f < %.2f → raise to %.2f (R:R≥%.2f)",
+                                _sess, ai_tp_mult, _tp_floor, _tp_floor, _min_rr)
+                    ai_tp_mult = _tp_floor
+            else:
+                ai_tp_mult = _tp_floor  # AI 未给 TP 倍数 → 下限兜底, 杜绝无 TP
+                logger.info("[%s] TP mult floor: ai_tp_mult unset → use %.2f (R:R≥%.2f)",
+                            _sess, _tp_floor, _min_rr)
         # ── P1a/P1c: enrich with AI risk params + zone-trigger hint ──
         # 方案B (2026-07-23): 方向对齐的入场 zone 解析（根治 SELL 误等下方 PIVOT）。
         # _compute_entry_zone 返回的 nearest zone 方向不感知（仅用于打分 Tier2/prompt）。
@@ -2639,15 +2950,14 @@ class Scheduler:
         # 与方案 A (hexp.extreme.* Donchian 极值反转陷阱) 互补、串联：
         #   方案 A 拦「极值区+动量反向」的接刀单；本闸门拦「方向逆着结构位开仓」
         #   （阻力上方硬 BUY / 支撑下方硬 SELL）——入场点本身就逆着结构。
-        # 仅当存在方向对齐结构位(_entry_zone 命中)且价格已显著越过该位(逆结构)时硬封；
-        # 价格仍在结构位同侧(顺势)或无非对齐 zone → 不拦，交给方案 A/门槛裁决。
+        # 仅当价格在【对侧】结构位(阻力/支撑)另一侧且显著越过该位(逆结构:突破阻力追多/
+        # 跌破支撑追空)时硬封；价格仍在结构位同侧(顺势)或无数 → 不拦，交给方案 A/门槛裁决。
         # 独立开关 hexp.zone.hard_block_enabled(默认 False，需显式开启)；
         # hexp.zone.hard_block_atr_mult 控制「越过多远算逆结构」(ATR 倍数，默认 0.3)。
         # 注意：此闸门在 P1a 段、方案 A(extreme) 之后执行——extreme 已 NO_TRADE 的单
         # 不会二次处理；本闸门只拦 extreme 放行但方向逆结构位的单。
         _zone_hard_block = False
         if (final_direction in ("BUY", "SELL")
-                and _entry_zone is not None
                 and self._config is not None):
             try:
                 _zb_enabled = bool(await self._config.get_bool(
@@ -2664,21 +2974,30 @@ class Scheduler:
                 _zb_atr = _atr_z if _atr_z > 0 else 0.0
                 _zb_band = _zb_atr * _zb_atr_mult if _zb_atr > 0 else 0.5
                 _zb_px = _live_px if _live_px is not None else indicators.close
-                _zb_dist = _zb_px - zone_level  # >0: 价在结构位上方；<0: 价在结构位下方
-                # BUY 应在支撑下方(价 <= 支撑)，若价显著高于支撑(逆结构)→ 封
-                # SELL 应在阻力上方(价 >= 阻力)，若价显著低于阻力(逆结构)→ 封
-                _zb_against = (
-                    (final_direction == "BUY" and _zb_dist > _zb_band)
-                    or (final_direction == "SELL" and _zb_dist < -_zb_band)
-                )
-                if _zb_against:
-                    _zone_hard_block = True
-                    logger.info(
-                        "hexp_zone_blocked %s/%s %s: price=%.2f against %s zone=%.2f "
-                        "(band=%.2f, dir=%s) → NO_TRADE",
-                        state.symbol, state.timeframe, final_direction,
-                        _zb_px, zone_type, zone_level, _zb_band, final_direction,
+                # 【2026-09-08 修复·逆结构判据必须用「对侧」结构位】
+                # 原实现用 _entry_zone(方向对齐同侧位：BUY→下方支撑 / SELL→上方阻力)算
+                # _zb_dist = 价 - 同侧位，对 BUY 恒≥0、对 SELL 恒≤0；原判定
+                # (BUY:_zb_dist>band / SELL:_zb_dist<-band) 实际封的是「价在同侧位上方/下方」
+                # 的顺势回踩单，却把「突破阻力 / 跌破支撑」的真逆结构单漏封——逻辑颠倒且自相矛盾
+                # （且若当时错误地把符号翻转，因 _zb_dist 恒≥0(BUY)/≤0(SELL) 会变得永不触发=空操作）。
+                # 正确：用 _compute_target_zone 取【对侧】结构位(BUY→上方阻力 / SELL→下方支撑)，
+                # 价突破该位(逆结构)才硬封；与 hexp.zone.block_enabled(engine, 近侧0.8ATR)互补串联。
+                _zb_counter = await self._compute_target_zone(
+                    state, _zb_px, final_direction)
+                if _zb_counter > 0:
+                    _zb_dist = _zb_px - _zb_counter  # >0: 价在阻力上方；<0: 价在支撑下方
+                    _zb_against = (
+                        (final_direction == "BUY" and _zb_dist > _zb_band)
+                        or (final_direction == "SELL" and _zb_dist < -_zb_band)
                     )
+                    if _zb_against:
+                        _zone_hard_block = True
+                        logger.info(
+                            "hexp_zone_blocked %s/%s %s: price=%.2f broke counter-zone=%.2f "
+                            "(band=%.2f, dir=%s) → NO_TRADE",
+                            state.symbol, state.timeframe, final_direction,
+                            _zb_px, _zb_counter, _zb_band, final_direction,
+                        )
         # 2026-08-05 (D9-1): 阶段标记——入场 zone 解析完成(已定 entry_trigger_wait)。
         logger.info(
             "Stage zone_resolved: %s/%s %s entry_trigger_wait=%ds zone=%.2f zone_blocked=%s",
@@ -2716,6 +3035,15 @@ class Scheduler:
             await self._compute_target_zone(state, indicators.close, final_direction)
             if final_direction in ("BUY", "SELL") else 0.0
         )
+        # ── RANGE 均值回归：禁用 zone TP 锚点（零改桥）──
+        # 桥 mt5_bridge.py:1484-1487 以 signal_data["zone_tp_level"] > 0 作为锚点开关，
+        #   命中且 rr≥1.0 时会用结构目标位覆盖 ai_tp_mult，令 tp_set=True。
+        # RANGE 靠「小止盈 1.0ATR + 高胜率 84~89%」盈利，而 zone 目标位常 ≥2.0ATR；
+        #   一旦覆盖即回到负期望区（实测 TP2.0/SL2.0 组合净望 -0.057ATR、
+        #   TP2.5/SL2.0 -0.250ATR）。置 0 → 桥跳过锚点 → 回退 _tp_baseline_atr
+        #   (= ai_tp_mult = range.tp_atr = 1.0)。SL/入场等其余 zone 逻辑不受影响。
+        if getattr(score_result, "range_mode", False):
+            zone_tp_level = 0.0
 
         # ── Step 9: Publish Signal ──────────────
         t0 = time.time()
@@ -2894,6 +3222,20 @@ class Scheduler:
         _ind_vals["position_cycle"] = getattr(score_result, "position_cycle", None)
         _ind_vals["position_z"] = getattr(score_result, "position_z", None)
         _ind_vals["cycle_pos_blocked"] = bool(getattr(score_result, "cycle_pos_blocked", False))
+        # 2026-09-08：signal_mode → MT5 magic 逻辑编号（magic_for_signal_mode 见 signal_publisher）
+        _signal_mode = (
+            "live_override" if live_override
+            else (score_result.weight_scheme or "scoring")[:30]
+        )
+        _signal_magic = magic_for_signal_mode(_signal_mode)
+        # 【2026-09-09】RANGE 均值回归注入信号 → MT5 magic 55，终端可直接辨识。
+        # 必须显式覆盖：RANGE 的 signal_mode 形如 "HEXP:Regime.RANGE"，走
+        # magic_for_signal_mode 会被 HEXP 分支判成 11 —— 那样就无法区分
+        # 「RANGE 注入单」与「HEXP 自身在震荡市出的单」（后者必须保持 11）。
+        if getattr(score_result, "range_mode", False):
+            _signal_magic = SIGNAL_MODE_MAGIC["range"]
+            logger.info("[range_mr] signal magic override → %d (RANGE 均值回归)",
+                        _signal_magic)
         signal_data = SignalData(
             signal_id=signal_id,
             task_id=0,
@@ -2907,12 +3249,15 @@ class Scheduler:
             sl_price=_chase_sl_price if _chase_sl_price else _ai_sl_price,
             tp1=_chase_tp1 if _chase_tp1 else _ai_tp1,
             tp2=0.0,
+            # 【2026-09-08 审计修复 P0】仅"信号塔锁定止损"置 True（趋势启动 3.5ATR）；
+            # 不覆盖 _ai_sl_price（AI 缩放可能 <2ATR，若一并豁免会取消桥的会话下限
+            # 保护、反而让紧止损更易被扫 → 修 A 坏 B）。同源取值于 2655 行。
+            sl_locked=bool(getattr(score_result, "trend_start_sl_locked", False)),
             lot=0.0,
             confidence=final_confidence,
-            signal_mode=(
-                "live_override" if live_override
-                else (score_result.weight_scheme or "scoring")[:30]
-            ),
+            signal_mode=_signal_mode,
+            # 2026-09-08：仅真实开仓方向(BUY/SELL)写逻辑编号 magic；NO_TRADE 保持 0
+            magic=_signal_magic if final_direction in ("BUY", "SELL") else 0,
             indicator_values=_ind_vals,
             fallback_reason=bypass_reason,
             regime=regime_result.regime.value,
@@ -3947,8 +4292,8 @@ class Scheduler:
         tf_chain = (tf_hint,) if tf_hint else ("H1", "M15", "M5")
         tf_limit = {"H1": 200, "M15": 400, "M5": 600}
         tf_params = {
-            "H1":  {"cm": 0.3, "ms": 3},
-            "M15": {"cm": 0.5, "ms": 3},
+            "H1":  {"cm": 0.3, "ms": 2},
+            "M15": {"cm": 0.5, "ms": 2},
             "M5":  {"cm": 1.0, "ms": 2},
         }
         try:
@@ -3967,7 +4312,7 @@ class Scheduler:
             closes = np.array([float(x["close"]) for x in klines], dtype=np.float64)
             atr = IndicatorCalculator.compute_atr(highs, lows, closes, period=14)
 
-            params = tf_params.get(tf_used, {"cm": 0.3, "ms": 3})
+            params = tf_params.get(tf_used, {"cm": 0.3, "ms": 2})
             prev_h, prev_l, prev_c = self._prev_day_hlc(klines)
             pivots = compute_pivots(prev_h, prev_l, prev_c) if prev_h is not None else {}
             sr = compute_support_resistance(highs, lows, atr, cluster_mult=params["cm"])

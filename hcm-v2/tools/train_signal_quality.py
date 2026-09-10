@@ -79,15 +79,24 @@ def load(labels_path, features_path):
         df["di_net"] = (pdi - mdi) / (pdi + mdi + eps)
         df["spread_atr_log"] = df["spread_atr"].astype(float).clip(lower=0).apply(lambda v: float(np.log1p(v)))
         atr_col = "atr_14" if "atr_14" in df.columns else ("atr" if "atr" in df.columns else None)
-        if atr_col is not None:
-            atr = df[atr_col].astype(float).replace(0, np.nan).fillna(1e-9)
-            # close_mom_atr: features 无 close(单行) → 用 mm(动量均值)/atr_14 近似，
-            # 与 build_features 端"近5根收盘动量/ATR"同量纲(动量强度)
-            df["close_mom_atr"] = df["mm"].astype(float).fillna(0.0) / atr.values
-        else:
-            df["close_mom_atr"] = 0.0
-        # trend_aligned: ema20_dist_atr>0 → 价格在 EMA 一侧(近似顺/逆趋势方向，>0=多头侧)
-        df["trend_aligned"] = (df.get("ema20_dist_atr", pd.Series(0.0, index=df.index)) > 0).astype(float)
+        # 【2026-09-08 审计修复 P0】禁止覆盖 features.csv 中"已与推理同源"的列。
+        # 原实现无条件重算，制造了两处严重 train-serve skew：
+        #   · close_mom_atr = mm/atr（mm 已 tanh 压缩，∈[-1,1]/ATR），而推理端
+        #     build_features 是 (close[-1]-close[-6])/atr（线性动量）→ 量纲差约 1 个 ATR；
+        #   · trend_aligned = (ema20_dist_atr > 0)，而 ema20_dist_atr=|close-ema20|/atr
+        #     恒 ≥0 → 训练近恒 1；推理端是 (close > EMA20 ? 1 : 0)，约 50% 分布。
+        # 两者都属于"训练分布与线上完全不同"，模型学到的分裂阈值线上无效。
+        # 现在：features.csv 已提供则直接采用；缺失时不再用错误公式兜底，置 NaN 并告警
+        # （LightGBM 原生处理缺失，好过用错误口径污染特征-标签关系）。
+        _sys = __import__("sys")
+        if "close_mom_atr" not in df.columns:
+            print("[warn] close_mom_atr 未在 features.csv 提供 — 置 NaN"
+                  "（已禁用 mm/atr 近似：与推理口径不符）", file=_sys.stderr)
+            df["close_mom_atr"] = np.nan
+        if "trend_aligned" not in df.columns:
+            print("[warn] trend_aligned 未在 features.csv 提供 — 置 NaN"
+                  "（已禁用 ema20_dist_atr>0 近似：该式恒为 1）", file=_sys.stderr)
+            df["trend_aligned"] = np.nan
     except Exception as _e:
         print(f"[warn] feature-enhance derive skipped: {_e}", file=__import__("sys").stderr)
         for _c in ("di_ratio", "di_net", "spread_atr_log", "close_mom_atr", "trend_aligned"):
@@ -166,7 +175,12 @@ def prepare(df: pd.DataFrame):
 
 
 # 校准器退化护栏：验证块正样本过少或拟出档位<此值 → 视为退化，回退原始概率
-CALIB_MIN_LEVELS = 4
+# 【2026-09-08 审计修复 P1】4 → 8：与线上推理侧 ai.lm.calib_min_levels(=8) 对齐。
+# 原训练侧按 4 判定 → 实测 5 档（calib_v92：0.2658/0.3617/0.4625/0.9231/0.95）被判
+# "健康"并落盘上线，而线上 sidecar 按 8 判定它为退化 → 同一校准器训练侧与推理侧
+# 结论相反；且 5 档会把连续概率压成粗阶梯（实测 c_ai 24h 仅 5 个取值、46.25 占
+# 72%，AI 闸门失去区分度）。提到 8 后，档位不足即回退原始概率，不再产出坏校准器。
+CALIB_MIN_LEVELS = 8
 CALIB_MIN_POS = 8  # 验证块至少需若干正样本才能可靠拟合单调映射
 
 

@@ -136,14 +136,21 @@ class LotCalculator:
         # Compute raw lot based on mode
         raw_lot = 0.0
 
-        if lot_mode == LotMode.FIXED.value:
+        # 【2026-09-08 审计修复 P0】lot_mode 大小写不匹配：DB 落库为小写
+        # （hcm_copy.relationships.lot_mode DEFAULT 'multiplier'），原实现与
+        # LotMode.*.value（大写）直接比较 → 恒不命中，永远落到 else 分支
+        # raw_lot = signal_lot（1:1 主号手数），使 lot_multiplier / fixed_lot /
+        # risk_percent / balance_ratio / equity_ratio 全部失效。两侧统一大写归一。
+        _mode = str(lot_mode or "").strip().upper()
+
+        if _mode == str(LotMode.FIXED.value).upper():
             raw_lot = float(copy_config.get("fixed_lot", DEFAULT_FIXED_LOT))
 
-        elif lot_mode == LotMode.MULTIPLIER.value:
+        elif _mode == str(LotMode.MULTIPLIER.value).upper():
             multiplier = float(copy_config.get("lot_multiplier", DEFAULT_LOT_MULTIPLIER))
             raw_lot = signal_lot * multiplier
 
-        elif lot_mode == LotMode.RISK_PERCENT.value:
+        elif _mode == str(LotMode.RISK_PERCENT.value).upper():
             risk_pct = float(copy_config.get("risk_percent", DEFAULT_RISK_PERCENT))
             sl_distance = self._compute_sl_distance(signal_data)
             pip_value = await self._get_pip_value(symbol)
@@ -152,16 +159,16 @@ class LotCalculator:
             else:
                 raw_lot = signal_lot  # Fallback
 
-        elif lot_mode == LotMode.BALANCE_RATIO.value:
+        elif _mode == str(LotMode.BALANCE_RATIO.value).upper():
             ratio = float(copy_config.get("balance_ratio", DEFAULT_BALANCE_RATIO))
             raw_lot = balance * ratio
 
-        elif lot_mode == LotMode.EQUITY_RATIO.value:
+        elif _mode == str(LotMode.EQUITY_RATIO.value).upper():
             ratio = float(copy_config.get("equity_ratio", DEFAULT_EQUITY_RATIO))
             raw_lot = equity * ratio
 
         else:
-            logger.warning("Unknown lot mode '%s' — using MULTIPLIER fallback", lot_mode)
+            logger.warning("Unknown lot mode '%s' — using signal lot fallback", lot_mode)
             raw_lot = signal_lot
 
         # Clamp to [min_lot, max_lot]

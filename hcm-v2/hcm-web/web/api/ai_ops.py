@@ -90,6 +90,24 @@ async def _cfg_value(config_provider, key: str) -> str | None:
         return None
 
 
+def _world_to_dir(world) -> str | None:
+    """价值头世界方向 → 交易方向（+1 多头世界→BUY / -1 空头世界→SELL / 0 无趋势→None）。
+
+    价值头是 2026-09-05 Step1 起的**方向裁决源**（value gate 全路径仲裁）：
+    它给的是"顺向世界方向 + 该点位顺向期望 E[R]"，比方向头的动量延续概率更上位。
+    面板方向展示与共振对照均优先取它，方向头缺席（停用）时面板不会开天窗。
+    """
+    try:
+        w = int(world)
+    except (TypeError, ValueError):
+        return None
+    if w > 0:
+        return "BUY"
+    if w < 0:
+        return "SELL"
+    return None
+
+
 def _judge_resonance(hexp_dir: str | None, ai_dir: str | None) -> tuple[str, str]:
     """方向共振判定（**仅展示**，绝不改写方向）。
 
@@ -146,12 +164,26 @@ def create_ai_ops_router(
         # 判定 DeepSeek 是否激活：非空且非占位串（铁律真值附录）
         ds_key_ready = bool(ds_key_state) and ds_key_state != "test_pg_key"
 
-        # ── 三头输出（缺失 → 未启用）──
+        # ── 多头输出（缺失 → 未启用）──
+        # value（价值头）：world=±1 → BUY/SELL 方向裁决；score=顺向 E[R] 期望。
+        # world=0（无趋势世界）不是故障——价值头按设计不评价值，面板显示「无趋势」。
+        _vw = (ai_snap or {}).get("value_world")
+        _vs = (ai_snap or {}).get("value_score")
+        _vdir = _world_to_dir(_vw)
         heads = {
             "direction": {
                 "value": (ai_snap or {}).get("ai_direction"),
                 "prob": (ai_snap or {}).get("ai_dir_prob"),
                 "enabled": (ai_snap or {}).get("ai_direction") is not None,
+                "label": DISABLED_LABEL,
+            },
+            "value": {
+                "value": (_vdir or ("无趋势" if _vw is not None else None)),
+                "prob": _vs,
+                "world": _vw,
+                "score": _vs,
+                "reason": (ai_snap or {}).get("value_reason"),
+                "enabled": _vw is not None,
                 "label": DISABLED_LABEL,
             },
             "entry": {
@@ -175,8 +207,15 @@ def create_ai_ops_router(
                 _h["label"] = None
 
         # ── 方向共振（仅展示，不改方向）──
+        # 价值头已是方向裁决源 → 共振对照优先跟价值头世界方向比；价值头缺席
+        # （world 字段缺失）才回退方向头。source 供前端标注结论出处。
         hexp_dir = (hexp_snap or {}).get("direction")
-        res_code, res_text = _judge_resonance(hexp_dir, (ai_snap or {}).get("ai_direction"))
+        if _vw is not None:
+            res_code, res_text = _judge_resonance(hexp_dir, _vdir)
+            res_source = "value"
+        else:
+            res_code, res_text = _judge_resonance(hexp_dir, (ai_snap or {}).get("ai_direction"))
+            res_source = "dir"
 
         # ── DeepSeek 票新鲜度 ──
         ds_age_sec = None
@@ -216,7 +255,7 @@ def create_ai_ops_router(
                 "close": (hexp_snap or {}).get("close"),
                 "atr": (hexp_snap or {}).get("atr"),
             },
-            "resonance": {"code": res_code, "text": res_text},
+            "resonance": {"code": res_code, "text": res_text, "source": res_source},
             "deepseek": {
                 "key_ready": ds_key_ready,
                 "ticket": ds_out,

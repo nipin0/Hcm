@@ -340,6 +340,58 @@ _DEFAULTS: dict[str, Any] = {
     "hexp.live_extend_guard_enabled": True,
     "hexp.live_extend_bars": 6,
     "hexp.live_extend_atr": 1.5,
+    # ── 【2026-09-08 审计修复 P0】补全"代码在用但从未登记"的键 ──────────────
+    # 引擎配置快照 self._cfg 只装载 _DEFAULTS 里的键（见 _reload_locked：
+    # `snapshot = {k: await self._get(k) for k in _DEFAULTS}`），未登记的键即使
+    # 配置中心里有值也读不到 → 面板改值不生效（"改不动"缺陷，涉及 46 个键）。
+    # 以下 18 个键**逐项取自代码原 cfg.get(...) 的硬编码默认** → 补入后行为零变化，
+    # 仅恢复其可热调能力。其余 28 个键配置中心已有值，其中 6 个与代码默认相反
+    # （trend_start_order_enabled / new_mode_order_allowed / trend_start_min_grade /
+    # reverse_order_enabled / zone.block_enabled / zone.penalty_enabled），
+    # 补入会直接开启对应功能（此前因 _DEFAULTS 未登记，cfg.get 取硬编码默认 False 运行）。
+    # 【2026-09-08 用户已拍板并全部补入】趋势抢跑 3 键见 370 行块、反转/zone 3 键见 382 行块，
+    # 6 键值均取配置中心当前值（true/true/ANY/true/true/true），行为与部署意图对齐。
+    "hexp.cycle.look": 60,
+    "hexp.cycle.z_extreme": 3.5,
+    "hexp.extreme.rsi_launch_high": 70.0,
+    "hexp.mtf.range_hi": 0.7,
+    "hexp.mtf.range_lo": 0.3,
+    "hexp.phase.establish_threshold": 55.0,
+    "hexp.phase.ignite_threshold": 50.0,
+    "hexp.pole_chase_wait_enabled": True,
+    "hexp.pole_chase_wait_ma_hi": 90.0,
+    "hexp.pole_chase_wait_ma_lo": 10.0,
+    "hexp.pole_chase_wait_rsi_hi": 68.0,
+    "hexp.pole_chase_wait_rsi_lo": 32.0,
+    "hexp.pullback_gate_enabled": True,
+    "hexp.pullback_gate_mm": 0.005,
+    "hexp.score.ema_alpha": 0.35,
+    "hexp.score.hp_delta_max": 15.0,
+    "hexp.score.hyst_gap": 2.5,
+    "hexp.score.hyst_confirm_bars": 2,
+    # ── 【2026-09-08 用户拍板】开放趋势抢跑真下单，解除 A/B/C 三层阻断 ──
+    # 这三个键原在 343-351 行"待拍板"清单：配置中心自 2026-08-31 起已是
+    # true / true / ANY，但 _DEFAULTS 未登记 → cfg.get 取硬编码默认 False/"B"
+    # → 三层阻断使趋势抢跑永不真下单（与"326 候选 0 单"实证吻合）。现补入
+    # 并取配置中心当前值，行为对齐部署意图。保留 2556 行 `grade != "RED"`
+    # 全局安全栅栏（RED 恒不可交易）；min_grade=ANY 仅解除"C 级被评级门槛拦"，
+    # RED 级趋势启动候选仍不放行。
+    "hexp.trend_start_order_enabled": True,
+    "hexp.trend_start.new_mode_order_allowed": True,
+    "hexp.trend_start_min_grade": "ANY",
+    # ── 【2026-09-08 用户拍板·续】待拍板清单剩余 3 键全启动 ──
+    # reverse_order_enabled / zone.block_enabled / zone.penalty_enabled 配置中心
+    # 自部署起已是 true / true / true（键名带 hexp. 前缀），但 _DEFAULTS 未登记
+    # → cfg.get 取硬编码默认 False → 此前一直按 False 运行（反转候选纯观测、逆结构
+    # 硬约束/惩罚关闭）。现补入并取配置中心当前值，与部署意图对齐：
+    #   · reverse_order_enabled → 反转候选经风控 rule_chain 接刀护栏后真下逆势接刀单
+    #   · zone.block_enabled    → 启用逆结构硬约束（贴脸阻力追多/支撑追空硬封 NO_TRADE）
+    #   · zone.penalty_enabled  → 启用逆结构惩罚（阻力位追多/支撑位追空降分）
+    # 三者均为反向单开关/安全护栏，与趋势抢跑真下单互补；均受既有护栏与风控
+    # rule_chain 接刀护栏裁决，非裸放行。
+    "hexp.reverse_order_enabled": True,
+    "hexp.zone.block_enabled": True,
+    "hexp.zone.penalty_enabled": True,
 }
 
 # 分级序：用于 hexp.min_grade 门槛比较（RED 恒不可交易）
@@ -1416,18 +1468,32 @@ class HexpEngine:
             elif st == _TREND_DOWN:
                 pv = -1.0
             elif st == _RANGE:
-                # 方案 A（2026-08-27）：区间震荡反向共识，消除"全 RANGE→resonance=0"塌缩。
-                # 原 pv=0 跳过导致纯震荡市共振维恒为 0（权重 12% 系统性压低 total），
-                # 与 extreme.auto_on_regimes(RANGE 开启反向硬封) / range_hurst 护栏 /
-                # anti_cancel(RANGE 反向因子升权) 的"RANGE 可反向交易"语义自相矛盾。
-                # 现按主周期位置/RSI 推导反向共识：高位→一致做空(-1)、低位→一致做多(+1)、
-                # 中位→无共识(0)。与 extreme guard / range_hurst 口径统一；趋势市分支不变。
-                if _pos_pct > float(cfg.get("hexp.mtf.range_hi", 0.7)) \
-                        or _rsi > float(cfg.get("hexp.extreme.rsi_launch_high", 70.0)):
-                    pv = -1.0
-                elif _pos_pct < float(cfg.get("hexp.mtf.range_lo", 0.3)) \
-                        or _rsi < float(cfg.get("hexp.extreme.rsi_launch_low", 35.0)):
-                    pv = 1.0
+                # 【2026-09-09 修复·跨周期污染 P0】原实现用【主周期 M5】的 _pos_pct/_rsi
+                # 给【所有】RANGE 周期投票：M5 处于低位时，M30/H1/H4/D1 四个 RANGE 周期
+                # 被统一误投"做多(+1)" → verdict 饱和到 ±1.00 → resonance_counter_block
+                # 长期硬拦（实测 6 小时不下单根因）。改为：每个 RANGE 周期用【自己的】
+                # 位置分位与 RSI 推导反向共识（高位→做空 -1、低位→做多 +1、中位→0），
+                # 杜绝跨周期污染；趋势市分支不变。
+                _pdata = period_data.get(p)
+                _h_p = _pdata.get("highs") if _pdata is not None else None
+                if _h_p is not None and len(_h_p) >= 15:
+                    _atr_p = self._atr(_pdata["highs"], _pdata["lows"], _pdata["closes"], 14)
+                    _pos_p = float(self._get_donchian_pct(_pdata, _atr_p, cfg))
+                    _cl_p = np.asarray(_pdata["closes"], dtype=float)
+                    _d_p = np.diff(_cl_p, prepend=_cl_p[0])
+                    _g_p = self._ema(np.where(_d_p > 0, _d_p, 0.0), 14)
+                    _l_p = self._ema(np.where(_d_p < 0, -_d_p, 0.0), 14)
+                    _ag_p = float(_g_p[-1]) if len(_g_p) else 0.0
+                    _al_p = float(_l_p[-1]) if len(_l_p) else 0.0
+                    _rsi_p = 100.0 - 100.0 / (1.0 + _ag_p / _al_p) if _al_p > 0 else 50.0
+                    if _pos_p > float(cfg.get("hexp.mtf.range_hi", 0.7)) \
+                            or _rsi_p > float(cfg.get("hexp.extreme.rsi_launch_high", 70.0)):
+                        pv = -1.0
+                    elif _pos_p < float(cfg.get("hexp.mtf.range_lo", 0.3)) \
+                            or _rsi_p < float(cfg.get("hexp.extreme.rsi_launch_low", 35.0)):
+                        pv = 1.0
+                    else:
+                        pv = 0.0
                 else:
                     pv = 0.0
             else:  # TRANSITION
@@ -2478,6 +2544,13 @@ class HexpEngine:
                         symbol, primary, direction, _phase, _squeeze, _ignite,
                         _pos_pct, f_mm, float(pf.get("_er_raw", 0.0)))
         sr.trend_start_candidate = _trend_start
+        # ── 趋势启动三条件实时诊断（纯观测，供面板「预启动状态条」实时显示）──
+        # 与下方顺势下单共用 squeeze_breakout 同源逻辑，但**无条件输出**，使面板能在
+        # 候选未触发时也能看到三条件各自的命中情况与中间量（BBW 带宽 / Donchian 轨 /
+        # H1 EMA 共振），便于盯盘判断趋势启动抢跑何时就绪。不影响下单决策。
+        _ts_diag = self._trend_start_diag(
+            period_data=period_data, primary=primary, pf=pf, cfg=cfg,
+            atr=atr, close_v=close_v)
         # ── 趋势启动顺势下单（2026-08-26 由"纯观测"升级为可配置下单）──
         # 目标：趋势启动初期（ignite 点火 + 微动量同向 + 位置中低位）即轻仓顺势进场，
         # 根治"滞后组(adx/er/ma≈68% 权重)确认趋势时已在高位才给方向"的追单止损。
@@ -2649,6 +2722,8 @@ class HexpEngine:
                         # 「A/S 级可交易」与「A/S 级但已被护栏封成 NO_TRADE」。
                         "grade_vetoed": bool(getattr(sr, "grade_vetoed", False)),
                         "grade_veto_by": getattr(sr, "grade_veto_by", ""),
+                        # 趋势启动三条件实时诊断（纯观测，面板「预启动状态条」用）
+                        "trend_start_diag": _ts_diag,
                         "reason": sr.reason, "ts": time.time(),
                     }, default=str),
                     ex=15,
@@ -2899,6 +2974,74 @@ class HexpEngine:
         if 8 <= h < 15:
             return 50.0
         return 70.0
+
+    def _trend_start_diag(self, period_data, primary, pf, cfg, atr, close_v):
+        """趋势启动(squeeze_breakout)三条件实时诊断。
+
+        与 _trend_start_squeeze_breakout 同源逻辑，但**无论是否满足都输出**，供前端
+        「预启动状态条」实时展示三条件的命中情况与中间量，便于盯盘判断趋势启动抢跑
+        何时就绪。纯观测，不写候选、不影响下单决策。
+
+        三条件（squeeze_breakout 模式）：
+          ① 压缩  bbw_pct < bbw_max            （布林带宽处于历史低位 = 蓄势）
+          ② 突破  close > don_hi(BUY) / < don_lo(SELL)，don_hi/lo = Donchian(don_look) 上/下轨
+          ③ 共振  H1 已完成棒收盘 > H1 EMA(h1_ema)（做多）/ <（做空）
+        三条件齐 → dir 给出、ready=True（即趋势启动抢跑就绪方向）。
+        """
+        _bbw_max = float(cfg.get("hexp.trend_start.bbw_max", 20.0))
+        _bbw = float(pf.get("_bbw_pct", 100.0))
+        _sq_ok = bool(np.isfinite(_bbw) and _bbw < _bbw_max)
+
+        _don_look = int(cfg.get("hexp.trend_start.don_look", 10))
+        _h1_ema = int(cfg.get("hexp.trend_start.h1_ema", 50))
+        _dir = None
+        _don_hi = _don_lo = None
+        _p = period_data.get(primary)
+        if _p is not None and atr > 0 and close_v > 0:
+            _h = _p.get("highs")
+            _l = _p.get("lows")
+            if _h is not None and _l is not None and len(_h) >= _don_look + 2:
+                _don_hi = float(np.max(np.asarray(_h[-(_don_look + 1):-1])))
+                _don_lo = float(np.min(np.asarray(_l[-(_don_look + 1):-1])))
+                if close_v > _don_hi:
+                    _dir = "BUY"
+                elif close_v < _don_lo:
+                    _dir = "SELL"
+        _bk_ok = _dir is not None
+
+        _h1 = period_data.get("H1")
+        _h1_up = None
+        if _h1 is not None:
+            _c = _h1.get("closes")
+            if _c is not None and len(_c) >= _h1_ema + 2:
+                _ema = self._ema(np.asarray(_c, dtype=float), _h1_ema)
+                _h1_up = bool(float(_c[-2]) > float(_ema[-2]))
+        _res_ok = (
+            _dir is not None and _h1_up is not None
+            and ((_dir == "BUY" and _h1_up) or (_dir == "SELL" and not _h1_up))
+        )
+
+        _ready = bool(_sq_ok and _bk_ok and _res_ok)
+        return {
+            "mode": str(cfg.get("hexp.trend_start_mode", "squeeze_breakout")).strip().lower(),
+            "observe_enabled": bool(cfg.get("hexp.trend_start_observe_enabled", True)),
+            "order_enabled": bool(cfg.get("hexp.trend_start_order_enabled", False)),
+            "new_mode_order_allowed": bool(cfg.get("hexp.trend_start.new_mode_order_allowed", False)),
+            "bbw_max": round(_bbw_max, 2),
+            "don_look": _don_look,
+            "h1_ema": _h1_ema,
+            "bbw": round(_bbw, 2),
+            "squeeze_ok": _sq_ok,
+            "close": round(float(close_v), 3) if close_v else None,
+            "don_hi": round(_don_hi, 3) if _don_hi is not None else None,
+            "don_lo": round(_don_lo, 3) if _don_lo is not None else None,
+            "breakout_dir": _dir,
+            "breakout_ok": _bk_ok,
+            "h1_up": _h1_up,
+            "resonance_ok": _res_ok,
+            "dir": _dir if _ready else None,
+            "ready": _ready,
+        }
 
     # ─────────────────────── 指标兜底（独立于 IndicatorCalculator）───────────────────────
     @staticmethod

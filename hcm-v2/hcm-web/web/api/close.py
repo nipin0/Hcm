@@ -66,6 +66,12 @@ CLOSE_CONFIG_DEFAULTS: dict[str, Any] = {
     # 仅拦截 BUY/SELL 开仓信号，平仓/改仓/部分平仓路径不受影响；half 部分平仓不触发。
     # 0 = 关闭（不写冷却键，闸门恒放行）。
     "after_close_cooldown_sec": 0,
+    # ── 同向尾单止损（2026-09-04 用户需求，bridge _check_tail_stop_guard 实际读取）──
+    # 同一 (symbol, direction) 组 ≥2 仓 且 ≥1 笔已保本后：最新一笔加仓单(尾单)开仓浮亏
+    # > ATR × tail_stop_atr_mult → 全平该同向组，锁定保本单小利，防尾单反转拖垮整体。
+    "tail_stop_enabled": True,
+    "tail_stop_atr_mult": 0.5,
+    "tail_stop_cooldown_sec": 60,
 }
 
 # ── 时段感知风险档案 (2026-07-24) ─────────────────────────────────────────────

@@ -526,11 +526,26 @@ class RedisClient:
 # ────────────────────────────────────────────────────────────
 
 CRITICAL_SAFETY_KEYS = {
-    "risk_cool_minutes":          {"type": "int",    "min":  3,  "max": 1440, "default": 5},
-    "risk_max_open_positions":    {"type": "int",    "min":  1,  "max":   50, "default": 1},
-    "risk_min_confidence":        {"type": "float",  "min": 0.05, "max": 0.80, "default": 0.10},
-    "risk_max_lot_single":        {"type": "float",  "min": 0.01, "max": 10.0, "default": 0.01},
+    # ── 【2026-09-08 审计修复 P0】以下 4 键为历史遗留僵尸键：风控 rule_chain.load_config
+    # 实际读的是 risk.max_lot_per_trade / risk.max_total_exposure / risk.max_concurrent_signals
+    # / risk.cooldown_minutes（见下方新增），旧键被误配为 0 时自检"以为在保护"、
+    # 真实阈值却完全裸奔。保留仅为兼容历史部署（缺失仍告警），真正的门禁见下方新键。
+    "risk_cool_minutes":          {"type": "int",    "min":  0,  "max": 1440, "default": 5},
+    "risk_max_open_positions":    {"type": "int",    "min":  1,  "max":   50, "default": 5},
+    "risk_max_lot_single":        {"type": "float",  "min": 0.01, "max": 10.0, "default": 0.03},
     "risk_max_total_lot":         {"type": "float",  "min": 0.01, "max": 100.0,"default": 0.05},
+    # ── 风控实际生效键（rule_chain.load_config 读取，务必与之一一对应）──
+    # 注意：置信度键是**下划线** risk_min_confidence（下方"通用安全键"已含），
+    # 不要写成 risk.min_confidence —— 该键在配置中心不存在，会导致启动自检
+    # 判为缺失并中止服务启动（2026-09-08 实测事故，已即时修正）。
+    "risk.max_lot_per_trade":     {"type": "float",  "min": 0.01, "max": 100.0,"default": 0.03},
+    "risk.max_total_exposure":    {"type": "float",  "min": 0.01, "max": 10000.0,"default": 0.05},
+    "risk.max_concurrent_signals":{"type": "int",   "min":  1,  "max":   50, "default": 10},
+    "risk.max_daily_loss":        {"type": "float",  "min": 1.0,  "max": 100000.0,"default": 200},
+    "risk.margin_call_level":     {"type": "float",  "min": 1.0,  "max": 100.0,"default": 20},
+    "risk.cooldown_minutes":      {"type": "int",    "min":  0,  "max": 1440, "default": 5},
+    # ── 通用安全键 ──
+    "risk_min_confidence":        {"type": "float",  "min": 0.0,  "max": 1.0,  "default": 0.10},
     "close.trailing_stop_enabled":{"type": "bool",                      "default": True},
     "close.trailing_stop_distance":{"type": "int",  "min":  1,  "max":   10, "default": 2},
     "regime_adx_trend":           {"type": "int",   "min": 18,  "max":   40, "default": 24},

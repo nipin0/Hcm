@@ -407,9 +407,10 @@ class RiskStreamConsumer:
                     if not _pub:
                         raise RuntimeError(
                             f"risk_passed publish failed signal_id={signal_id}")
-                    # 【E 组 P2-4】决策放行且发布成功后才启动冷却计时
-                    if self._rule_chain is not None:
-                        await self._rule_chain.mark_cooldown(msg.data)
+                    # 【2026-09-08 审计清理】原此处调用 rule_chain.mark_cooldown() 启动
+                    # 冷却计时，但该方法自 2026-08-03 起已废弃为空实现（同向闸门改为
+                    # 「同向保本闸门」_check_cooldown，不再用 Redis 时间窗键）。
+                    # 调用点与空方法一并删除，避免维护者误以为冷却在此启动。
                     await self._update_signal_status(
                         signal_id, 1, decision,
                         signal_mode=str(msg.data.get("signal_mode", "")))
@@ -427,9 +428,10 @@ class RiskStreamConsumer:
                     if not _pub:
                         raise RuntimeError(
                             f"risk_passed publish failed signal_id={signal_id}")
-                    # 【E 组 P2-4】决策放行且发布成功后才启动冷却计时
-                    if self._rule_chain is not None:
-                        await self._rule_chain.mark_cooldown(msg.data)
+                    # 【2026-09-08 审计清理】原此处调用 rule_chain.mark_cooldown() 启动
+                    # 冷却计时，但该方法自 2026-08-03 起已废弃为空实现（同向闸门改为
+                    # 「同向保本闸门」_check_cooldown，不再用 Redis 时间窗键）。
+                    # 调用点与空方法一并删除，避免维护者误以为冷却在此启动。
                     await self._update_signal_status(
                         signal_id, 1, decision,
                         signal_mode=str(msg.data.get("signal_mode", "")))
@@ -567,7 +569,15 @@ class RiskStreamConsumer:
             "co_exec_fb": int(signal_data.get("co_exec_fb", 0) or 0),  # 盲点兜底单：桥端 zone 到期不市价追
             # 2026-08-26 反向单标记：momentum_flip 封 NO_TRADE 后覆写方向产出的接刀单，
             # 风控 _check_reverse_order 消费；透传供桥端诊断/日志识别。
-            "reverse_order": bool(signal_data.get("reverse_order", False)),
+            # 【2026-09-08 审计修复 P0】Redis Stream 字段值只能是字符串：Python bool
+            # 写入后被编码为 "True"/"False"，下游裸用 bool() 时 bool("False") 恒为
+            # True → 反向单护栏误伤正常开仓单。统一写 0/1 规范值，下游按 "1" 判定。
+            "reverse_order": 1 if str(signal_data.get("reverse_order", False)).strip().lower()
+                             in ("1", "true", "yes", "on") else 0,
+            # 【2026-09-08 审计修复 P0】"信号塔已锁定止损"标记透传给桥：桥侧据此跳过
+            # 会话 SL 下限兜底（避免把信号塔精确止损反向拉宽）。默认 0 = 桥侧行为不变。
+            "sl_locked": 1 if str(signal_data.get("sl_locked", 0)).strip().lower()
+                         in ("1", "true", "yes", "on") else 0,
         }
 
         try:

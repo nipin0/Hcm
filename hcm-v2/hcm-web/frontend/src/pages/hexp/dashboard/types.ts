@@ -96,6 +96,51 @@ export type PeriodState = 'TREND_UP' | 'TREND_DOWN' | 'RANGE' | 'TRANSITION' | s
 export type Direction = 'BUY' | 'SELL' | 'NO_TRADE' | string;
 export type Grade = 'S' | 'A' | 'B' | 'C' | 'RED' | string;
 
+/**
+ * 趋势启动（squeeze_breakout）三条件实时诊断，纯观测字段。
+ * 由引擎 `_trend_start_diag` 在每帧 produce 中无条件计算并发布，
+ * 与真正下单的 `_trend_start_squeeze_breakout` 同源逻辑，但无论是否触发都输出，
+ * 供面板「预启动状态条」实时展示三条件的命中情况与中间量。
+ */
+export interface TrendStartDiag {
+  /** 判定模式（squeeze_breakout / phase_ignite） */
+  mode: string;
+  /** 观测开关（仅落库候选） */
+  observe_enabled: boolean;
+  /** 真实下单开关 */
+  order_enabled: boolean;
+  /** 新模式(squeeze_breakout)是否允许下单 */
+  new_mode_order_allowed: boolean;
+  /** BBW 带宽压缩阈值（%） */
+  bbw_max: number;
+  /** Donchian 回看根数 */
+  don_look: number;
+  /** H1 EMA 周期 */
+  h1_ema: number;
+  /** 当前 BBW 带宽分位（%） */
+  bbw: number;
+  /** ① 压缩：bbw < bbw_max */
+  squeeze_ok: boolean;
+  /** 现价 */
+  close: number | null;
+  /** Donchian 上轨（突破买入触发价） */
+  don_hi: number | null;
+  /** Donchian 下轨（突破卖出触发价） */
+  don_lo: number | null;
+  /** ② 突破方向：close 上穿 don_hi→BUY / 下破 don_lo→SELL / None */
+  breakout_dir: 'BUY' | 'SELL' | null;
+  /** ② 突破：close 已突破 Donchian 轨 */
+  breakout_ok: boolean;
+  /** ③ H1 已完成棒收盘 > H1 EMA（true=多头共振 / false=空头共振 / null=数据不足） */
+  h1_up: boolean | null;
+  /** ③ 共振：突破方向与 H1 EMA 方向一致 */
+  resonance_ok: boolean;
+  /** 三条件齐备时的就绪方向（BUY/SELL），否则 null */
+  dir: 'BUY' | 'SELL' | null;
+  /** 三条件是否全部命中（趋势启动抢跑就绪） */
+  ready: boolean;
+}
+
 /** hcm:live:hexp:{symbol} 实时快照全字段 */
 export interface HexpSnapshot {
   direction: Direction;
@@ -109,6 +154,8 @@ export interface HexpSnapshot {
   factor_scores: HexpFactorScores;
   factor_raws?: HexpFactorRaws;
   trend_phase?: TrendPhase;
+  /** 趋势启动三条件实时诊断（纯观测，预启动状态条用） */
+  trend_start_diag?: TrendStartDiag;
   period_states: Record<string, PeriodState>;
   trend_scores: Record<string, number>;
   used_periods: string[];

@@ -184,7 +184,17 @@ class IndicatorCalculator:
         if len(closes) < max(self._boll_period, self._adx_period, self._rsi_period) + 5:
             logger.warning("Insufficient data: %d closes (need >= %d)",
                          len(closes), max(self._boll_period, self._adx_period, self._rsi_period) + 5)
-            return IndicatorResults(close=float(closes[-1]) if len(closes) > 0 else 0.0)
+            # 【2026-09-08 审计修复 P1】原此处直接返回"默认值"结果，而 adx_14 默认值是
+            # **20.0**、plus_di/minus_di 默认 25.0 —— 恰好落在"有趋势"区间（micro_state
+            # 趋势门槛 adx>=18）→ 数据不足时被判成趋势并继续出信号（用假指标下单）。
+            # 改为显式返回"指标不可用"的中性值（adx=0 → 下游按震荡/无趋势处理，保守侧）。
+            return IndicatorResults(
+                close=float(closes[-1]) if len(closes) > 0 else 0.0,
+                adx_14=0.0,
+                plus_di=0.0,
+                minus_di=0.0,
+                atr_14=0.0,
+            )
 
         if highs is None:
             highs = closes * 1.001  # Approximate
@@ -700,7 +710,7 @@ class IndicatorCalculator:
 # Pure functions operating on numpy arrays / scalar OHLC. No DB access, no side
 # effects — safe to call from the scheduler's production pipeline.
 
-ZONE_MIN_STRENGTH = 3          # 最小结构层融合数才输出 zone
+ZONE_MIN_STRENGTH = 2          # 最小结构层融合数才输出 zone
 SR_TIMEFRAME_PRIMARY = "H1"    # 摆动 S/R 母结构主时间框架
 SR_TIMEFRAME_FILTER = "H4"     # 高阶过滤（预留）
 ATR_CLUSTER_MULT = 0.3         # zone 聚类 / 融合容差 = 0.3 × ATR

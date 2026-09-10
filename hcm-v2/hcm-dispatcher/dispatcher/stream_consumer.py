@@ -340,7 +340,10 @@ class DispatcherStreamConsumer:
                 sl_price = float(msg.data.get("sl_price", 0.0))
                 tp1 = float(msg.data.get("tp1", 0.0))
                 entry_price = float(msg.data.get("entry_price", 0.0))
-                client_id = f"disp-{signal_id}-{int(time.time() * 1000)}"
+                # 【2026-09-08 审计修复 P1】client_id 是网关侧幂等键，原实现含毫秒
+                # 时间戳 → 每次重试都生成新键，gRPC 已成交但回包超时的重试会绕过
+                # 去重、重复开仓。改为 (account, signal) 稳定键，重试天然幂等。
+                client_id = f"disp-{account_id}-{signal_id}"
 
                 # Place order via Gateway gRPC
                 if self._gateway is not None:

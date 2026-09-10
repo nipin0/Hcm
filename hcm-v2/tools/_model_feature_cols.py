@@ -90,12 +90,15 @@ MODEL_FEATURE_COLS = [
     # 注：dev_z_ema200 / entry_atr_ratio 已于 2026-08-31 移除——
     # 经 lm_features 连续采样复核，两者在生产恒为 0.0（推理侧取不到对应数据），
     # 入模只会引入常数维度与噪声。
-    # ── 【2026-09-01 加回】TimesFM 离线特征 13 维（管线已恢复，非恒 0）──
-    # 训练侧 quality_features.load_tmf_features 与推理侧 quality_scorer._load_tmf_for_bar
-    # 均按 (symbol, M5 bar_time) 精确 join hcm_ai.timesfm_features（tmf_version=tfm25_pca_v1_sig），
-    # 缺省全 0.0 保证训练-推理同分布。PCA 8 维 + 5 派生特征。
-    "tmf_pc00", "tmf_pc01", "tmf_pc02", "tmf_pc03", "tmf_pc04", "tmf_pc05", "tmf_pc06", "tmf_pc07",
-    "tmf_trend_cont", "tmf_rev_prob", "tmf_vol_cycle", "tmf_mtf_resonance", "tmf_hist_sim",
+    # ──【2026-09-10 下线 TimesFM 特征】13 维 tmf_* 已从质量头契约移除。──
+    # 依据：AUC 消融实测（_scratch/_tmp_ablation.py，features.csv/labels.csv 2026-09-09）：
+    #   含 tmf   test_AUC = 0.7371
+    #   不含 tmf test_AUC = 0.7575
+    #   增量 ΔAUC = -0.0205（TimesFM 特征不仅无增益，反而拉低 AUC）；
+    #   且 Top5 特征重要性无一 tmf_*，tmf_hist_sim 实测恒 ≈0.9994（退化常数）。
+    # 根因：TimesFM 2.5 单变量(仅 close) + 通用低频序列预训练 + normalize_inputs=False
+    #   → PC1 独占 99.95% 方差（embedding 退化为标量）→ 任务失配 + 特征退化。
+    # TMF_FEATURE_COLS 仍保留（仅供离线审计/追溯），但不再入 MODEL_FEATURE_COLS。
     # ── 【2026-09-02 新增】verdict（多周期 MTF 加权共识分 ∈[-1,1]，hexp 实时产出）──
     # dir_head 长期缺"多周期共振方向"这一最强方向信号（见对话复盘：dir_hit 仅 0.52、系统性偏多
     # 的根因之一）。verdict 由 hexp_engine 用 M30/H1/H4/D1 按 weight_* 加权算出，含趋势/震荡反向
@@ -125,4 +128,25 @@ MODEL_FEATURE_COLS = [
 TMF_FEATURE_COLS = [
     "tmf_pc00", "tmf_pc01", "tmf_pc02", "tmf_pc03", "tmf_pc04", "tmf_pc05", "tmf_pc06", "tmf_pc07",
     "tmf_trend_cont", "tmf_rev_prob", "tmf_vol_cycle", "tmf_mtf_resonance", "tmf_hist_sim",
+    # 【2026-09-10】不确定度特征（timesfm_features.uncertainty_features 从 9 分位数 q 提取）
+    #
+    # 【2026-09-10 消融结论：不提升，维持不入模】
+    # 实测（消融脚本；features.csv/labels.csv 2026-09-09，n=1470，
+    #       时序 TimeSeriesSplit 5 折 × 5 种子 = 25 组【配对】观测，两模型同折同种子）：
+    #   基线 37 维       AUC = 0.6683 ± 0.1419
+    #   +不确定度 41 维  AUC = 0.6549 ± 0.1332
+    #   ΔAUC = -0.0134，SE = 0.0102，95%CI = [-0.0335, +0.0067]（跨 0，无显著差异）
+    #   不确定度仅胜出 5/25 组 —— 幅度虽不显著，但方向一致偏负。
+    #
+    # ⚠️ 本次根因【不同于】上方旧 13 维的下线原因，勿混为一谈：
+    #   旧 13 维：embedding 退化（PC1 独占 99.95% 方差 → 退化为标量，tmf_pc00 实测
+    #             span=0.0038 / std=0.0005），属"特征本身没信息"。
+    #   新 qf_*  ：【并非】退化常数，分位数均有真实跨度
+    #             （width span=19.40/std=2.57、skew 0.72/0.087、
+    #               uptail 8.27/1.09、growth 0.55/0.059）。
+    #             即"信息真实存在，但不预测信号质量"；且模型确实在用
+    #             （tmf_qf_skew 重要性排名第 2，占 5.74% ≈ 均摊 2.44% 的 2.4 倍），
+    #             说明是【样本内可拟合、样本外不泛化】，1470 样本再加 4 维只增过拟合。
+    # 决策：保留本列表供审计/追溯，【不】加入 MODEL_FEATURE_COLS。
+    "tmf_qf_width", "tmf_qf_skew", "tmf_qf_uptail", "tmf_qf_growth",
 ]

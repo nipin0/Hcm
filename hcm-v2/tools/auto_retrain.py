@@ -623,6 +623,25 @@ def fetch_recent(window_hours: float = 24.0):
 # 参考：健康状态下恒定占比约 0.06~0.14(实测)；2026-08-30 故障期高达 25/39≈0.64。
 LIVE_BASELINE_MAX_CONST_RATIO = 0.30
 
+# 【2026-09-08 审计修复 P1】影子验收的绝对 AUC 下限（见 shadow_compare 内注释）：
+# 仅有"相对冠军"判据会让模型族自洽劣化，必须叠加"候选自身达标"下限。
+SHADOW_MIN_ABS_AUC = 0.55
+
+# 【治本 2026-09-09】真实结果评估集的留出比例：必须与 train_signal_quality.py 的
+# --test-ratio **保持一致**。auto_retrain 调用训练时未传该参数(:1137)，故取其默认 0.2。
+# ⚠️ 契约：两者不一致 → 评估集落入候选训练集 → 候选 AUC 变成"样本内"而虚高
+#    （实测 25% 时候选 0.821 vs 训练自报 test 0.681，即此偏差），验收失去意义。
+#    若今后给训练传了 --test-ratio，此常量必须同步修改。
+REAL_EVAL_HOLDOUT_RATIO = float(os.environ.get("REAL_EVAL_HOLDOUT_RATIO", "0.20"))
+
+# 【2026-09-08 审计修复 P1】漂移触发的 fail_streak 熔断阈值：
+# 连续 N 轮重训都被影子验收拒收时，说明"重训也换不出更好的模型"（当前
+# fail_streak=9：样本/标签/特征侧的问题未解决，重训必然被拒）。此时继续按 PSI
+# 漂移触发重训 = 空转 churn：每轮全量 build_labels→features→train→裁判耗时数小时、
+# 抢占 CPU，且结果必然 adopted=false。达到阈值后降级为"仅告警不重训"，
+# 待 fail_streak 被成功采纳重置（或人工清零）后自动恢复。
+RETRAIN_FAIL_STREAK_HALT = 3
+
 
 def build_live_baseline(window_days: float = 1.0) -> dict | None:
     """从 inference_log 近窗口特征构建 live 群体基线(deciles)→ models/live_baseline.json。
@@ -853,40 +872,162 @@ def monitor_and_trigger(use_deepseek: bool = True) -> bool:
     psi, collapse, triggered = _compute_trigger(baseline, feat_cols, ai, feats, passed)
     log(f"[trigger] psi_max={psi['max']:.3f} psi_mean={psi['mean']:.3f} "
         f"collapsed={collapse} drifted={psi['drifted']} -> triggered={triggered}")
+    # 【2026-09-08 审计修复 P1】退化/常量特征告警：这类特征 PSI 恒 0，此前被
+    # 静默当作"无漂移"（健康），实为"线上无信息"（如 tmf_* 曾长期恒 0）。
+    _degen = psi.get("degenerate", [])
+    if _degen:
+        log(f"[WARN] 退化/常量特征 {len(_degen)} 个（线上无信息，PSI=0 不代表健康）: "
+            f"{_degen}")
     if triggered:
+        # 【2026-09-08 审计修复 P1】fail_streak 熔断（见 RETRAIN_FAIL_STREAK_HALT 注释）：
+        # 漂移可以是真的（实测基线重建后 psi_max 仍 1.40、22 维漂移），但若连续多轮
+        # 重训都被影子验收拒收，再触发重训只是空转。达到阈值 → 本轮仅告警不重训。
+        _streak = 0
+        try:
+            import redis as _rlib
+            _rc = _rlib.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=3,
+                              decode_responses=True)
+            _streak = int(float(_rc.get("hcm:ai:retrain:fail_streak") or 0))
+        except Exception as _se:
+            log(f"[trigger] fail_streak 读取失败({_se})，按 0 处理")
+        if _streak >= RETRAIN_FAIL_STREAK_HALT:
+            log(f"[trigger] 漂移确认，但 fail_streak={_streak} >= "
+                f"{RETRAIN_FAIL_STREAK_HALT} → 本轮**不重训**（避免空转 churn），"
+                f"仅告警。待新模型通过影子验收或人工重置 fail_streak 后自动恢复。")
+            return triggered
         log("[trigger] condition met -> launching retrain_once()")
         retrain_once(use_deepseek=use_deepseek)
     return triggered
 
 
 # ── P3-C 灰度对比（champion/challenger）──────────────────────────────────
-def shadow_eval(champion_path: str, candidate_path: str, feats, passed) -> dict:
-    """候选 vs 现役 champion 影子对比：在近期特征上比较 AUC(对 passed 标签)。
+def fetch_real_eval_set(holdout_ratio: float = REAL_EVAL_HOLDOUT_RATIO,
+                        min_samples: int = 100):
+    """【治本 2026-09-09】真实成交结果评估集：join(features.csv, labels.csv) → y=真实胜负。
 
-    返回 {available, auc_champ, auc_cand, adopt}。adopt=候选 AUC 不劣于 champion
-    （允许 -0.02 容差）。库缺失/样本不足→available=False 且 adopt=True（放行，
-    交由既有 DS/本地护栏兜底）。
+    留出比例必须与训练一致（见 REAL_EVAL_HOLDOUT_RATIO 契约注释）：取时间序最近
+    holdout_ratio 切片 == train_signal_quality.py 的测试段，从而对**冠军与候选都是
+    样本外**，比较才公平（候选只在其前 1-ratio 段上训练过）。
+
+    背景（空转根因）：原影子验收用 HEXP `passed` 代理标签，而质量模型特征含 HEXP
+    自身输出 verdict → "用答案考答案"循环自证：冠军恒赢(0.82)、候选恒输(0.69)，
+    连续 13 次拒收、模型永不更新（churn）。既有 TODO 亦指向此。
+
+    治本：改用 labels.csv 的**真实 R 倍数**作标签（R>0 为正例）——与训练目标
+    （真实成交结果）对齐；features.csv 按 signal_id 提供特征。取时间序最近
+    holdout_ratio 切片作近似留出集，降低与训练集重叠风险。
+
+    样本不足/文件缺失/异常 → 返回 None（调用方回退 passed 代理并标注 label_src）。
+    """
+    try:
+        _tools = os.path.dirname(os.path.abspath(__file__))
+        fpath = os.path.join(_tools, "_artifacts", "features.csv")
+        lpath = os.path.join(_tools, "_artifacts", "labels.csv")
+        if not (os.path.exists(fpath) and os.path.exists(lpath)):
+            log("[real-eval] features/labels csv missing -> fallback")
+            return None
+        fdf = pd.read_csv(fpath)
+        ldf = pd.read_csv(lpath)
+        if "signal_id" not in fdf.columns or "signal_id" not in ldf.columns:
+            return None
+        keep = ["signal_id"] + [c for c in ("R", "label", "created_at") if c in ldf.columns]
+        m = fdf.merge(ldf[keep], on="signal_id", how="inner")
+        if m.empty:
+            return None
+        # 标签优先级：**label(真实胜负) 优先**。
+        # 【实测订正 2026-09-09】labels.csv 的 R 列恒 >0（3721/3721 全为正、R<=0 计数 0），
+        # 是无符号量（非已实现盈亏），不能作二分类标签 —— 首次验证即因 y 全 1 导致
+        # set(y) 单值、AUC 无法计算而回退。label 才是真实成交结果(1.0=win / 0.0=loss)。
+        # R 仅作兜底（且需其确实存在正负两侧，否则下方 set(y)<2 仍会拦截）。
+        if "label" in m.columns and pd.to_numeric(m["label"], errors="coerce").notna().any():
+            m = m.copy()
+            m["_lb"] = pd.to_numeric(m["label"], errors="coerce")
+            m = m[m["_lb"].notna()]
+            _src = "label_winloss"
+        elif "R" in m.columns and pd.to_numeric(m["R"], errors="coerce").notna().any():
+            m = m.copy()
+            m["_lb"] = pd.to_numeric(m["R"], errors="coerce")
+            m = m[m["_lb"].notna()]
+            _src = "R"
+        else:
+            return None
+        # 时间序取最近切片（近似留出集）
+        if "created_at" in m.columns:
+            m["_ts"] = pd.to_datetime(m["created_at"], utc=True, errors="coerce")
+            m = m.sort_values("_ts")
+        n_hold = max(min_samples, int(len(m) * holdout_ratio))
+        if len(m) > n_hold:
+            m = m.iloc[-n_hold:]
+        y = ((m["_lb"] > 0) if _src == "R" else m["_lb"]).astype(float).to_numpy()
+        if len(y) < min_samples or len(set(y.tolist())) < 2:
+            log(f"[real-eval] insufficient/degenerate labels (n={len(y)} "
+                f"classes={len(set(y.tolist()))}) -> fallback")
+            return None
+        m = m.drop(columns=[c for c in ("_ts", "_lb") if c in m.columns])
+        log(f"[real-eval] real-outcome eval set n={len(m)} pos_rate={y.mean():.3f} "
+            f"src={_src}")
+        return m.to_dict("records"), y
+    except Exception as e:
+        log(f"[real-eval] build failed: {e} -> fallback")
+        return None
+
+
+def shadow_eval(champion_path: str, candidate_path: str, feats, y,
+                label_src: str = "passed_proxy") -> dict:
+    """候选 vs 现役 champion 影子对比：在给定评估集上比较 AUC。
+
+    y 的语义由 label_src 标明（治本后优先真实成交结果）：
+      - "real_R"        ：labels.csv 真实 R 倍数(R>0)，与训练目标一致（推荐）
+      - "passed_proxy"  ：HEXP 闸门结果代理（含 verdict 特征→循环自证，仅兜底）
+
+    返回 {available, auc_champ, auc_cand, adopt, label_src}。adopt=候选 AUC 不劣于
+    champion（允许 -0.02 容差）且不低于绝对下限。库缺失→available=False 且 adopt=True
+    （放行，交由既有 DS/本地护栏兜底）。
     """
     if lgb is None or _roc_auc is None:
-        return {"available": False, "adopt": True, "reason": "libs_unavailable"}
+        return {"available": False, "adopt": True, "reason": "libs_unavailable",
+                "label_src": label_src}
     try:
         champ = lgb.Booster(model_file=champion_path)
         cand = lgb.Booster(model_file=candidate_path)
     except Exception as e:
-        return {"available": False, "adopt": True, "reason": f"load_err:{e}"}
+        return {"available": False, "adopt": True, "reason": f"load_err:{e}",
+                "label_src": label_src}
     cfeats = champ.feature_name()
     nfeats = cand.feature_name()
     Xc = pd.DataFrame(feats).reindex(columns=cfeats, fill_value=0.0)
     Xn = pd.DataFrame(feats).reindex(columns=nfeats, fill_value=0.0)
-    y = np.asarray(passed, dtype=float)
+    y = np.asarray(y, dtype=float)
     if len(y) < 30 or len(set(y.tolist())) < 2:
-        return {"available": True, "adopt": True, "reason": "insufficient_labels"}
+        return {"available": True, "adopt": True, "reason": "insufficient_labels",
+                "label_src": label_src}
     p_champ = np.asarray(champ.predict(Xc), dtype=float).ravel()
     p_cand = np.asarray(cand.predict(Xn), dtype=float).ravel()
     auc_champ = safe_auc(y, p_champ)
     auc_cand = safe_auc(y, p_cand)
-    adopt = (auc_cand is not None and auc_champ is not None and auc_cand >= auc_champ - 0.02)
-    return {"available": True, "auc_champ": auc_champ, "auc_cand": auc_cand, "adopt": adopt}
+    # 【2026-09-08 审计修复 P1】追加绝对下限，根除"与冠军相当即可上线"的自洽劣化：
+    # 原判据仅为 `auc_cand >= auc_champ - 0.02`，是**相对**比较 —— 当 champion 自身
+    # 退化时（如 0.55），候选 0.54 也会被采纳，模型族可一代代缓慢劣化而不触发任何
+    # 拒收；且 y 用的是 hexp 闸门结果(passed)作**代理标签**，只证明"与 HEXP 一致"，
+    # 不证明对行情有效。现叠加绝对下限：候选必须同时"不显著差于冠军"且"本身达标"。
+    # 注：实测当前 champion≈0.606 / cand≈0.549 < 0.55 → 与修复前同为拒收，行为不变。
+    # 【2026-09-09 治本 DONE】原 TODO「把 y 换成真实 R 触达标签」已实现：
+    #   由 fetch_real_eval_set() 从 labels.csv 取真实 R(R>0) 作标签，调用点优先用它；
+    #   仅在真实集不可用(样本不足/文件缺失)时回退 passed 代理，并以 label_src 标注，
+    #   使"验收是否基于真实结果"在 hcm:ai:shadow:last / retrain:last 中可审计。
+    adopt = (
+        auc_cand is not None and auc_champ is not None
+        and auc_cand >= auc_champ - 0.02
+        and auc_cand >= SHADOW_MIN_ABS_AUC
+    )
+    return {"available": True, "auc_champ": auc_champ, "auc_cand": auc_cand,
+            "adopt": adopt, "min_abs_auc": SHADOW_MIN_ABS_AUC,
+            "label_src": label_src,
+            "n_eval": int(len(y)),
+            "reason": ("ok" if adopt else
+                       ("cand_auc_below_abs_floor" if (auc_cand is not None
+                                                       and auc_cand < SHADOW_MIN_ABS_AUC)
+                        else "cand_worse_than_champ"))}
 
 
 def _check_trigger_only():
@@ -913,16 +1054,46 @@ def _run_shadow_eval():
     if not champ or not os.path.exists(cand):
         log(f"[shadow-eval] champion={champ} candidate(v{v})={cand} missing"); return
     ai, feats, passed = fetch_recent(24.0)
-    if not feats:
-        log("[shadow-eval] no recent features"); return
-    se = shadow_eval(champ, cand, feats, passed)
+    # 【治本 2026-09-09】与 retrain_once 同口径：优先真实成交结果标签。
+    _real = fetch_real_eval_set()
+    if _real is not None:
+        feats, passed = _real
+        _src = "real_outcome"
+    else:
+        if not feats:
+            log("[shadow-eval] no recent features"); return
+        _src = "passed_proxy"
+    se = shadow_eval(champ, cand, feats, passed, label_src=_src)
     print(json.dumps({"champion": champ, "candidate": cand, "shadow": se},
                      ensure_ascii=False, indent=2))
 
 
 # ── 主流程 ────────────────────────────────────────────────────────────────
-def retrain_once(use_deepseek: bool = True) -> dict:
-    """执行一轮完整重训闭环，返回结果摘要。"""
+def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
+    """执行一轮完整重训闭环，返回结果摘要。
+
+    【2026-09-09 修复·堵塞熔断旁路】fail_streak 熔断统一前置到本函数：
+    此前熔断仅作用于 monitor_and_trigger（PSI 数据驱动触发路径，:874-892），
+    而 _tmf_then_retrain.py 在 TimesFM 抽取完成后经 `auto_retrain.py --once`
+    （main:1239）以及 daemon 定时分支（main:1265）都直接调用本函数 → 完全绕过
+    熔断。实测：fail_streak=12（远超 RETRAIN_FAIL_STREAK_HALT=3）时仍在
+    2026-09-08T21:44 训练出 v96，版本继续堆积、CPU 空转。
+    现统一在此判定：fail_streak >= RETRAIN_FAIL_STREAK_HALT 且非 force → 跳过
+    训练（仅告警，避免 churn）；人工确实要强制重训时用 --force 覆盖。
+    """
+    if not force:
+        try:
+            import redis as _rlib
+            _rc = _rlib.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=3,
+                              decode_responses=True)
+            _streak = int(float(_rc.get(FAIL_STREAK_KEY) or 0))
+        except Exception as _se:
+            log(f"[halt] fail_streak 读取失败({_se})，按 0 处理")
+            _streak = 0
+        if _streak >= RETRAIN_FAIL_STREAK_HALT:
+            log(f"[halt] fail_streak={_streak} >= {RETRAIN_FAIL_STREAK_HALT} "
+                f"→ 跳过本轮重训（空转防护）；人工强制请加 --force")
+            return {"ok": False, "stage": "fail_streak_halt", "fail_streak": _streak}
     v = next_model_version()
     model_out = os.path.join(MODELS_DIR, f"lgbm_quality_v{v}.txt")
     calib_out = os.path.join(MODELS_DIR, f"calib_v{v}.pkl")
@@ -949,8 +1120,26 @@ def retrain_once(use_deepseek: bool = True) -> dict:
         return {"ok": False, "stage": "build_labels", "error": err[-500:]}
 
     # 2) 特征（自动带 ds_* DeepSeek 特征 = 路径 C）
+    # 【2026-09-08 审计修复 P0】训练口径必须与线上推理严格一致（train-serve skew）。
+    # quality_scorer 侧仅当 `ai.lm.period_match == "align_m5"` 才启用 M5 同源重算
+    # （adx_14/rsi_14/macd/atr_14/h1_adx/h1_trend_strength）；此前本处固定传
+    # --period-align m5，而线上该键无种子 → 默认 none → 训练按 M5 重算、线上读
+    # hexp 快照原值，4~6 个核心技术指标两套口径，模型学到线上不存在的分布。
+    # 现按线上实际配置自动对齐（线上改 align_m5 后训练自动跟随，反之亦然）。
+    _pm = "(unknown)"
+    _period_align = "none"
+    try:
+        import redis as _rlib
+        _rc = _rlib.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=5,
+                          decode_responses=True)
+        _pm = str(_rc.hget("hcm:config:v2", "ai.lm.period_match") or "").strip().lower()
+        _period_align = "m5" if _pm == "align_m5" else "none"
+    except Exception as _e:
+        log(f"[warn] 读取 ai.lm.period_match 失败({_e}) → 回退 none（与线上默认一致）")
+    log(f"[align] ai.lm.period_match={_pm or '(empty)'} → quality_features "
+        f"--period-align {_period_align}（与推理口径对齐）")
     rc, out, err = run([PY, "quality_features.py", "--out", features_csv,
-                        "--mode", "HEXP:%,live_override", "--period-align", "m5"])
+                        "--mode", "HEXP:%,live_override", "--period-align", _period_align])
     if rc != 0:
         log(f"[ABORT] quality_features failed: {err[-500:]}")
         return {"ok": False, "stage": "quality_features", "error": err[-500:]}
@@ -1056,8 +1245,19 @@ def retrain_once(use_deepseek: bool = True) -> dict:
         if champ_path and os.path.exists(champ_path) and \
                 os.path.abspath(champ_path) != os.path.abspath(model_out):
             _ai_l, _f_l, _p_l = fetch_recent(24.0)
-            if _f_l:
-                se = shadow_eval(champ_path, model_out, _f_l, _p_l)
+            # 【治本 2026-09-09】优先用"真实成交结果"标签验收（破除 passed 代理 +
+            # verdict 特征的循环自证）；真实集不可用时回退 passed 代理并标注来源。
+            _real = fetch_real_eval_set()
+            if _real is not None:
+                _ev_f, _ev_y = _real
+                se = shadow_eval(champ_path, model_out, _ev_f, _ev_y,
+                                 label_src="real_outcome")
+            elif _f_l:
+                se = shadow_eval(champ_path, model_out, _f_l, _p_l,
+                                 label_src="passed_proxy")
+            else:
+                se = None
+            if se is not None:
                 log(f"[shadow] {se}")
                 # 【P1-O5 2026-08-22】影子对比持久化：候选 vs 现役 AUC 差异 + 决定落库，
                 # 形成在线表现时间线，供按版本归因/回看（不再仅打日志）。
@@ -1147,6 +1347,8 @@ def main():
                     help="强制 re-pin live baseline（调 HEXP 参数后手动调用，配合 --link-hexp）")
     ap.add_argument("--dry-run", action="store_true",
                     help="switch_model 只记录不切换（验证/灰度用）")
+    ap.add_argument("--force", action="store_true",
+                    help="绕过 fail_streak 熔断强制重训（人工介入用；默认受熔断约束）")
     args = ap.parse_args()
 
     if args.dry_run:
@@ -1169,7 +1371,7 @@ def main():
         hexp_config_link(force_repin=args.force_repin)
         return
     if args.once:
-        retrain_once(use_deepseek=use_ds)
+        retrain_once(use_deepseek=use_ds, force=args.force)
         return
 
     # daemon 模式：monitor_and_trigger 高频(≤1h)查数据驱动触发，retrain_once 按 interval 定时全量

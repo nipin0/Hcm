@@ -47,6 +47,8 @@ import MetaTrader5 as _mt5_global  # top-level import for reliable order_send
 # Lazy import — resolved when position_sync.py exists (T02+)
 # Re-imported in T04 when actually called from main()
 from position_sync import sync_positions, _record_after_close_cooldown  # noqa: F401
+# MT5 pos.time 是经纪商服务器时间（实测比 UTC 快 3h），经统一入口校正后再用。
+from _mt5_timeutil import mt5_time_to_utc, detect_mt5_tz_offset  # noqa: F401
 
 # Live bar Redis key — inline to avoid cross-module import (bridge runs on Windows host)
 LIVE_BAR_KEY_TEMPLATE = "market:bar:{symbol}:{timeframe}:live"
@@ -717,28 +719,48 @@ async def write_price_to_redis(redis_conn, mt5, symbol, timeframe_str, broker_ut
             "open_time": _open_epoch,
             "open": float(r['open']), "high": float(r['high']),
             "low": float(r['low']), "close": float(r['close']),
+            # 【2026-09-08 审计修复 P0】字段对齐：signal_tower scheduler 组装实时
+            # live_bar 时读的是 `tick_volume`（见 scheduler _fetch_klines 实时合并），
+            # 而本处只写了 `volume` → 实时 bar 的 tick_volume 恒 0 → bar_quality
+            # 的 vol_q=vol/vol_base=0 → quality 被无条件 ×0.5，实时信号系统性降质量。
+            # 两键同值双写：新键对齐消费侧，旧键保留以兼容既有读取方。
             "volume": int(r['tick_volume'] or 0),
+            "tick_volume": int(r['tick_volume'] or 0),
             "spread": float(_spread),
             "real_volume": int(_rv),
         }))
         # Compute and cache ATR (14-period) for SL/TP calculation — 仅主周期需要
         if write_tick:
             try:
+                # 取数根数 15 → 100：Wilder RMA 需要足够历史预热收敛（见下方口径统一注释）
                 atr_rates = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(None, mt5.copy_rates_from_pos, real, mt5.TIMEFRAME_M5, 0, 15),
+                    asyncio.get_event_loop().run_in_executor(None, mt5.copy_rates_from_pos, real, mt5.TIMEFRAME_M5, 0, 100),
                     timeout=3.0
                 )
             except (asyncio.TimeoutError, Exception) as exc:
                 log.warning(f"write_price_to_redis: ATR copy_rates_from_pos timeout/error: {exc}")
                 return
-            if atr_rates is not None and len(atr_rates) >= 15:
-                trs: list[float] = []
+            if atr_rates is not None and len(atr_rates) >= 16:
+                # 【2026-09-08 审计修复 P0】ATR 口径统一（消除多源冲突）。
+                # 原实现 = 最近 14 个 TR 的**简单均值(SMA)**，而：
+                #   · 信号塔 hexp 评分/止损用 indicator_calculator.compute_atr = **Wilder RMA**；
+                #   · 训练侧 quality_features 用 ewm(alpha=1/14)（数学上等价 Wilder RMA）。
+                # 三者应同源，否则「塔按 Wilder 定 SL、桥按 SMA 定 SL/TP 与滑点闸门」互相
+                # 矛盾（同一时刻两套波动率）。此处改为与塔完全一致的 Wilder RMA(14)，
+                # 并把取数从 15 根扩到 100 根保证 RMA 预热收敛（与塔的计算逐值对齐）。
+                _period = 14
+                _trs: list[float] = []
                 for i in range(1, len(atr_rates)):
                     hl = float(atr_rates[i]['high']) - float(atr_rates[i]['low'])
                     hc = abs(float(atr_rates[i]['high']) - float(atr_rates[i-1]['close']))
                     lc = abs(float(atr_rates[i]['low']) - float(atr_rates[i-1]['close']))
-                    trs.append(max(hl, hc, lc))
-                atr_val = sum(trs[-14:]) / 14.0
+                    _trs.append(max(hl, hc, lc))
+                if len(_trs) <= _period:
+                    atr_val = sum(_trs) / float(len(_trs))
+                else:
+                    atr_val = sum(_trs[:_period]) / float(_period)
+                    for _t in _trs[_period:]:
+                        atr_val = (atr_val * (_period - 1) + _t) / float(_period)
                 redis_conn.set(f"hcm:atr:{symbol}", str(atr_val), ex=300)
 
 
@@ -801,14 +823,10 @@ def _get_atr_from_redis(redis_conn, symbol: str) -> float:
         atr = redis_conn.get(f"hcm:atr:{symbol}")
         if atr:
             return float(atr)
-        # Fallback: read from latest kline cache
-        cached = redis_conn.get(f"hcm:market:latest_kline:{symbol}")
-        if cached:
-            import json
-            data = json.loads(cached)
-            atr = data.get('atr', 0.0)
-            if atr > 0:
-                return atr
+        # 【2026-09-08 审计清理】此处原回退读 `hcm:market:latest_kline:{symbol}`，
+        # 全库无任何写入者（桥写的是 hcm:config:v2 的 latest_kline:{sym}:{tf} 字段，
+        # collector 写的是无前缀的 latest_kline:{sym}:{tf} 键）→ 该分支永远读不到值，
+        # 只会掩盖 hcm:atr:{symbol} 缺失。删除，由调用方按 close.fallback_atr 显式兜底。
         return 0.0  # not available — caller should handle
     except Exception:
         return 0.0
@@ -947,6 +965,13 @@ CLOSE_CONFIG_DEFAULTS: dict[str, float] = {
     "close.follow_daily_profit_abs_min": 0.0,  # 盈利绝对金额阈值($)；百分比达标且绝对额>=此值才熔断，0=不设绝对下限
     "close.follow_daily_loss_abs_min": 0.0,    # 亏损绝对金额阈值($)；百分比达标且绝对额>=此值才熔断，0=不设绝对下限
     "close.follow_resume_time": "06:30",     # 每日恢复跟单时间（本地时区 HH:MM）
+    # ── 同向尾单止损（2026-09-04 用户需求）──
+    # 同一 (symbol, direction) 组 ≥2 仓 且 ≥1 笔已保本时，最新一笔加仓单(尾单)开仓后
+    # 浮亏 > ATR × tail_stop_atr_mult → 全平该同向组，落袋前面保本单小利，
+    # 防「尾单反转大止损 + 前单保本小利」整体转亏。仅主号桥跑。
+    "close.tail_stop_enabled": True,
+    "close.tail_stop_atr_mult": 0.5,
+    "close.tail_stop_cooldown_sec": 60,
 }
 
 
@@ -1010,17 +1035,22 @@ def _get_close_config_bool(redis_conn, key: str, default: bool = False) -> bool:
     return val.lower() in ("true", "1", "yes")
 
 
-def _after_close_cooling(redis_conn, symbol: str) -> bool:
-    """信号冷却闸门读取：持仓刚平仓后 N 秒内抑制该品种新开仓。
+def _after_close_cooling(redis_conn, symbol: str, direction: str = "") -> bool:
+    """信号冷却闸门读取：持仓刚平仓后 N 秒内抑制**同方向**新开仓。
 
-    读 hcm:after_close_cooldown:{symbol}，与当前 epoch 比较；键不存在或已过期→False。
+    【2026-09-09 变更·仅同方向冷却】读 hcm:after_close_cooldown:{symbol}:{DIRECTION}；
+    反向信号不再被拦（原按品种全方向冷却，震荡期连续平仓会连锁吞掉所有方向信号）。
+    direction 缺失/非法 → 回退旧的全品种键 hcm:after_close_cooldown:{symbol}（兼容）。
     该键由 _record_after_close_cooldown() 在平仓时写入（close.after_close_cooldown_sec>0 才写），
     故关闭状态下本函数恒返回 False，无需在热路径额外读配置。
     """
     if redis_conn is None or not symbol:
         return False
+    _d = str(direction or "").strip().upper()
+    _key = (f"hcm:after_close_cooldown:{symbol}:{_d}" if _d in ("BUY", "SELL")
+            else f"hcm:after_close_cooldown:{symbol}")
     try:
-        raw = redis_conn.get(f"hcm:after_close_cooldown:{symbol}")
+        raw = redis_conn.get(_key)
         if raw is None:
             return False
         if isinstance(raw, bytes):
@@ -1407,7 +1437,19 @@ def place_mt5_order(mt5, signal_data, symbol, timeframe_str, redis_conn=None):
     # 低位追空单 SL 被 zone 收到 ~1.1ATR，被 19:00 反弹直接扫损）。此处将 SL 距离
     # 放大到 close.<session>.trailing_stop_distance×ATR（会话键值兜底），
     # 下方 P0-1 再按 max_sl_atr_mult 封顶（最终 = min(会话值, max_sl)）。
-    if redis_conn and sl > 0:
+    # 【2026-09-08 审计修复 P0】信号塔"锁定的精确止损"不得被本兜底拉宽。
+    # 原实现无条件把任何 SL 距离 < 会话 trailing_stop_distance×ATR 的止损抬到会话
+    # 下限，导致信号塔刻意收紧的止损被反向放大（实证：RANGE 串行加仓单 1×ATR=4.41
+    # 被拉宽成 2×ATR≈11.49，orders 开仓即 4408.26，风控形同虚设）。
+    # 豁免条件：① strategy=range（控制器自定义 sl_atr_mult）；② 上游显式透传
+    # sl_locked=1（趋势抢跑/极值追单等已由信号塔锁定止损的场景）。
+    # 未豁免场景行为完全不变（zone/AI 收紧的止损仍受会话下限保护）。
+    _sl_locked_raw = signal_data.get("sl_locked", 0)
+    _sl_locked = (
+        str(signal_data.get("strategy", "") or "").strip().lower() == "range"
+        or str(_sl_locked_raw).strip().lower() in ("1", "true", "yes", "on")
+    )
+    if redis_conn and sl > 0 and not _sl_locked:
         try:
             _sess_floor = _current_session()
             _floor_raw = _session_cfg_float(
@@ -1700,10 +1742,11 @@ async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
     # ── 信号冷却闸门（2026-08-11）：持仓平仓后 N 秒内抑制该品种新开仓 ──
     # 仅拦截 BUY/SELL 开仓信号；平仓/改仓/部分平仓路径不受影响。冷却期间到达的信号
     # 直接丢弃（不成交、但会被标记 processed 去重）→ 冷却结束后新信号正常触发。
-    # 作用域：仅按交易品种（per symbol），主号与跟单号共享同一 Redis 键，故双方都生效。
+    # 作用域：按 (品种, 方向)【2026-09-09 起仅同方向冷却】；主号与跟单号共享同一
+    # Redis 键，故双方都生效。反向信号不再被拦（原全方向冷却会连锁吞掉所有方向信号）。
     if _dir in ("BUY", "SELL"):
         _cool_sym = logic_symbol(msg_symbol) or msg_symbol
-        if _after_close_cooling(redis_conn, _cool_sym):
+        if _after_close_cooling(redis_conn, _cool_sym, _dir):
             log.info("After-close cooldown: skip %s open for %s (cooling active)", _dir, _cool_sym)
             await _mark_signal_blocked(pool, sid, "bridge_after_close_cooldown")
             return False
@@ -1872,10 +1915,11 @@ async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
         return True
 
 
-async def _force_close_positions(mt5, redis_conn, symbol: str, mode: str = "all", master_ticket: int = 0) -> int:
+async def _force_close_positions(mt5, redis_conn, symbol: str, mode: str = "all", master_ticket: int = 0, direction: str = "") -> int:
     """P1 FORCE_CLOSE：平掉指定 symbol 的持仓（P3 安全反转）。
 
     mode='all' 平全部；mode='half' 每仓平一半手数（多仓时）。
+    direction 非空且 mode != 'ticket' 时 → 仅平该方向持仓（同向组全平，如同向尾单止损）。
     无持仓返回 0（安全 no-op，不报错）。返回实际平仓笔数。
 
     支持逻辑名（如 'XAUUSD'）和真实 broker 名（如 'XAUUSD_'）：
@@ -1912,6 +1956,11 @@ async def _force_close_positions(mt5, redis_conn, symbol: str, mode: str = "all"
             positions = [p for p in all_pos
                          if (real_sym and p.symbol == real_sym)
                          or (symbol and p.symbol == symbol)]
+    # 【同向尾单止损 2026-09-04】mode=all 且指定方向时仅平该方向组（BUY=0 / SELL=1）
+    _dir = str(direction or "").upper()
+    if _dir and mode != "ticket":
+        positions = [p for p in positions
+                     if (_dir == "BUY" and p.type == 0) or (_dir == "SELL" and p.type == 1)]
     if not positions:
         log.info("FORCE_CLOSE: no open positions for %s (real=%s) — nothing to close", symbol, real_sym)
         return 0
@@ -1970,7 +2019,10 @@ async def _force_close_positions(mt5, redis_conn, symbol: str, mode: str = "all"
             # ── 信号冷却（2026-08-11）：强制平仓（含跟单镜像平仓）→ 抑制该品种 N 秒新开仓 ──
             # 仅全平（all/ticket）触发；half 部分平仓不算一次完整平仓，不重置冷却。
             if mode != "half":
-                _record_after_close_cooldown(redis_conn, logic_symbol(pos.symbol))
+                # 【2026-09-09 仅同方向冷却】MT5 pos.type: 0=BUY / 1=SELL
+                _fc_dir = "BUY" if getattr(pos, "type", 1) == 0 else "SELL"
+                _record_after_close_cooldown(
+                    redis_conn, logic_symbol(pos.symbol), _fc_dir)
             log.warning("FORCE_CLOSE closed ticket=%s vol=%.2f mode=%s", pos.ticket, close_volume, mode)
         except Exception as exc:
             log.exception("FORCE_CLOSE position close error ticket=%s: %s", pos.ticket, exc)
@@ -4187,6 +4239,18 @@ async def main(dry_run=False):
                         _update_total_trailing_stop(mt5, redis_conn)
                     except Exception as e:
                         log.error(f"total trailing stop update failed: {e}")
+                    # [2026-09-04] 同向尾单止损：保本后加仓组尾单浮亏>阈值 → 全平该同向组
+                    #（仅主号；跟单号由主号镜像驱动平仓，避免主号未平跟单先平）
+                    try:
+                        await _check_tail_stop_guard(mt5, redis_conn, pool)
+                    except Exception as e:
+                        log.error(f"tail stop guard update failed: {e}")
+                    # [P0 2026-09-05] 持仓路径采样：每根 M5 落一条 MFE/MAE 快照，
+                    # 供入场点模型与移动止盈参数寻优（仅主号，fail-open，开关 pos_path.enabled）
+                    try:
+                        await _position_path_sample(mt5, redis_conn, pool)
+                    except Exception as e:
+                        log.error(f"position path sample failed: {e}")
                     # [2026-09-02] 反转头：主号浮亏>0.6ATR 写评分请求 + 消费结论
                     # （异步双段，绝不在此同步调 AI；内部全异常隔离，失败则不动）
                     try:
@@ -4452,6 +4516,7 @@ def _publish_trail_sltp_event(redis_conn, pos, new_sl: float, new_tp: float, acc
 #   6. 失败安全：模型未启用/无结论/异常 → 一律不动作。
 # ══════════════════════════════════════════════════════════════════════
 _REV_TRIGGER_DD_ATR = 0.6     # 触发：浮亏 > 0.6 ATR
+_REV_TRIGGER_DD_ATR_TAIL = 0.45  # 【路径C 2026-09-04】尾单场景提前触发阈值（须 < tail_stop 0.5ATR）
 _REV_COOLDOWN_SEC = 900.0     # 每仓最小重评间隔 15 分钟
 _REV_STEP_ATR = 0.5           # 台阶：浮亏再加深 0.5ATR 立即重评
 _REV_TIGHTEN_BUF_ATR = 0.15   # 反转时收紧 SL 的缓冲（×ATR）
@@ -4524,6 +4589,27 @@ async def _rev_request_scores(mt5, redis_conn, pool):
     cooldown = _rev_float_cfg(redis_conn, "ai.rev.cooldown_sec", _REV_COOLDOWN_SEC)
     step = _rev_float_cfg(redis_conn, "ai.rev.step_atr", _REV_STEP_ATR)
     trig = _rev_sess_float(redis_conn, "trigger_dd_atr", _REV_TRIGGER_DD_ATR)
+    # 【路径C 2026-09-04】尾单场景提前触发阈值（会话化键 ai.rev.trigger_dd_atr_tail[.{sess}]）。
+    # 须 < close.tail_stop_atr_mult(默认0.5)，让反转头先于 tail guard 硬切表态。
+    trig_tail = _rev_sess_float(redis_conn, "trigger_dd_atr_tail", _REV_TRIGGER_DD_ATR_TAIL)
+    # 保本容差与同向尾单止损/风控同源（risk.cool_be_tolerance）
+    _be_tol = _get_close_config(redis_conn, "risk.cool_be_tolerance", 0.0)
+    # 组上下文：(sym,dir) → [组仓数, 是否含已保本仓, 最大 ticket]（与 tail_stop guard 同口径）
+    _gctx: dict = {}
+    for _p in positions:
+        _pd = "BUY" if int(_p.type) == 0 else ("SELL" if int(_p.type) == 1 else "")
+        _psym = getattr(_p, "symbol", "") or ""
+        if not _pd:
+            continue
+        _g = _gctx.setdefault((_psym, _pd), [0, False, 0])
+        _g[0] += 1
+        _e0 = float(getattr(_p, "price_open", 0) or 0)
+        _sl0 = float(getattr(_p, "sl", 0) or 0)
+        if (_pd == "BUY" and _sl0 >= _e0 - _be_tol) or (_pd == "SELL" and _sl0 <= _e0 + _be_tol):
+            _g[1] = True
+        _tk0 = int(getattr(_p, "ticket", 0) or 0)
+        if _tk0 > _g[2]:
+            _g[2] = _tk0
     now = time.time()
     for pos in positions:
         try:
@@ -4538,7 +4624,11 @@ async def _rev_request_scores(mt5, redis_conn, pool):
             entry, cur = float(pos.price_open), float(pos.price_current)
             sign = 1.0 if direction == "BUY" else -1.0
             dd = sign * (entry - cur) / atr
-            if dd <= trig:
+            # 尾单场景（组≥2仓且含保本且本仓为组内最新 ticket）→ 用提前阈值，让 AI 先表态
+            _g = _gctx.get((sym, direction)) or [0, False, 0]
+            _is_tail = _g[0] >= 2 and _g[1] and int(getattr(pos, "ticket", 0) or 0) == _g[2]
+            _eff_trig = trig_tail if _is_tail else trig
+            if dd <= _eff_trig:
                 continue
             ticket = int(pos.ticket)
             lkey = f"hcm:ai:rev:last:{ticket}"
@@ -4558,8 +4648,11 @@ async def _rev_request_scores(mt5, redis_conn, pool):
                 "symbol": sym, "direction": direction,
                 "open_price": entry, "sl": float(getattr(pos, "sl", 0) or 0),
                 "tp": float(getattr(pos, "tp", 0) or 0),
-                "open_time": datetime.fromtimestamp(int(pos.time), tz=timezone.utc).isoformat(),
-                "dd_atr": round(dd, 4), "ts": now,
+                # 时区校正：pos.time 是经纪商服务器时间（实测 +3h）；
+                # 取不到时回退 now（此处 now 为 time.time() 的 epoch 秒，需自行转 datetime）。
+                "open_time": (mt5_time_to_utc(pos.time)
+                              or datetime.fromtimestamp(now, tz=timezone.utc)).isoformat(),
+                "dd_atr": round(dd, 4), "tail": _is_tail, "ts": now,
             }
             redis_conn.set(f"hcm:ai:rev:req:{int(ACCOUNT_ID_MODE)}:{ticket}",
                            json.dumps(payload), ex=900)
@@ -4863,8 +4956,24 @@ async def _rev_apply_verdicts(mt5, redis_conn, pool):
             # 只朝有利方向改：反转时只允许收紧（更靠近现价），回踩时只允许放宽。
             # 【A2 2026-09-04】"想动没动成"也落归因行，mode='log_skip'——与 act 行
             # 区分标签，供日报漏斗对账，且不得污染"动作价值"统计（文档 §9-4）。
+            # 【三态化 2026-09-04 杠杆2】反转头只在高置信时动——reversal v1 测试集
+            # AUC≈0.57、score≈cutoff 的临界样本大量误判（当日实证：把反弹当回踩放宽、
+            # 空单扛出大亏）。档位：
+            #   score > cutoff+strong_margin        → 收紧（高置信反转，仍走确认机制）
+            #   score ∈ [cutoff-hold_margin, ...]    → hold 不动（临界，拒绝破坏性动作）
+            #   score < cutoff-hold_margin            → 回踩（默认不动；显式开
+            #                                            ai.rev.pullback_widen_enabled 才放宽）
+            _strong_m = float(_rev_float_cfg(redis_conn, "ai.rev.strong_margin", 0.015))
+            _hold_m = float(_rev_float_cfg(redis_conn, "ai.rev.hold_margin", 0.03))
+            _widen_en = _rev_bool_cfg(redis_conn, "ai.rev.pullback_widen_enabled", False)
             _skip = None
-            if is_rev and cur_sl > 0 and sign * (new_sl - cur_sl) <= 0:
+            if is_rev and score <= cutoff + _strong_m:
+                _skip = "rev_weak_hold"       # 判反转但置信不足(≤cutoff+margin) → 不动
+            elif (not is_rev) and score >= cutoff - _hold_m:
+                _skip = "pull_near_hold"      # 判回踩但贴近 cutoff → 不动（不赌临界）
+            elif (not is_rev) and not _widen_en:
+                _skip = "pull_widen_disabled" # 回踩放宽默认关（低置信动作风险大）→ 不改
+            elif is_rev and cur_sl > 0 and sign * (new_sl - cur_sl) <= 0:
                 _skip = "rev_not_tighter"     # 新 SL 未比原 SL 更紧 → 不改
             elif (not is_rev) and cur_sl > 0 and sign * (cur_sl - new_sl) <= 0:
                 _skip = "pull_not_wider"      # 新 SL 未比原 SL 更宽 → 不改
@@ -5170,6 +5279,314 @@ async def _update_trailing_stops(mt5, redis_conn, pool):
                     log.error(f"symbol BE flag write failed: {_sb_exc}")
     except Exception as e:
         log.error(f"_update_trailing_stops error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  P0 持仓路径采样（2026-09-05「贴合行情」专项）
+# ══════════════════════════════════════════════════════════════════════════
+# 目的：把持仓过程中的 MFE/MAE 曲线持久化到 hcm_ai.position_path，解锁
+#   · P1 入场点模型：标签 E[MFE_R] / P(先达1R) / 最优挂单偏移 δ*
+#   · P2 移动止盈参数寻优：回放不同 breakeven/trail 参数比总 R 与 MFE 捕获率
+# 口径：每根 M5 bar 每仓落一条；极值 = 「开仓以来 M5 high/low」+ 当前 tick 补齐
+#       未收盘 bar。只落原始价格事实，R 归一/ATR/world/regime/session 由离线补齐
+#       （口径统一、可反复重算，桥侧绝不跑行情指标计算）。
+# 纪律：仅主号采样（跟单 SL 由主号镜像，路径同源无需重复）；fail-open，任何异常
+#       均不影响交易主循环；落库失败限频告警避免刷屏。
+_PATH_STATE: dict = {}      # ticket -> {entry, dir, open_dt, init_sl, symbol, volume, ...}
+_PATH_LAST_BAR: dict = {}   # ticket -> 已落库 bar 的 open_time(datetime)
+_PATH_ERR_TS: float = 0.0
+
+
+def _path_bar_open(dt) -> object:
+    """M5 bar 开盘时间（UTC，按 300s 对齐，与 hcm_market.klines 柱对齐口径一致）。"""
+    return datetime.fromtimestamp((int(dt.timestamp()) // 300) * 300, tz=timezone.utc)
+
+
+async def _position_path_sample(mt5, redis_conn, pool) -> None:
+    """P0：每根 M5 bar 为每笔持仓落一条 MFE/MAE 路径快照（仅主号，fail-open）。"""
+    global _PATH_ERR_TS
+    try:
+        if _get_close_config(redis_conn, "pos_path.enabled", 1.0) < 1.0:
+            _PATH_STATE.clear()
+            _PATH_LAST_BAR.clear()
+            return
+    except Exception:
+        return
+    try:
+        positions = mt5.positions_get() or []
+    except Exception:
+        return
+
+    live: set = set()
+    for pos in positions:
+        try:
+            ticket = int(pos.ticket)
+            sym = logic_symbol(pos.symbol) or pos.symbol
+            d = "BUY" if int(pos.type) == 0 else "SELL"
+            entry = float(pos.price_open or 0.0)
+            sl = float(pos.sl or 0.0)
+            tp = float(pos.tp or 0.0)
+            vol = float(pos.volume or 0.0)
+            profit = float(pos.profit or 0.0)
+            # 时区校正：pos.time 是经纪商服务器时间（实测 +3h）。首轮即正确，
+            # 后续 :5344 起的 orders.open_time 自愈逻辑保持不变（真值覆盖，幂等）。
+            open_dt = (mt5_time_to_utc(pos.time)
+                       or _path_bar_open(datetime.now(timezone.utc)))
+        except Exception:
+            continue
+        live.add(ticket)
+
+        st = _PATH_STATE.get(ticket)
+        if st is None:
+            st = {"entry": entry, "dir": d, "open_dt": open_dt, "init_sl": sl,
+                  "symbol": sym, "volume": vol, "mfe": 0.0, "mae": 0.0,
+                  "px": 0.0, "bars": 0, "src": "mt5"}
+            _PATH_STATE[ticket] = st
+        # 时区校正（2026-09-05 实证）：MT5 pos.time 是【经纪商服务器时间】，
+        # 实测与 UTC 差 +3h（订单 20:27:10Z 被记成 23:30:09Z）。直接当 UTC 用会让
+        # 「开仓以来 K 线取段」整体偏移数小时 → mfe/mae 完全失真。
+        # 故以 PG hcm_trading.orders.open_time（系统写入的 UTC 真值）为准；
+        # 同时用 orders.sl 作为 R 基准（桥重启后读到的 SL 可能已被移到保本）。
+        # orders 尚未落库（刚下单）时先用 pos.time，后续轮次自愈校正。
+        if st.get("src") != "orders":
+            try:
+                async with pool.acquire() as conn:
+                    orow = await conn.fetchrow(
+                        "SELECT open_time, sl FROM hcm_trading.orders "
+                        "WHERE mt5_ticket=$1 ORDER BY open_time DESC LIMIT 1", ticket)
+                if orow is not None and orow["open_time"] is not None:
+                    st["open_dt"] = orow["open_time"]
+                    if orow["sl"]:
+                        st["init_sl"] = float(orow["sl"])
+                    st["src"] = "orders"
+            except Exception:
+                pass
+
+        # ① 极值：开仓以来 M5 K 线（多取一根覆盖开仓所在 bar）
+        mfe = mae = 0.0
+        bars = 0
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT high, low FROM hcm_market.klines "
+                    "WHERE symbol=$1 AND time_frame='M5' AND open_time >= $2 "
+                    "ORDER BY open_time ASC LIMIT 400",
+                    sym, datetime.fromtimestamp(
+                        st["open_dt"].timestamp() - 300, tz=timezone.utc))
+            if rows:
+                hi = max(float(r["high"]) for r in rows)
+                lo = min(float(r["low"]) for r in rows)
+                bars = len(rows)
+                mfe = (hi - entry) if d == "BUY" else (entry - lo)
+                mae = (entry - lo) if d == "BUY" else (hi - entry)
+        except Exception:
+            pass
+
+        # ② 当前 tick 补齐未收盘 bar（bid/ask 取不利侧，保守）
+        px = 0.0
+        try:
+            tick = mt5.symbol_info_tick(pos.symbol)
+            if tick is not None:
+                px = float(tick.bid if d == "BUY" else tick.ask)
+                if d == "BUY":
+                    mfe = max(mfe, px - entry)
+                    mae = max(mae, entry - px)
+                else:
+                    mfe = max(mfe, entry - px)
+                    mae = max(mae, px - entry)
+        except Exception:
+            pass
+        mfe, mae = max(0.0, mfe), max(0.0, mae)
+        st.update({"mfe": mfe, "mae": mae, "px": px, "bars": bars})
+
+        bar_dt = _path_bar_open(datetime.now(timezone.utc))
+        if _PATH_LAST_BAR.get(ticket) == bar_dt:
+            continue
+        try:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO hcm_ai.position_path "
+                    "(account_id, ticket, symbol, direction, open_time, volume, bar_time, "
+                    " bars_in_trade, is_closed, entry_price, last_price, mfe_px, mae_px, "
+                    " sl_price, tp_price, init_sl_price, profit) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,0,$9,$10,$11,$12,$13,$14,$15,$16) "
+                    "ON CONFLICT (ticket, bar_time) DO NOTHING",
+                    int(ACCOUNT_ID_MODE or 0), ticket, sym, d, st["open_dt"], vol, bar_dt,
+                    int(bars), entry, px, round(mfe, 6), round(mae, 6),
+                    sl, tp, st["init_sl"], profit)
+            _PATH_LAST_BAR[ticket] = bar_dt
+        except Exception as exc:
+            if time.time() - _PATH_ERR_TS > 300:
+                log.error(f"position_path insert failed: {exc}")
+                _PATH_ERR_TS = time.time()
+
+    # ③ 平仓补最后一条（is_closed=1）并清理内存态
+    for ticket in [t for t in list(_PATH_STATE) if t not in live]:
+        st = _PATH_STATE.pop(ticket, None)
+        _PATH_LAST_BAR.pop(ticket, None)
+        if not st:
+            continue
+        try:
+            bar_dt = _path_bar_open(datetime.now(timezone.utc))
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO hcm_ai.position_path "
+                    "(account_id, ticket, symbol, direction, open_time, volume, bar_time, "
+                    " bars_in_trade, is_closed, entry_price, last_price, mfe_px, mae_px, "
+                    " sl_price, tp_price, init_sl_price, profit) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$10,$11,$12,$13,$14,$15,$16) "
+                    "ON CONFLICT (ticket, bar_time) DO UPDATE SET is_closed=1",
+                    int(ACCOUNT_ID_MODE or 0), ticket, st["symbol"], st["dir"],
+                    st["open_dt"], st["volume"], bar_dt, int(st["bars"]),
+                    st["entry"], st["px"], round(st["mfe"], 6), round(st["mae"], 6),
+                    0.0, 0.0, st["init_sl"], 0.0)
+        except Exception:
+            pass
+
+
+async def _check_tail_stop_guard(mt5, redis_conn, pool) -> None:
+    """同向尾单止损（2026-09-04 用户需求，仅主号桥跑）。
+
+    场景：同向轮动加仓——最新一笔持仓已保本(SL 抬到开仓价±容差) → 风控同向保本闸门放行
+    继续开新单，直到最大持仓数封顶。此时若【最新一笔加仓单(尾单, ticket 最大)】开仓后
+    浮亏 > close.tail_stop_atr_mult × ATR，说明加仓点在反转位上 → 立即全平该同向组，
+    落袋前面保本单的小利，防「尾单反转大止损 + 前单保本小利」整体转亏。
+
+    武装前提：同 (symbol, direction) 组 ≥2 仓 且 ≥1 笔已保本（用户 2026-09-04 拍板）。
+    全平范围：仅该同向组（保留反向下单，不误伤）。
+    触发后写 hcm:tail_stop_guard:{symbol}:{dir} 冷却键（close.tail_stop_cooldown_sec，0=关）。
+    【路径C 2026-09-04】触发全平后写组级归因 hcm_ai.tail_close_attribution（供反事实/建模）。
+    数据源均同 _update_trailing_stops / _write_be_flags 口径（Redis hcm:config:v2 热改）。
+    """
+    if mt5 is None or redis_conn is None:
+        return
+    try:
+        _enabled = redis_conn.hget("hcm:config:v2", "close.tail_stop_enabled")
+        if not _enabled or str(_enabled).lower() not in ("true", "1"):
+            return
+    except Exception:
+        return
+    try:
+        _mult = _get_close_config(redis_conn, "close.tail_stop_atr_mult",
+                                  CLOSE_CONFIG_DEFAULTS.get("close.tail_stop_atr_mult", 0.5))
+        _cool = _get_close_config(redis_conn, "close.tail_stop_cooldown_sec",
+                                  CLOSE_CONFIG_DEFAULTS.get("close.tail_stop_cooldown_sec", 60.0))
+        _tol = _get_close_config(redis_conn, "risk.cool_be_tolerance", 0.0)
+    except Exception as exc:
+        log.error(f"tail stop guard config read failed: {exc}")
+        return
+    if _mult <= 0:
+        return  # 阈值≤0 = 视为禁用
+    try:
+        _positions = mt5.positions_get()
+    except Exception as exc:
+        log.error(f"tail stop guard positions_get failed: {exc}")
+        return
+    if not _positions or len(_positions) < 2:
+        return
+    # 按 (symbol, direction) 分组
+    _groups: dict[tuple, list] = {}
+    for p in _positions:
+        _d = "BUY" if p.type == 0 else ("SELL" if p.type == 1 else "")
+        if not _d or p.price_open is None:
+            continue
+        _groups.setdefault((logic_symbol(p.symbol), _d), []).append(p)
+    _now = time.time()
+    for (_sym, _d), _ps in _groups.items():
+        try:
+            if len(_ps) < 2:
+                continue
+            # 武装前提：组内 ≥1 笔已保本（BUY: sl≥entry-tol / SELL: sl≤entry+tol）
+            if not any((p.sl or 0) >= p.price_open - _tol if _d == "BUY"
+                       else (p.sl or 0) <= p.price_open + _tol for p in _ps):
+                continue
+            # 尾单 = ticket 最大者（MT5 ticket 单调增 = 最新开）
+            _tail = max(_ps, key=lambda p: (p.ticket or 0))
+            _atr = _get_atr_from_redis(redis_conn, _sym)
+            if _atr <= 0:
+                _atr = _get_close_config(redis_conn, "close.fallback_atr",
+                                         CLOSE_CONFIG_DEFAULTS.get("close.fallback_atr", 2.0))
+            if _atr <= 0:
+                continue
+            _tick = mt5.symbol_info_tick(_tail.symbol)
+            if _tick is None:
+                continue
+            _loss_dist = (_tail.price_open - _tick.bid) if _d == "BUY" else (_tick.ask - _tail.price_open)
+            if _loss_dist <= _mult * _atr:
+                continue
+            # 冷却防连发（cooldown>0 才生效）
+            _cd_key = f"hcm:tail_stop_guard:{_sym}:{_d}"
+            if _cool > 0:
+                try:
+                    _last = redis_conn.get(_cd_key)
+                    if _last is not None and _now < float(_last):
+                        continue
+                except Exception:
+                    pass
+            log.warning(
+                "TAIL-STOP-GUARD trigger: %s %s 组内%d仓含保本 尾单#%s 浮亏%.2f>%.2f×ATR(%.2f) → 全平该同向组",
+                _sym, _d, len(_ps), _tail.ticket, _loss_dist, _mult, _atr)
+            # 【路径C 2026-09-04】平仓前采集组快照（含各仓浮盈），供反事实归因
+            _snap, _fpnl, _be_n = [], 0.0, 0
+            for _p in _ps:
+                _e = float(getattr(_p, "price_open", 0) or 0)
+                _sl = float(getattr(_p, "sl", 0) or 0)
+                _isbe = (_sl >= _e - _tol) if _d == "BUY" else (_sl <= _e + _tol)
+                if _isbe:
+                    _be_n += 1
+                _snap.append({
+                    "ticket": int(getattr(_p, "ticket", 0) or 0),
+                    "entry": _e, "sl": _sl,
+                    "volume": float(getattr(_p, "volume", 0) or 0),
+                    "profit": float(getattr(_p, "profit", 0) or 0),
+                })
+                _fpnl += float(getattr(_p, "profit", 0) or 0)
+            try:
+                _closed = await _force_close_positions(mt5, redis_conn, _tail.symbol, "all", 0, _d)
+            except Exception as exc:
+                log.error(f"tail stop guard force-close failed {_sym} {_d}: {exc}")
+                continue
+            if _cool > 0:
+                try:
+                    redis_conn.set(_cd_key, _now + _cool, ex=int(_cool) + 30)
+                except Exception:
+                    pass
+            # 【路径C】触发归因写 PG（组级；只记录不干预，失败仅告警）
+            try:
+                await _log_tail_close(pool, _sym, _d, _ps, _tail, _loss_dist, _atr,
+                                      _mult, _snap, _fpnl, _be_n)
+            except Exception as _le:
+                log.error(f"tail close attribution failed {_sym} {_d}: {_le}")
+            log.warning("TAIL-STOP-GUARD closed=%d positions for %s %s", _closed, _sym, _d)
+        except Exception as exc:
+            log.error(f"tail stop guard per-group error {_sym}: {exc}")
+
+
+async def _log_tail_close(pool, sym, direction, ps, tail, loss_dist, atr, mult,
+                          snap, fpnl, be_n):
+    """【路径C 2026-09-04】tail guard 全平触发归因 → hcm_ai.tail_close_attribution。
+
+    只写入、绝不干预交易；任何异常仅告警（失败安全）。snap=组各仓快照(含浮盈)，
+    fpnl=触发时组净浮盈(货币，≈全平落袋近似)，供离线反事实与路径A/B建模。
+    """
+    if pool is None:
+        return
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO hcm_ai.tail_close_attribution "
+                "(account_id, symbol, direction, grp_n, grp_be_n, tail_ticket, tail_entry, "
+                " tail_dd_atr, atr, threshold_mult, positions, grp_float_pnl) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12)",
+                int(ACCOUNT_ID_MODE or 0), sym, direction, len(ps), int(be_n),
+                int(getattr(tail, "ticket", 0) or 0),
+                float(getattr(tail, "price_open", 0) or 0),
+                float(loss_dist / atr) if atr else 0.0,
+                float(atr or 0.0), float(mult or 0.0),
+                json.dumps(snap, ensure_ascii=False), float(fpnl or 0.0),
+            )
+    except Exception as e:
+        log.warning("[TAIL-CLOSE] attribution insert failed %s %s: %s", sym, direction, e)
 
 
 def _write_be_flags(mt5, redis_conn) -> None:

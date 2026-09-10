@@ -49,6 +49,11 @@ CFG_FALLBACK: dict[str, Any] = {
     "ai.lm.entry_fuse": False,
     "ai.lm.entry_boost_prob": 0.60,   # ai_entry≥此值 → 增强好买点(boost_good_entry)
     "ai.lm.entry_veto_prob": 0.35,    # ai_entry≤此值 → 否决差买点(veto_bad_entry)
+    # 【杠杆1·PULLBACK 追单抑制 2026-09-04】ai_state=PULLBACK（回调态）且拟开方向与
+    # M5 微动量(ai_mm, sidecar lm_features.mm)相反 → 逆动量追单（大跌后反弹里追空/接刀），
+    # 直接 VETO。默认启用；mm_abs 过低会拦到噪声，过高则失灵。
+    "ai.lm.pullback_chase_enabled": True,
+    "ai.lm.pullback_chase_mm_abs": 0.3,
     "ai.cpl.enabled": False,
     "ai.cpl.w_trend": 0.7,
     "ai.cpl.w_neutral": 0.6,
@@ -258,6 +263,8 @@ def decide(
     ai_direction: Optional[str] = None,
     ai_dir_prob: Optional[float] = None,
     ai_entry: Optional[float] = None,
+    ai_state: Optional[str] = None,
+    ai_mm: Optional[float] = None,
 ) -> dict:
     """闸门主入口。
 
@@ -271,6 +278,8 @@ def decide(
                 本模块是纯逻辑，不调用任何 AI（保持只读、可单测）。
       c_ai_meta 诊断（source="lm_only"/"none"、lm_score，及纯观测的
                 ds_score/ds_age_sec），仅透传进返回 dict，不参与裁决。
+      ai_state  sidecar 状态头输出（如 "PULLBACK"），供杠杆1追单抑制。
+      ai_mm     sidecar lm_features.mm（M5 微动量，tanh 归一），供杠杆1判动量方向。
 
     返回决策 dict；ai 未启用/解耦/无 c_ai/引擎未放行 时原样透传纯 HEXP。
     """
@@ -327,6 +336,45 @@ def decide(
     #    AI 再高分也只能 HOLD（不打开）——绝不允许 AI 越过 HEXP 闸门独立开仓
     #    （2026-08-28 阶段 1·纪律修正：删原 ai_opened 打开逻辑）。
     action, final_grade = adjust_grade(c_ai / 100.0, grade, cfg, passed=passed)
+
+    # ── RANGE 均值回归：豁免常规分数否决（2026-09-10 用户决策）──
+    # 背景：RANGE 信号【天生低分】——它做的是逆动量交易，而质量模型是按
+    #   "顺势/高质量" 学出来的（实测 RANGE 的 SELL 侧被系统性压到 lm=20.0 地板）。
+    #   生产 veto_floor=0.15（即 c_ai=15），RANGE 的 c_ai 恒在 20 附近，余量仅 5 分：
+    #   一旦模型或行情让分下探，连 BUY 也会被常规否决 → 策略归零。
+    # 决策：RANGE 不参与常规分数否决。但【保留低分可见性】——转 DOWNGRADE（降一级）
+    #   而非 HOLD，不把低质量信号伪装成高质量。
+    # 风控不因此消失：ai_lot_tier="low" → 确定性 0.5× 手数；TP=1.0ATR 小止盈 +
+    #   会话宽止损；总开关 range.enabled 可一键停。
+    if snapshot.get("range_mode", False) and action == "VETO":
+        _rv_idx = grade_index(grade)
+        action, final_grade = "DOWNGRADE", GRADE_ORDER[max(0, _rv_idx - 1)]
+
+    # 【杠杆1·PULLBACK 追单抑制 2026-09-04】回调态 + 逆 M5 微动量 → 追单/接刀，直接 VETO。
+    # 场景实证：H1 深跌后 V 型反弹，方向头仍 0.72 置信追空被反打。此处拦截
+    # 「HEXP 方向与当前微动量相反」的逆势追单（SELL 但 mm 上行 / BUY 但 mm 下行）。
+    # 输入 ai_mm=sidecar lm_features.mm；仅 hexp 已放行(passed)时拦；mm 缺失不拦。
+    pullback_chase = "none"
+    # ── RANGE 均值回归豁免（2026-09-10）──
+    # 本规则否决「逆动量交易」：SELL 且 M5 微动量上行 / BUY 且微动量下行。
+    # 而【均值回归的定义就是逆动量交易】——二者根本冲突：
+    #   · RANGE 的启用前提(H1/H4/D1 全 RANGE)下，sidecar 的 ai_state 恰恰恒为
+    #     "PULLBACK"（实测当前 ai_state=PULLBACK、ai_mm=+0.61），故该规则对
+    #     RANGE 是【必然命中】而非偶然。
+    #   · 实测 14 次注入：7 次 SELL 的 lm 分全被压到 20.0 并 100% VETO，
+    #     仅 1 次 BUY 因动量温和(|mm|<0.3)放行 → 表现为"只出 BUY、从不出 SELL"。
+    # 故 RANGE 豁免本规则。风险控制不因此消失：RANGE 另有 TP=1.0ATR 小止盈
+    # + ai_lot_tier="low"(0.5× 手数) 兜底。
+    if (passed and _g(cfg, "ai.lm.pullback_chase_enabled")
+            and ai_state == "PULLBACK" and direction in ("BUY", "SELL")
+            and ai_mm is not None
+            and not snapshot.get("range_mode", False)):
+        _pbc_abs = _g(cfg, "ai.lm.pullback_chase_mm_abs")
+        if _pbc_abs > 0 and (
+                (direction == "SELL" and ai_mm >= _pbc_abs) or
+                (direction == "BUY" and ai_mm <= -_pbc_abs)):
+            action, final_grade, lot_tier = "VETO", grade, "none"
+            pullback_chase = "veto_pullback_chase"
 
     # 【阶段 1·方向共振】dir_lm(方向头) × dir_hexp(HEXP 方向)：
     #   仅否决/增强 action，绝不改 snapshot.direction（方向永远由 HEXP 决定）。
@@ -404,6 +452,7 @@ def decide(
         "ai_opened": ai_opened,
         "dir_resonance": dir_resonance,  # 阶段 1·方向共振诊断: none/boost_same/veto_reverse
         "entry_resonance": entry_resonance,  # 阶段 2·买点共振诊断: none/boost_good_entry/veto_bad_entry
+        "pullback_chase": pullback_chase,  # 杠杆1·追单抑制诊断: none / veto_pullback_chase
         "coupling_pass": coupling_pass,
         # caller 区分 "none=cpl 未启用(不得压制)" 与 "none=极弱压制"
         "cpl_enabled": bool(_g(cfg, "ai.cpl.enabled")),

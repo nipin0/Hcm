@@ -49,6 +49,10 @@ interface HeadState {
   prob?: number | null;
   enabled: boolean;
   label: string | null;
+  // 价值头扩展字段（2026-09-05）：world=±1 方向世界 / 0 无趋势；score=顺向 E[R]
+  world?: number | null;
+  score?: number | null;
+  reason?: string | null;
 }
 interface LiveData {
   symbol: string;
@@ -57,13 +61,16 @@ interface LiveData {
     valid: boolean | null; model_loaded: boolean | null; model_version: string | null;
     total_score: number | null; ext_factor_score: number | null; degrade_streak: number | null;
   };
-  heads: { direction: HeadState; entry: HeadState; quality: HeadState; state: HeadState };
+  heads: {
+    direction: HeadState; value: HeadState; entry: HeadState;
+    quality: HeadState; state: HeadState;
+  };
   hexp: {
     direction: string | null; grade: string | null; hp_score: number | null;
     verdict: number | null; scorecard_total: number | null; passed: boolean | null;
     close: number | null; atr: number | null;
   };
-  resonance: { code: string; text: string };
+  resonance: { code: string; text: string; source?: string };
   deepseek: {
     key_ready: boolean; ticket: Record<string, unknown> | null; age_sec: number | null;
     max_age_sec: number; state: string; stale: boolean;
@@ -229,12 +236,22 @@ export default function AiOpsConsole() {
   const res = live?.resonance;
   const hexp = live?.hexp;
 
-  // 三头判定：共振结论决定方向头徽章
+  // 共振结论决定方向徽章（共振优先跟价值头世界方向比，见后端 _judge_resonance）
   const dirTone = res?.code === 'SAME' ? C.ok : res?.code === 'OPPOSITE' ? C.block : C.idle;
   const dirBadge = res?.code === 'SAME' ? '同向增强'
     : res?.code === 'OPPOSITE' ? '反向否决'
     : res?.code === 'HEXP_NO_DIRECTION' ? 'hexp 无方向'
     : 'AI 不干预';
+
+  // 价值头（方向裁决源）：无趋势世界 / 未启用 → 灰；有方向 → 跟随共振结论着色
+  const vh = live?.heads?.value;
+  const valTone = !vh?.enabled || vh?.world === 0 ? C.idle : dirTone;
+  const valCompare = !vh?.enabled
+    ? '价值头未发布（world 缺失）'
+    : `E[R] ${fmt(vh?.score, 3)}${vh?.world === 0 ? ' · 无趋势世界不评价值' : ''}`
+      + (live?.heads?.direction?.enabled
+        ? ` · dir_head 观测 ${String(live.heads.direction.value ?? '—')} 置信 ${fmt(live.heads.direction.prob, 2)}`
+        : ' · dir_head 已停用');
 
   // DeepSeek 票状态：无票 / 陈旧（标黄）/ 新鲜
   const dsStateText = ds?.state === 'no_ticket' ? '无票'
@@ -280,14 +297,16 @@ export default function AiOpsConsole() {
       {/* ── ① 三头实时运作 ── */}
       <Paper elevation={0} sx={{ backgroundColor: C.card, border: `1px solid ${C.border}`, borderRadius: 2, p: 2, mb: 2 }}>
         <Typography sx={{ color: C.accent, fontSize: 12, fontWeight: 600, mb: 1.2 }}>
-          ① LightGBM 三头实时运作
+          ① LightGBM 多头实时运作（价值头 = 方向裁决源，dir_head 降为观测）
         </Typography>
         <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 1.5 }}>
           <HeadCard
-            title="方向头 dir_head"
-            head={live?.heads?.direction}
-            compare={live?.heads?.direction?.prob != null ? `置信 ${fmt(live.heads.direction.prob, 3)}` : undefined}
-            tone={dirTone} badge={dirBadge}
+            title="价值头 value_head（方向裁决）"
+            head={vh}
+            compare={valCompare}
+            tone={valTone}
+            badge={!vh?.enabled ? '未启用'
+              : vh?.world === 0 ? '无趋势·不评价值' : '顺向世界·裁决中'}
           />
           <HeadCard
             title="买点头 entry_head"
@@ -324,7 +343,8 @@ export default function AiOpsConsole() {
               {res?.text || '—'}
             </Box>
             <Box component="span" sx={{ color: C.weak, fontSize: 11, ml: 1 }}>
-              hexp={hexp?.direction || '—'} / AI={String(live?.heads?.direction?.value ?? '—')}
+              hexp={hexp?.direction || '—'} / {res?.source === 'value' ? '价值头' : 'dir_head'}
+              ={String((res?.source === 'value' ? vh?.value : live?.heads?.direction?.value) ?? '—')}
             </Box>
           </Typography>
           <Typography sx={{ color: C.weak, fontSize: 10, mt: 0.3 }}>

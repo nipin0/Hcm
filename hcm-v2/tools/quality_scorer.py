@@ -281,6 +281,19 @@ def _num(v, default=0.0):
 # 与训练侧缺省严格一致，保证训练-推理同分布。60s 缓存按 bar_time 避免每 5s 打 PG。
 _TMF_CACHE = {"bar_time": None, "vals": {}, "at": 0.0}
 _TMF_VERSION = "tfm25_pca_v1_sig"
+# 【2026-09-08 审计修复 P0】TimesFM 线上恒 0 —— 根因与修复：
+# 特征表只在**部分 bar** 有行（实测 2281 行 / 1371 个不同 bar_time，相对 8/01~9/07
+# 的约 1.1 万根 M5 覆盖率仅 ~12%），且由日级调度 T+1 产出；原 SQL 用
+# `bar_time = 当前bar` **等值匹配** → 当前 bar 几乎必然无行 → 13 维 tmf_* 线上恒
+# 0.0，而训练侧有真值 = 典型 train-serve skew（模型在训练时学到的 tmf 分裂阈值
+# 线上全部落空，48 维里 27% 无信息）。
+# 改为 **as-of**（取 <= 当前 bar 的最近一行），并加"最大可用年龄"保护：
+# 超过 ai.lm.tmf_max_age_min（默认 30 分钟）的陈旧特征一律降级 0（与训练缺省
+# 一致），避免把几小时前的时序特征喂给实时打分（修 A 不能坏 B）。
+# 开关 ai.lm.tmf_asof_enabled=false 可秒级回退到原等值匹配行为。
+_TMF_ASOF = True
+_TMF_MAX_AGE_MIN = 30.0
+_TMF_STATS = {"hit": 0, "miss": 0, "stale": 0, "logged_at": 0.0}
 
 
 def _load_tmf_for_bar(conn, symbol, bar_time, ttl: float = 60.0) -> dict:
@@ -296,19 +309,57 @@ def _load_tmf_for_bar(conn, symbol, bar_time, ttl: float = 60.0) -> dict:
     vals: dict = {}
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT tmf_pc00,tmf_pc01,tmf_pc02,tmf_pc03,tmf_pc04,tmf_pc05,tmf_pc06,tmf_pc07,"
-                "tmf_trend_cont,tmf_rev_prob,tmf_vol_cycle,tmf_mtf_resonance,tmf_hist_sim "
-                "FROM hcm_ai.timesfm_features "
-                "WHERE symbol=%s AND time_frame='M5' AND tmf_version=%s AND bar_time=%s",
-                (symbol, _TMF_VERSION, bt),
-            )
+            if _TMF_ASOF:
+                # as-of：取"截至当前 bar"最近的一行（含 bar_time 以便判年龄）
+                cur.execute(
+                    "SELECT bar_time, tmf_pc00,tmf_pc01,tmf_pc02,tmf_pc03,tmf_pc04,tmf_pc05,"
+                    "tmf_pc06,tmf_pc07,tmf_trend_cont,tmf_rev_prob,tmf_vol_cycle,"
+                    "tmf_mtf_resonance,tmf_hist_sim "
+                    "FROM hcm_ai.timesfm_features "
+                    "WHERE symbol=%s AND time_frame='M5' AND tmf_version=%s AND bar_time<=%s "
+                    "ORDER BY bar_time DESC LIMIT 1",
+                    (symbol, _TMF_VERSION, bt),
+                )
+            else:
+                cur.execute(
+                    "SELECT bar_time, tmf_pc00,tmf_pc01,tmf_pc02,tmf_pc03,tmf_pc04,tmf_pc05,"
+                    "tmf_pc06,tmf_pc07,tmf_trend_cont,tmf_rev_prob,tmf_vol_cycle,"
+                    "tmf_mtf_resonance,tmf_hist_sim "
+                    "FROM hcm_ai.timesfm_features "
+                    "WHERE symbol=%s AND time_frame='M5' AND tmf_version=%s AND bar_time=%s",
+                    (symbol, _TMF_VERSION, bt),
+                )
             r = cur.fetchone()
             if r:
-                for c, v in zip(TMF_FEATURE_COLS, r):
-                    vals[c] = float(v) if v is not None else 0.0
+                _stale = False
+                if _TMF_ASOF:
+                    try:
+                        _row_bt = _as_naive_utc(r[0])
+                        _age_min = (bt - _row_bt).total_seconds() / 60.0 if _row_bt else None
+                        if _age_min is not None and _age_min > _TMF_MAX_AGE_MIN:
+                            _stale = True  # 陈旧特征 → 降级 0（与训练缺省一致）
+                    except Exception:
+                        _stale = False
+                if _stale:
+                    _TMF_STATS["stale"] += 1
+                    vals = {}
+                else:
+                    for c, v in zip(TMF_FEATURE_COLS, r[1:]):
+                        vals[c] = float(v) if v is not None else 0.0
     except Exception:
         pass
+    _TMF_STATS["hit" if vals else "miss"] += 1
+    # 观测：每 10 分钟打印一次命中率（"tmf 是否真的在生效"此前完全不可度量）
+    if (_now - _TMF_STATS["logged_at"]) > 600.0:
+        _tot = max(1, _TMF_STATS["hit"] + _TMF_STATS["miss"] + _TMF_STATS["stale"])
+        try:
+            print("[tmf] hit=%d miss=%d stale=%d 非零率=%.1f%% asof=%s max_age=%.0fmin"
+                  % (_TMF_STATS["hit"], _TMF_STATS["miss"], _TMF_STATS["stale"],
+                     100.0 * _TMF_STATS["hit"] / _tot, _TMF_ASOF, _TMF_MAX_AGE_MIN),
+                  file=sys.stderr)
+        except Exception:
+            pass
+        _TMF_STATS["logged_at"] = _now
     _TMF_CACHE["bar_time"] = bt
     _TMF_CACHE["vals"] = vals
     _TMF_CACHE["at"] = _now
@@ -325,7 +376,10 @@ REDIS_URL_DEFAULT = "redis://127.0.0.1:6379"
 # 0.0=完全用 raw 概率、1.0=完全信校准（即恒定常数）。默认 0.5 兼顾排序与分辨率。
 CALIB_BLEND_W = 0.5
 # 校准器唯一输出档位数低于此值即判定退化（由 ai.lm.calib_min_levels 覆盖）
-CALIB_MIN_LEVELS = 4
+# 【2026-09-08 审计修复 P1】4 → 8：与训练侧 train_signal_quality.CALIB_MIN_LEVELS
+# 及生产配置 ai.lm.calib_min_levels=8 统一（此前 4 会让 5 档的粗阶梯校准器被判
+# 健康，实测把 c_ai 压成 5 个取值、AI 闸门失能）。
+CALIB_MIN_LEVELS = 8
 
 # 与 quality_features.py / 训练一致的固定特征顺序（模型训练时所用列）
 # 【阶段2·数据契约单一真值】FEATURE_COLS 现来自 _model_feature_cols.MODEL_FEATURE_COLS。
@@ -728,6 +782,28 @@ def _cached_slow(key: str, ttl_sec: float, fn):
     return val
 
 
+def _redis_now(r) -> float:
+    """统一时钟：取 Redis 服务器时间（秒，浮点）作为 ts 产出源。
+
+    【跨时钟根因修复 2026-09-09】sidecar 运行在【宿主机】，而消费侧 scheduler 运行在
+    Docker【容器】内，二者系统时钟存在偏移（实测：容器比宿主机快 38s）。
+    若 sidecar 用宿主机 time.time() 写 ts，scheduler 用容器 time.time() 算
+    `_age = time.time() - float(_ts)`（scheduler.py:844），得到的是【虚假陈旧度】：
+      · 容器偏快 → age 虚高。漂移一旦超过 ai.lm.max_age_sec(默认 60s)，AI 被静默
+        判定为“缺失”，quality_gate 透传纯 HEXP —— AI 闸门整体失效且几乎无声
+        （只有一行 info 日志）。
+      · 容器偏慢 → age 为负 → `age > max_age` 恒假 → 新鲜度保护彻底失效；
+        sidecar 真死也会一直用死前的旧分裁决。
+    故 ts 一律改由 Redis 服务器时间产出：消费侧本就读同一个 Redis，二者同钟。
+    Redis 不可用时退化为宿主机时间（不会静默：下游会因 age 异常被观测到）。
+    """
+    try:
+        sec, usec = r.time()
+        return float(sec) + float(usec) / 1e6
+    except Exception:
+        return time.time()
+
+
 def _h1_features(conn, symbol: str) -> dict:
     """PG H1 K线 → h1_adx / h1_trend_strength / h1_trend_dir（Wilder DX 14 平滑 + 趋势态）。
 
@@ -753,7 +829,17 @@ def _h1_features(conn, symbol: str) -> dict:
     mdi = kl["minus_di"].astype(float)
     dx = 100.0 * (pdi - mdi).abs() / (pdi + mdi).replace(0, float("nan"))
     adx = dx.ewm(alpha=1 / 14, adjust=False).mean().iloc[-1]
-    _out = {"h1_trend_dir": h1_trend_dir_at(kl, pd.Timestamp.now(tz="UTC"))}
+    # 【2026-09-09 修复·训练/推理同源】h1_trend_dir 必须用【已收盘】H1 棒。
+    # PG 会写入"形成中"的当前 H1 棒（实测 13:44 时仍存在 open_time=13:00 的未收盘棒），
+    # 而 _bar_at_or_before 仅按 open_time <= ts 定位、并不过滤未收盘棒
+    # （其 docstring 声称返回"已收盘 bar"，实现并未兑现）→ 推理侧取到盘中未定型值：
+    #   · 与训练侧（历史回放、全为已收盘棒）不同源 → train/serve skew；
+    #   · 该值棒内随 tick 漂移，可在一小时内反复翻转 → 方向头/价值头输入抖动。
+    # 此处仅剔除未收盘棒（不动共享函数，避免波及训练侧）。
+    _now_h1 = pd.Timestamp.now(tz="UTC")
+    _kl_closed = kl[kl["open_time"] + pd.Timedelta(hours=1) <= _now_h1]
+    _out = {"h1_trend_dir": h1_trend_dir_at(
+        _kl_closed if not _kl_closed.empty else kl, _now_h1)}
     if not pd.isna(adx):
         _out["h1_adx"] = float(adx)
         _out["h1_trend_strength"] = float(adx) / 100.0
@@ -1035,6 +1121,51 @@ except Exception as _rev_imp_err:      # 缺模块不得拖垮主链路
     _rev_assemble = _rev_build_indicators = None
     print(f"[warn] reversal_features import failed: {_rev_imp_err}", file=sys.stderr)
 
+# ── Step-2.4【前瞻价值头·影子观测 2026-09-05】──────────────────────────────
+# value_score = 顺向 E[R] 期望（全网格"路径价值"回归模型 v1）。纯观测发布到
+# hcm:live:hexp:ai:*，绝不参与任何下单决策；world=0（无趋势世界）不评价值。
+# 开关：ai.lm.value_enabled（默认关；开启即发布观测，无实盘副作用）。
+_value_booster = None
+_value_loaded = False
+_value_last_ts = 0.0
+_value_last_out = None
+_VALUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "models", "lgbm_value_v1.txt")
+_VALUE_TTL = 60.0
+
+
+def _value_poll(conn, symbol, r):
+    """节流 60s 计算前瞻价值分；开关关/模型缺失/异常 → None（安全降级，绝不阻塞主循环）。"""
+    global _value_booster, _value_loaded, _value_last_ts, _value_last_out
+    try:
+        _en = r.hget("hcm:config:v2", "ai.lm.value_enabled")
+        # redis-py 默认 decode_responses=False → bytes；须先 decode 再判（同 _rev_hget 教训）
+        if isinstance(_en, (bytes, bytearray)):
+            _en = _en.decode("utf-8", "ignore")
+        if not _en or str(_en).strip().lower() not in ("true", "1", "yes", "on"):
+            return None
+    except Exception:
+        return None
+    now = time.time()
+    if now - _value_last_ts < _VALUE_TTL:
+        return _value_last_out
+    try:
+        if not _value_loaded:
+            if not os.path.exists(_VALUE_PATH):
+                _value_loaded = True   # 已探测过，避免每轮 stat（后续放文件需重启才加载）
+                return None
+            import value_features as _vf_imp
+            _value_booster = _vf_imp.load_model(_VALUE_PATH)
+            _value_loaded = True
+            print(f"[info] value head loaded: {os.path.basename(_VALUE_PATH)}", file=sys.stderr)
+        import value_features as _vf
+        _value_last_out = _vf.compute(conn, symbol, _value_booster)
+        _value_last_ts = now
+        return _value_last_out
+    except Exception as _ve:
+        print(f"[warn] value head compute failed: {_ve}", file=sys.stderr)
+        return None
+
 
 def _rev_load():
     """加载反转头模型+校准器+元数据。失败置 None，_rev_tick 静默降级。"""
@@ -1204,6 +1335,9 @@ def main():
         _cfg_reloaded_at = -1e9
         _period_match = "none"
         _align_m5 = False
+        # 【2026-09-09 P1】inference_log 落库心跳间隔(秒)：值稳定时也按此间隔补写，
+        # 0 = 关闭心跳(恢复旧行为：仅值变化才写)。配置键 ai.lm.persist_heartbeat_sec。
+        _persist_hb = 60.0
         # 【阶段 1·方向头】main 作用域变量，供 _reload_cfg 内 nonlocal 绑定。
         dir_model = None
         dir_calibs = None
@@ -1252,11 +1386,15 @@ def main():
         def _reload_cfg(force=False):
             """节流热重载 ai.* 配置；返回是否真重载了。"""
             global CALIB_BLEND_W, CALIB_MIN_LEVELS, FEAT_BASELINE
+            # 【2026-09-08 审计修复 P0】TimesFM 接入开关与最大可用年龄（见 _load_tmf_for_bar
+            # 注释）：tmf_asof_enabled=false 秒级回退到原等值匹配；tmf_max_age_min 控制
+            # as-of 允许回溯的最大分钟数，超龄降级 0（防陈旧特征污染实时打分）。
+            global _TMF_ASOF, _TMF_MAX_AGE_MIN
             nonlocal _cfg_reloaded_at, _period_match, _align_m5, enabled, _ai_mode
             nonlocal _model_path, _calib_path, model, iso, _feature_audit, _health_ttl
             nonlocal state_model, state_classes, _raw_fallback
             nonlocal dir_model, dir_calibs, entry_model, entry_calib
-            nonlocal _score_zscore, _score_smooth, _min_valid, _ds_window_sec
+            nonlocal _score_zscore, _score_smooth, _min_valid, _ds_window_sec, _persist_hb
             now = time.time()
             if not force and (now - _cfg_reloaded_at) < _cfg_reload_sec:
                 return False
@@ -1292,6 +1430,9 @@ def main():
                 _score_smooth = 0.0
             CALIB_BLEND_W = _cfg_float(cfg, "ai.lm.calib_blend_w", CALIB_BLEND_W)
             CALIB_MIN_LEVELS = int(_cfg_float(cfg, "ai.lm.calib_min_levels", CALIB_MIN_LEVELS))
+            _TMF_ASOF = _bool(cfg, "ai.lm.tmf_asof_enabled", _TMF_ASOF)
+            _TMF_MAX_AGE_MIN = _cfg_float(cfg, "ai.lm.tmf_max_age_min", _TMF_MAX_AGE_MIN)
+            _persist_hb = max(0.0, _cfg_float(cfg, "ai.lm.persist_heartbeat_sec", 60.0))
             _new_model = args.model or (cfg.get("ai.lm.model_path") or "").strip() or None
             _new_calib = args.calib or (cfg.get("ai.lm.calib_path") or "").strip() or None
             # 多任务状态头模型：与质量模型同目录的 lgbm_state.pkl（灰度切换时一并切换）
@@ -1414,6 +1555,7 @@ def main():
             import traceback as _re_tb
             _re_tb.print_exc(file=sys.stderr)
         _last_key = [None]
+        _last_persist_ts = [0.0]
         while True:
             try:
                 _reload_cfg()  # 节流热重载（<=30s 一次）
@@ -1585,7 +1727,8 @@ def main():
                         "feat_missing_ratio": None,
                         "feat_constant_ratio": None,
                         "feat_outlier_ratio": None,
-                        "ts": time.time(),
+                        # 【跨时钟修复】用 Redis 服务器时间，与容器侧消费方同钟
+                        "ts": _redis_now(r),
                     }
                     # 特征健康统计需在 feats 就绪后计算（_feature_health 接受 feats dict）
                     if feats is not None:
@@ -1614,12 +1757,22 @@ def main():
                             out["degrade_streak"] = 0
                     except Exception:
                         pass
+                    # 【Step-2.4 2026-09-05 前瞻价值头·影子观测】发布 value_score（顺向 E[R]）。
+                    # 纯观测字段；不参与决策；开关 ai.lm.value_enabled 控制。
+                    try:
+                        _vv = _value_poll(conn, args.symbol.upper(), r)
+                        if _vv is not None:
+                            out["value_score"] = _vv.get("score")
+                            out["value_world"] = _vv.get("world")
+                            out["value_reason"] = _vv.get("reason")
+                    except Exception as _vv_err:
+                        print(f"[warn] value head poll failed: {_vv_err}", file=sys.stderr)
                     r.set(f"hcm:live:hexp:ai:{args.symbol.upper()}", json.dumps(out), ex=15)
                     try:
                         r.set("ai.lm.health_check", json.dumps({
                             "status": _status, "enabled": bool(enabled),
                             "mode": _ai_mode, "model_loaded": bool(model is not None),
-                            "symbol": args.symbol.upper(), "ts": time.time(),
+                            "symbol": args.symbol.upper(), "ts": _redis_now(r),
                         }), ex=_health_ttl)
                     except Exception:
                         pass
@@ -1629,9 +1782,18 @@ def main():
                     except Exception:
                         pass
                     _key = (out.get("ai_score"), out.get("total_score"), out.get("ext_factor_score"), out.get("mode"))
-                    if _key != _last_key[0]:
+                    # 【2026-09-09 P1·心跳补写】原仅"四元组变化才落库"：评分稳定期(如被钳在
+                    # 20~21 区间、total/ext 亦不变)时四元组长期不变 → 实测 21:00 后仅 1~2 条
+                    # /30min(降幅>99%)，使 inference_log 这一「重训样本源 + PSI live 基线源 +
+                    # 监控报表源」断流。现改为：值变化 或 距上次落库超过心跳间隔
+                    # (ai.lm.persist_heartbeat_sec，默认 60s，0=关闭) → 补写一条。
+                    _now_p = time.time()
+                    if _key != _last_key[0] or (
+                        _persist_hb > 0 and (_now_p - _last_persist_ts[0]) >= _persist_hb
+                    ):
                         _persist(conn, out, feats, snap)
                         _last_key[0] = _key
+                        _last_persist_ts[0] = _now_p
                     if args.once:
                         print(json.dumps(out, ensure_ascii=False))
                         break

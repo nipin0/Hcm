@@ -48,6 +48,11 @@ AI_KEYS: dict[str, Any] = {
     "ai.lm.sl_scale_enabled": True,
     "ai.lm.sl_scale_min": 0.8,
     "ai.lm.sl_scale_max": 1.5,
+    # 【2026-09-05 Step1】价值头全路径最终仲裁（value gate）：value_score(顺向 E[R])
+    # 对 HEXP/value_drive/live 全部 BUY/SELL 候选做最终闸门——逆顺向世界或同向低分
+    # (末端点位)→拦。接管原 direction_fuse 反向否决 + entry_fuse 差买点否决语义。
+    "ai.lm.value_gate_enabled": False,
+    "ai.lm.value_gate_min_score": 0.5,
 
     # DeepSeek 异步数据源（AI_DS）
     "ai.ds.enabled": False,

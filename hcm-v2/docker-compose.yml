@@ -166,11 +166,19 @@ services:
       - ./hcm-signal-tower/signal_tower/ai_async_client.py:/app/signal_tower/ai_async_client.py
       # [2026-09-04] 反转头每日绩效聚合（新文件非镜像烘焙，缺则 ModuleNotFoundError 崩溃）：绑定挂载跨 recreate 持久
       - ./hcm-signal-tower/signal_tower/rev_daily.py:/app/signal_tower/rev_daily.py
+      # [2026-09-09] RANGE 均值回归策略（新文件非镜像烘焙，缺则 scheduler 的
+      # `from signal_tower import range_strategy` 触发 ModuleNotFoundError 崩溃）：
+      # 单仓不加仓（实证：对称1:1胜率70~81%；递增摊平需66.7%而实测50~65%→负期望）。
+      # 开关 range.enabled 默认 false（影子），绑定挂载跨 recreate 持久。
+      - ./hcm-signal-tower/signal_tower/range_strategy.py:/app/signal_tower/range_strategy.py
       # [P1] 轻量 DeepSeek 客户端：供校准诊断生成自然语言报告（shared 包镜像内置，单文件挂载跨 recreate 持久）
       - ./shared/llm_client.py:/app/shared/llm_client.py
       # [2026-08-17 B7] RedisClient 封装类补 exists 方法（DeepSeek run_loop 检测触发标志依赖），
       # 同 llm_client 模式挂载使容器使用新码，跨 recreate 持久
       - ./shared/redis_client.py:/app/shared/redis_client.py
+      # [2026-09-08 审计] 指标计算：数据不足时原返回 adx=20.0（默认恰好落在"有趋势"
+      # 区间，门槛 18）→ 用假指标出单；改为返回中性值(adx=0)。挂载使修复进容器。
+      - ./hcm-signal-tower/signal_tower/indicator_calculator.py:/app/signal_tower/indicator_calculator.py
       # [2026-08-21] ConfigProviderV3.get_current（只读 current_value、不做 PG default_value
       # 兜底）：根治「和乘幂配置保存刷新又复原」。shared 包镜像内置，须单文件挂载才进容器，
       # 否则 hexp_engine/web 的 get_current 调用抛 AttributeError → 回退默认、读不到用户调优值。
@@ -237,6 +245,12 @@ services:
       # 风控配置崩溃降级 + 60s 热重载修复：配置缺失不再 raise、未加载时降级放行、改 PG 配置即生效
       - ./hcm-risk-engine/risk_engine/rule_chain.py:/app/risk_engine/rule_chain.py
       - ./hcm-risk-engine/main.py:/app/main.py
+      # [2026-09-08 审计] 启动安全自检键对齐：CRITICAL_SAFETY_KEYS 原本校验的是
+      # 僵尸键（risk_cool_minutes 等），而风控实际读 risk.cooldown_minutes /
+      # risk.max_lot_per_trade / risk.max_total_exposure / risk.max_concurrent_signals /
+      # risk.max_daily_loss / risk.margin_call_level → 真实阈值误配为 0 时自检不拦。
+      # shared 包是镜像内置的，须单文件挂载才进容器（与 signal-tower 同模式）。
+      - ./shared/redis_client.py:/app/shared/redis_client.py
       # 风控决策引擎：同向冷却(risk_cool_minutes)移出软规则改为硬规则 REJECT，绑定挂载跨 recreate 持久
       - ./hcm-risk-engine/risk_engine/decision.py:/app/risk_engine/decision.py
 
@@ -310,6 +324,9 @@ services:
       # 2026-08-29：默认关闭 copy-trading 真实下单（跟单开仓统一由跟单桥负责），
       # 同目录 stream_consumer.py 加开关 COPY_TRADING_ORDER_EXECUTION_ENABLED，挂载后 recreate 持久。
       - ./hcm-copy-trading/copy_trading/stream_consumer.py:/app/copy_trading/stream_consumer.py
+      # [2026-09-08 审计] 跟单手数：lot_mode 大小写不匹配（DB 小写 vs LotMode.*.value
+      # 大写）导致所有手数模式静默失效、恒按主号 1:1 下单。挂载使修复进容器。
+      - ./hcm-copy-trading/copy_trading/lot_calculator.py:/app/copy_trading/lot_calculator.py
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8009/health')"]
       interval: 15s

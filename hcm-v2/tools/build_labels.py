@@ -491,6 +491,38 @@ def main():
         print(f"[events] loaded {len(events)} active macro events for gap/news exclusion",
               file=sys.stderr)
         cfg = load_config(conn)
+        # 【2026-09-08 审计修复 P1】标签 R 口径 vs 实盘 SL 口径一致性校验。
+        # 标签的 R = atr × ai.lm.label_sl_atr_fallback（默认 2.0）；而实盘 SL 由 MT5 桥
+        # 按 close.<session>.trailing_stop_distance × ATR 兜底生成（会话 SL 下限）。
+        # 两者一旦漂移（运维调了会话止损却没同步标签倍率），模型学到的"R 触达"就与
+        # 真实盈亏不对齐 —— 训练-实盘口径分裂且完全无声（既不报错也不告警）。
+        # 此处显式比对：fallback 落在桥会话区间之外即告警（不阻断，仅供观测）。
+        try:
+            _sl_fb = float(cfg.get("ai.lm.label_sl_atr_fallback", 2.0))
+            with conn.cursor() as _cur:
+                _cur.execute(
+                    "SELECT config_key, current_value FROM hcm_config.metadata "
+                    "WHERE config_key LIKE 'close.%trailing_stop_distance'")
+                _rows = _cur.fetchall()
+            _vals = []
+            for _k, _v in _rows:
+                try:
+                    _vals.append(float(_v))
+                except (TypeError, ValueError):
+                    continue
+            if _vals:
+                _lo, _hi = min(_vals), max(_vals)
+                if _sl_fb < _lo - 1e-9 or _sl_fb > _hi + 1e-9:
+                    print(f"[WARN] 标签 R 口径与实盘 SL 口径不一致："
+                          f"label_sl_atr_fallback={_sl_fb} 不在桥会话止损区间 "
+                          f"[{_lo}, {_hi}]（close.*.trailing_stop_distance）→ "
+                          f"训练标签的 R 与实盘风险距离错位，模型会学到错误的盈亏口径",
+                          file=sys.stderr)
+                else:
+                    print(f"[ok] 标签 R 口径一致：fallback={_sl_fb} ∈ 会话区间 "
+                          f"[{_lo}, {_hi}]", file=sys.stderr)
+        except Exception as _ce:
+            print(f"[warn] SL 口径一致性校验跳过: {_ce}", file=sys.stderr)
         if args.r_win is not None:
             cfg["ai.lm.label_r_win"] = args.r_win
         if args.r_loss is not None:

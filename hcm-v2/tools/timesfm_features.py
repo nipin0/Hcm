@@ -93,7 +93,11 @@ TF_ORDER = ["M1", "M5", "M15", "H1"]
 DB_TIMEFRAMES = {"M1": "M1", "M5": "M5", "M15": "M15", "H1": "H1"}
 
 FEATURE_PREFIX = ["tmf_trend_cont", "tmf_rev_prob", "tmf_vol_cycle",
-                  "tmf_mtf_resonance", "tmf_hist_sim"]
+                  "tmf_mtf_resonance", "tmf_hist_sim",
+                  # 【2026-09-10】不确定度特征：从 9 分位数 q 提取（此前 q 算后被丢弃）。
+                  # 技术特征无"可预测性高低"维度，分位区间宽是 TimesFM 相对技术特征
+                  # 最正交、最可能提供增量的量。
+                  "tmf_qf_width", "tmf_qf_skew", "tmf_qf_uptail", "tmf_qf_growth"]
 
 
 def log(msg: str) -> None:
@@ -226,7 +230,10 @@ def infer_window(model, window: np.ndarray, horizon: int):
 # ══════════════════ 5 类结构化特征（§4.4 显式定义）═════════════════
 def trend_cont(close_now: float, forecast: np.ndarray, hist_std: float, h: int) -> float:
     """趋势延续得分 = tanh( (ŷ_h - c_t) / (h·σ_Δ) )  ∈[-1,1]"""
-    denom = h * (hist_std + 1e-12)
+    # 【2026-09-10 修复】随机游走下 h 步标准差 = √h·σ，而非 h·σ。
+    # 原用 h 把分母放大 √h 倍（h=12 → 3.46 倍），使 trend_cont 被过度压缩趋 0，
+    # 连带 mtf_resonance（再套 tanh）二次压缩，损失信息量。
+    denom = (h ** 0.5) * (hist_std + 1e-12)
     return float(np.tanh((forecast[h - 1] - close_now) / denom))
 
 
@@ -269,6 +276,39 @@ def hist_sim(vec: np.ndarray, lib: np.ndarray) -> float:
     v = vec / (np.linalg.norm(vec) + 1e-12)
     L = lib / (np.linalg.norm(lib, axis=1, keepdims=True) + 1e-12)
     return float(np.max(L @ v))
+
+
+def uncertainty_features(q: np.ndarray, hist_std: float) -> dict[str, float]:
+    """从分位数预测 q(horizon, 9) 提取 4 个不确定度特征（scale-free）。
+
+    q 列序 = 0.1..0.9 分位（TimesFM 默认 N_QUANTILES=9）。
+    特征（除以 σ_Δ 使量纲与金价水平无关）：
+      qf_width  : 末期 p90-p10 区间宽 / σ_Δ —— 预测不确定度（ATR 单位）
+      qf_skew   : (上尾-下尾)/全宽 ∈[-1,1] —— 上/下行风险不对称
+      qf_uptail : 上尾宽(p90-p50) / σ_Δ —— 上行风险（ATR 单位）
+      qf_growth : 早期(h/2)宽 / 末期宽 —— 不确定度在收敛(<1)还是发散(>1)
+
+    【2026-09-10】依据：技术特征(RSI/ADX/BBW)只有"当前状态"，无"可预测性高低"维度；
+    分位区间宽是 TimesFM 模型独有的不确定性信息，与技术特征正交，是相对 LightGBM
+    最可能提供正边际贡献的量。此函数只做特征提取，不做任何决策。
+    """
+    # 【2026-09-10 修复】先按步升序排序：TimesFM 返回的分位数组顺序不可假定
+    # （实测直接取 q[:,0]/q[:,4]/q[:,8] 得 skew=1.28~2.50 >1、uptail>width 的非法值，
+    # 证明列序并非 [p10..p90]）。排序后 lo/mid/hi 严格单调，保证各特征量纲合法。
+    qs = np.sort(q, axis=1)
+    lo = qs[:, 0]
+    mid = qs[:, 4]
+    hi = qs[:, 8]
+    sd = float(hist_std) + 1e-12
+    w_full = float(hi[-1] - lo[-1])
+    half = max(0, int(q.shape[0] // 2) - 1)
+    w_early = float(hi[half] - lo[half])
+    return {
+        "tmf_qf_width": w_full / sd,
+        "tmf_qf_skew": (float(hi[-1] - mid[-1]) - float(mid[-1] - lo[-1])) / (w_full + 1e-12),
+        "tmf_qf_uptail": float(hi[-1] - mid[-1]) / sd,
+        "tmf_qf_growth": w_early / (w_full + 1e-12),
+    }
 
 
 # ══════════════════ PCA（§4.3：仅训练期拟合）═════════════════
@@ -569,6 +609,8 @@ def cmd_extract(args) -> None:
                 "tmf_mtf_resonance": mtf_resonance(conts),
                 "tmf_hist_sim": hist_sim(pooled, lib_vecs),
             }
+            # 【2026-09-10】注入 4 个不确定度特征（q 此前被算后丢弃）
+            row.update(uncertainty_features(q, hist_std))
             for k in range(pca.n_components_):
                 row[f"tmf_pc{k:02d}"] = float(pc[k])
             rows.append(row)
@@ -631,6 +673,13 @@ def write_rows(conn, rows: list[dict], create_table: bool) -> None:
                 );
             """)
             conn.commit()
+        # 【2026-09-10】列迁移：给【已存在】的表补新增特征列（如 tmf_qf_*）。
+        # CREATE TABLE IF NOT EXISTS 不会为已存在表加列，缺列会使下方 INSERT 失败。
+        for _mc in (pc_keys + FEATURE_PREFIX):
+            cur.execute(
+                f"ALTER TABLE hcm_ai.timesfm_features "
+                f"ADD COLUMN IF NOT EXISTS {_mc} DOUBLE PRECISION")
+        conn.commit()
         ph = ", ".join(["%s"] * len(cols))
         collist = ", ".join(cols)
         upd = ", ".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in

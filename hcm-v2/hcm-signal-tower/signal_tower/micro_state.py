@@ -205,7 +205,16 @@ class MicroStateClassifier:
 
         # ── 加速度严格判定（横盘防御：效率比 + 净位移，不依赖 ADX）──
         _er = self._efficiency_ratio(_closes, self._accel_lookback)
-        _disp_atr = abs((_closes[-1] - _closes[0]) / _atr) if len(_closes) >= 2 else 0.0
+        # 【2026-09-08 审计修复 P1】净位移窗口错位：`_closes[0]` 取的是 recent_closes
+        # **首元素**（固定 50 根窗口，见 indicator_calculator 196），而设计口径是
+        # `_accel_lookback`（默认 12）→ 实测量级约为设计值的 2~4 倍，
+        # `_disp_atr >= _accel_disp_atr_min` 几乎恒真 → "横盘防御"（防每根 M5 都下单）
+        # 完全失效。改为与效率比 _er 同窗口（最近 accel_lookback 根）。
+        _disp_idx = -(self._accel_lookback + 1)
+        _disp_atr = (
+            abs((_closes[-1] - _closes[_disp_idx]) / _atr)
+            if len(_closes) >= self._accel_lookback + 1 else 0.0
+        )
         _new_extreme = self._new_extreme(_closes, _trend_dir)
         _real_accel = (
             (not _last_bar_against)

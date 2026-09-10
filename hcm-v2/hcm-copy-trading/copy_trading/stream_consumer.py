@@ -407,8 +407,14 @@ class CopyTradingStreamConsumer:
             )
             return not was_set  # True = already existed = duplicate
         except Exception as exc:
-            logger.warning("Dedup check failed for signal_id=%s: %s", signal_id, exc)
-            return False
+            # 【2026-09-08 审计修复 P1】原实现异常时返回 False（判为"非重复"）→
+            # Redis 抖动时去重失效，与 _mark_processed 写失败叠加会导致同一信号
+            # 重复跟单开仓。去重属安全护栏，故障侧应选"当作已处理"（fail-closed）。
+            logger.error(
+                "Dedup check failed for signal_id=%s: %s — treat as DUPLICATE "
+                "(fail-closed, 防重复跟单)", signal_id, exc,
+            )
+            return True
 
     async def _mark_processed(self, signal_id: int) -> None:
         """Ensure a signal is marked as processed in dedup set.
@@ -421,8 +427,14 @@ class CopyTradingStreamConsumer:
         try:
             dedup_key = f"{DEDUP_KEY_PREFIX}:{signal_id}"
             await self._redis.raw.setex(dedup_key, self._config.dedup_ttl, "1")
-        except Exception:
-            pass
+        except Exception as exc:
+            # 【2026-09-08 审计修复 P1】原为 `except: pass`：标记写不进去时调用方
+            # 无从感知，崩溃重启后 _recover_pending 重投会二次执行（重复开仓）。
+            # 改为 CRITICAL 可观测（此处不改 ACK 语义，避免影响正常吞吐）。
+            logger.critical(
+                "Mark processed FAILED for signal_id=%s: %s — 重启重投可能重复跟单",
+                signal_id, exc,
+            )
 
     # ── Copy Config Loading ─────────────────────
 

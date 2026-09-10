@@ -36,6 +36,31 @@ DB_FAIL_CLOSED_COUNT = 9999      # 持仓数 → 触发限仓拒绝
 DB_FAIL_CLOSED_LOT = 99999.0     # 总手数 → 触发限仓拒绝
 DB_FAIL_CLOSED_LOSS = -99999.0   # 日亏   → 触发熔断
 
+# ── 【2026-09-08 审计修复 P0】Redis Stream 布尔字段统一解析 ──────────────
+# Redis Stream 的 field value 只能是字符串：Python bool 写入后被编码为
+# "True"/"False"，消费侧裸用 bool() 时 bool("False") is True（非空字符串恒真）
+# → 所有信号都被当成 True：
+#   · extreme_pending 恒真 → 每条信号都进极值追单分支，suggested_lot_ratio 被
+#     无条件 ×0.5，且该分支 DB 不可达时 fail-closed 全量拒单（与正常路径
+#     fail-open 语义相反，DB 抖动即全局拒单）；
+#   · reverse_order 恒真 → 反向单护栏误伤正常开仓单。
+# 解析一律走本函数，禁止再裸用 bool(...) 解析 stream 字段。
+def _as_bool(v: Any, default: bool = False) -> bool:
+    """把 Redis Stream 里的布尔字段（str/int/bool）安全解析为 bool。"""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off", ""):
+        return False
+    return default
+
+
 # ── Rule result types ──────────────────────────
 
 
@@ -274,7 +299,7 @@ class RuleChain:
         # 保本（利润垫）才放行 + 轻仓（×0.5）；否则拒绝（防盲目接刀）。
         # 复用与 _check_cooldown 同口径的 BE 真值源（Redis 标志 / PG positions），
         # DB 不可达 → fail-closed 拒绝（从严，防接刀）。
-        _rro = bool(signal_data.get("reverse_order", False))
+        _rro = _as_bool(signal_data.get("reverse_order", False))
         if _rro:
             r = await self._check_reverse_order(signal_data)
             result.results.append(r)
@@ -310,15 +335,21 @@ class RuleChain:
         Returns:
             RuleResult for risk_min_confidence.
         """
-        confidence = float(signal_data.get("confidence", 0))
-        passed = confidence >= self._min_confidence
+        confidence = float(signal_data.get("confidence", 0) or 0.0)
+        # 【2026-09-08 审计修复 P0】0–100 与 0–1 制混用 → 置信度闸恒过。
+        # scheduler 下发的是 scorecard_total（**0–100 制**，实测 46.25/62/…），而
+        # risk_min_confidence 是 0–1 制（0.10）。原实现直接比较：46.25 >= 0.10 恒真
+        # → 该闸门从未拦过任何信号。归一到 0–1 后再比较（与 _apply_dynamic_lot
+        # 中 `if score > 1.0: score /= 100` 同口径，避免两处阈值语义分裂）。
+        conf_norm = confidence / 100.0 if confidence > 1.0 else confidence
+        passed = conf_norm >= self._min_confidence
         return RuleResult(
             rule_name="risk_min_confidence",
             passed=passed,
-            actual_value=confidence,
+            actual_value=conf_norm,
             threshold=self._min_confidence,
-            message=f"Confidence {confidence:.2f} >= {self._min_confidence:.2f}" if passed
-            else f"Confidence {confidence:.2f} < {self._min_confidence:.2f}",
+            message=f"Confidence {conf_norm:.4f} >= {self._min_confidence:.4f}" if passed
+            else f"Confidence {conf_norm:.4f} < {self._min_confidence:.4f}",
         )
 
     def _check_max_single_lot(self, signal_data: dict) -> RuleResult:
@@ -566,7 +597,7 @@ class RuleChain:
         #   与 575+ 同口径），不再直接拒单——修复"账户已保本但 BE 标志过期(TTL15s)/Redis
         #   抖动 → 极值追单被误拒（出信号不下单）"。仅当 PG 也确认未保本/无持仓/sl 未知/
         #   DB 不可达（无法确认保本）才拒绝（防接刀，从严 fail-closed）。
-        _extreme_pending = bool(signal_data.get("extreme_pending", False))
+        _extreme_pending = _as_bool(signal_data.get("extreme_pending", False))
         if _extreme_pending and direction in ("BUY", "SELL"):
             _account_be = False
             _be_source = "redis"
@@ -868,13 +899,6 @@ class RuleChain:
             message=f"reverse_order: 账户同向已保本(BE源={_be_source})，放行 + 轻仓×0.5",
         )
 
-
-    async def mark_cooldown(self, signal_data: dict) -> None:
-        """【已废弃·2026-08-03】同向闸门已改为「同向保本闸门」（见 _check_cooldown），
-        不再使用 Redis 时间窗键。此方法保留仅为兼容 stream_consumer 的调用点，
-        不再写入任何冷却键。
-        """
-        return
 
     # ── Database Helpers ────────────────────────
 

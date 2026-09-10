@@ -113,6 +113,13 @@ def load_signals(conn, mode: str) -> pd.DataFrame:
               "h1_regime", "h1_trend_direction", "h1_trend_strength"]:
         df[k] = ind.apply(lambda d, _k=k: d.get(_k))
     df["ai_sl_mult"] = ind.apply(lambda d: (d.get("_collab") or {}).get("ai_sl_mult"))
+    # 【2026-09-08 审计修复 P1】verdict 取引擎落库真值（供训练优先采用）：
+    # 推理侧 build_features 读的是 hexp **实时** snap["verdict"]，由带迟滞的状态机产出
+    # （exit_score=40 + confirm_enter 连续确认）；而本脚本 _compute_verdict 是**无状态
+    # 快照近似**（MTF_EXIT_TS=35、无迟滞）→ 同一时刻两侧值系统性不同，训练分布≠线上
+    # 分布（模型学到线上不存在的 verdict）。引擎落库值与推理同源，优先采用。
+    df["verdict_engine"] = ind.apply(
+        lambda d: (d.get("_hexp") or {}).get("verdict", d.get("verdict")))
     df["suggested_lot_ratio"] = ind.apply(lambda d: (d.get("_collab") or {}).get("suggested_lot_ratio"))
     for c in ["adx_14", "rsi_14", "macd", "atr_14", "h1_adx", "h1_trend_strength",
               "ai_sl_mult", "suggested_lot_ratio"]:
@@ -746,7 +753,18 @@ def main():
             # 与 hexp_engine 第 6 步同构近似；HEXP+live_override 全覆盖（落库 verdict 仅 HEXP 有）。
             # 推理侧 build_features 直接读 hexp 实时 snap["verdict"]（同源），两侧分布一致。
             _mtf = klines_mtf.get(r["symbol"], {})
-            row["verdict"] = _compute_verdict(_mtf, kl, r["created_at"])
+            # 【2026-09-08 审计修复 P1】优先用引擎落库 verdict（推理同源真值），
+            # 缺失时（live_override 等未落 _hexp 的模式）才回退离线无状态重算。
+            _eng_v = r.get("verdict_engine")
+            try:
+                _eng_v = (float(_eng_v) if _eng_v is not None
+                          and str(_eng_v).lower() != "nan" else None)
+            except (TypeError, ValueError):
+                _eng_v = None
+            if _eng_v is not None:
+                row["verdict"] = _eng_v
+            else:
+                row["verdict"] = _compute_verdict(_mtf, kl, r["created_at"])
             # 【2026-09-02 h1_trend_dir 特征注入】H1 主趋势方向(±1/0)：供方向头真正感知
             # "H1 主趋势"，使趋势对齐标签(dir_trend_align)可被模型学习(否则无 H1 输入，
             # 模型无法区分"H1 UP 回调" vs "震荡顶反转"→ 超买仍判 SELL)。

@@ -40,6 +40,12 @@ const fields: ConfigField[] = [
   { key: 'trail_start_atr_mult', label: '移动止盈启动 (ATR 倍数)', type: 'number', defaultValue: 3.0, min: 1.0, max: 8, step: 0.5, description: '盈利 > ATR × 此倍数后才启动移动止盈；此前仅保本保护' },
   { key: 'trail_wide_atr_mult', label: '移动止盈回撤距离 (ATR 倍数)', type: 'number', defaultValue: 1.5, min: 0.1, max: 4, step: 0.05, description: 'SL 始终距当前价 ATR × 此倍数；越小跟得越紧/回撤越小' },
 
+  // ── Group 4.5: 同向尾单止损（2026-09-04，青）──
+  { type: 'section', key: '_s45', label: '同向尾单止损', color: '#14b8a6', description: '同向保本后继续加仓场景：最新一笔加仓单（尾单）开仓浮亏超阈值 → 全平该同向组，落袋前面保本单的小利，防「尾单反转大止损 + 前单保本小利」整体转亏。' },
+  { key: 'tail_stop_enabled', label: '启用同向尾单止损', type: 'switch', defaultValue: true, description: '同 (品种,方向) 组 ≥2 仓且 ≥1 笔已保本时才生效' },
+  { key: 'tail_stop_atr_mult', label: '尾单止损触发 (ATR 倍数)', type: 'number', defaultValue: 0.5, min: 0.1, max: 3, step: 0.05, description: '最新加仓单浮亏 > ATR × 此倍数 → 全平该同向组（保本单小利落袋）' },
+  { key: 'tail_stop_cooldown_sec', label: '触发后冷却 (秒)', type: 'number', defaultValue: 60, min: 0, max: 3600, step: 1, description: '全平触发后该组 N 秒内不重复触发（0=关闭冷却）' },
+
   // ── Group 5: 总仓位移动止盈（左下，紫）──
   { type: 'section', key: '_s5', label: '总仓位移动止盈', color: '#a855f7', description: '所有持仓合计盈利达到阈值后启动整体跟踪，回撤到保护线时全部平仓' },
   { key: 'total_trail_enabled', label: '启用总仓位移动止盈', type: 'switch', defaultValue: false },

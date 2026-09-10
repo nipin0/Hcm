@@ -30,6 +30,13 @@ LIVE_BASELINE_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "models", "live_baseline.json"
 )
 
+# 【2026-09-08 审计修复 P1】退化(常量/低方差)特征登记表。
+# feature_psi 对这类特征返回 0（PSI 语义：无可漂移性），但 0 会被误读为"健康"——
+# 实际上它意味着"该特征线上无信息"，是最严重的 train-serve skew 形态
+# （实例：13 维 tmf_* 线上恒 0 长期未被任何监控发现）。此处登记 + 由
+# compute_psi_batch 以 `degenerate` 键输出，使"无信息"与"无漂移"可区分。
+DEGENERATE_FEATURES: set = set()
+
 # 低基数/类别特征阈值：distinct ≤ 此值的特征改用"按类别 PSI"而非分位 PSI。
 # 分位 PSI 对 binary/少值特征会产生巨大假象(8/10 箱为空→每空箱贡献~0.69)。
 LOW_CARD_MAX = 10
@@ -104,17 +111,25 @@ def load_baseline(path: str = DEFAULT_BASELINE) -> dict:
         return json.load(f)
 
 
-def feature_psi(actual, deciles) -> float:
+def feature_psi(actual, deciles, name: str | None = None) -> float:
     """单特征 PSI。deciles: 9 个分位边(p10~p90)。分箱[-inf,d1..d9,+inf]→10箱，期望各10%。
 
     退化特征(基线分位边无跨度 / live 常量)→ 全落单箱 → PSI≈8.28 永远触发；
     但常量无可漂移性，故返回 0。P3-B 根治 2026-08-22。
+
+    【2026-09-08 审计修复 P1】返回值仍为 0（不改变调用方阈值语义），但会把特征名
+    登记进 DEGENERATE_FEATURES：原实现把"常量/低方差"与"无漂移"混为一谈 →
+    线上恒 0 的特征（如 13 维 tmf_* 长期恒 0）在漂移监控里显示为"健康"，
+    这类最严重的 train-serve skew 完全不可见。登记后由 compute_psi_batch 输出
+    `degenerate` 列表，供 auto_retrain / monitoring_report 打印告警。
     """
     arr = np.asarray(actual, dtype=float)
     if arr.size == 0:
         return 0.0
     d = np.asarray(deciles, dtype=float)
     if np.ptp(d) < 1e-9 or np.nanstd(arr) < 1e-9:
+        if name is not None:
+            DEGENERATE_FEATURES.add(str(name))
         return 0.0
     edges = np.concatenate(([-np.inf], d, [np.inf]))
     # 【2026-08-31 修复·PSI 假漂移】deciles 退化守卫:若分位边大量重合(相邻边
@@ -180,10 +195,14 @@ def compute_psi_batch(features_df, baseline: dict, features: List[str] = None) -
         if feat in cat_props:
             result[feat] = feature_psi_categorical(col, cat_props[feat])
         elif feat in deciles:
-            result[feat] = feature_psi(col, deciles[feat])
+            result[feat] = feature_psi(col, deciles[feat], name=feat)
         # 既不在 cat_props 也不在 deciles（如训练基线缺该特征）→ 跳过
+    # 【2026-09-08 审计修复 P1】退化(常量/低方差)特征单独输出：这些特征 PSI 恒 0
+    # 并不代表健康，而是"线上根本没有信息"（典型：tmf_* 恒 0）。调用方据此告警。
+    _degenerate = sorted(DEGENERATE_FEATURES & set(result.keys()))
     if not result:
-        return {"per_feature": {}, "max": 0.0, "mean": 0.0, "drifted": []}
+        return {"per_feature": {}, "max": 0.0, "mean": 0.0, "drifted": [],
+                "degenerate": _degenerate}
     vals = list(result.values())
     drifted = [k for k, v in result.items() if v > 0.25]
     return {
@@ -191,4 +210,5 @@ def compute_psi_batch(features_df, baseline: dict, features: List[str] = None) -
         "max": float(max(vals)),
         "mean": float(np.mean(vals)),
         "drifted": drifted,
+        "degenerate": _degenerate,
     }

@@ -53,10 +53,24 @@ LOG_BACKUPS = 3
 # 保证"昨日"整日 K 线已入库完毕。
 DEFAULT_AT_HOUR = 21
 DEFAULT_AT_MINUTE = 30
-DEFAULT_CHECK_INTERVAL_MIN = 30
+# 【2026-09-08】30 → 15：本间隔同时是"滚动抽取"的执行周期。滚动抽取服务线上
+# 推理（as-of），特征年龄必须小于 quality_scorer 的 tmf_max_age_min(30 分钟)；
+# 原 30 分钟间隔会让最坏年龄恰好触到 30 分钟边界（时好时坏被判 stale），
+# 收紧到 15 分钟后 as-of 年龄 ≤ 15 分钟，稳定落在窗口内。
+DEFAULT_CHECK_INTERVAL_MIN = 15
 DEFAULT_OVERLAP_DAYS = 2     # 回看天数：容忍跨日/停机导致的漏抽
 DEFAULT_FALLBACK_START = "2026-08-10"   # 库里查不到水位线时的兜底起点
 DEFAULT_TIMEOUT_MIN = 240    # 单次抽取超时（整批 861 条约 18 分钟，留足余量）
+# ── 【2026-09-08 审计修复 P0】滚动抽取 ──────────────────────────────────
+# TimesFM 原本只在"历史 HEXP 信号时刻"抽取（--at-signal-times，服务训练），
+# 覆盖率约 12% 且 T+1 产出 → 线上 quality_scorer 的 as-of 取到的行往往已陈旧
+# 数小时，被 tmf_max_age_min(30) 判为 stale 降级 0 → 13 维 tmf_* 线上恒 0，
+# 而训练侧有真值 = 典型 train-serve skew。实测这些特征与胜负相关性很强
+# （tmf_pc00 r=0.449 / tmf_mtf_resonance r=0.469 / tmf_trend_cont r=0.349,
+# n=187）→ 值得让它们在线上真正生效。故按调度间隔滚动抽取最近窗口。
+DEFAULT_ROLLING_ENABLED = True
+DEFAULT_ROLLING_LOOKBACK_MIN = 60   # 每次抽取回看分钟数（需 ≥ 调度间隔）
+DEFAULT_ROLLING_TIMEOUT_MIN = 20    # 滚动抽取超时（约 12 根 bar，数十秒）
 
 # 「没有新活」的良性退出：脚本以 SystemExit 抛出，属预期情况而非故障
 BENIGN_MARKERS = (
@@ -184,8 +198,12 @@ def resolve_start(overlap_days: int, fallback_start: str) -> str:
         return fallback_start
 
 
-def build_cmd(start: str, end: str) -> list[str]:
-    """构造抽取命令（参数与历史整批严格一致，否则 embedding 分布不同 → 特征不可比）。"""
+def build_cmd(start: str, end: str, at_signal_times: bool = True) -> list[str]:
+    """构造抽取命令（参数与历史整批严格一致，否则 embedding 分布不同 → 特征不可比）。
+
+    at_signal_times=False 用于【滚动抽取】：抽取窗口内的**全部 M5 bar**（而非仅
+    HEXP 信号时刻），供线上推理 as-of 消费（见 run_rolling_once 注释）。
+    """
     cmd = [
         sys.executable, SCRIPT,
         "--extract",
@@ -196,24 +214,26 @@ def build_cmd(start: str, end: str) -> list[str]:
         "--pca", PCA_FILE,
         "--pca-dim", str(PCA_DIM),
         "--embed-norm", EMBED_NORM,
-        "--at-signal-times",
         "--lib-cache", LIB_CACHE,
         "--start", start,
         "--end", end,
     ]
+    if at_signal_times:
+        cmd.append("--at-signal-times")
     if NORMALIZE_INPUTS:
         cmd.append("--normalize-inputs")
     return cmd
 
 
-def run_extraction(start: str, end: str, timeout_min: int) -> tuple[bool, str]:
+def run_extraction(start: str, end: str, timeout_min: int,
+                   at_signal_times: bool = True) -> tuple[bool, str]:
     """执行一次增量抽取。返回 (是否成功, 结果摘要)。
 
     fail-open 语义：只有「抽取失败」才返回 False；「无新信号」属正常，返回 True。
     """
     if start >= end:
         return True, f"no-new-window (start={start} >= end={end})"
-    cmd = build_cmd(start, end)
+    cmd = build_cmd(start, end, at_signal_times=at_signal_times)
     log(f"run: start={start} end={end} timeout={timeout_min}min")
     log(f"cmd: {' '.join(cmd)}")
     # 子进程 stdout 走管道时，Windows 按 locale(GBK) 编码而非 UTF-8，
@@ -246,6 +266,28 @@ def run_extraction(start: str, end: str, timeout_min: int) -> tuple[bool, str]:
     for line in err.splitlines()[-8:]:
         log(f"  ! {line}")
     return False, f"FAILED rc={p.returncode}"
+
+
+def run_rolling_once(lookback_min: int, timeout_min: int) -> None:
+    """【2026-09-08 审计修复 P0】滚动抽取"最近 lookback 分钟内的全部 M5 bar"。
+
+    与每日整批（--at-signal-times，服务训练）互补：本函数服务**线上推理**，
+    让 quality_scorer 的 as-of 始终能取到"年龄 ≤ 调度间隔"的新鲜特征。
+    写入侧是 UPSERT（ON CONFLICT DO UPDATE），重复抽取幂等、无副作用。
+    与每日抽取共用 EXTRACT 互斥锁，不会并发写同表/同 npz。
+    """
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(minutes=lookback_min)).strftime("%Y-%m-%d %H:%M")
+    end = now.strftime("%Y-%m-%d %H:%M")
+    lock = _acquire_mutex(MUTEX_EXTRACT)
+    if lock is None:
+        log("rolling: another extraction in progress — skip this round")
+        return
+    try:
+        ok, summary = run_extraction(start, end, timeout_min, at_signal_times=False)
+        log(f"rolling extract: ok={ok} window=[{start} .. {end}] summary={summary}")
+    finally:
+        _release_mutex(lock, MUTEX_EXTRACT)
 
 
 def trigger_retrain(timeout_min: int = 120) -> tuple[bool, str]:
@@ -294,6 +336,12 @@ def main() -> None:
     ap.add_argument("--overlap-days", type=int, default=DEFAULT_OVERLAP_DAYS)
     ap.add_argument("--fallback-start", default=DEFAULT_FALLBACK_START)
     ap.add_argument("--timeout-min", type=int, default=DEFAULT_TIMEOUT_MIN)
+    ap.add_argument("--rolling-lookback-min", type=int,
+                    default=DEFAULT_ROLLING_LOOKBACK_MIN,
+                    help="滚动抽取回看分钟数（服务线上推理，需 ≥ 调度间隔）")
+    ap.add_argument("--no-rolling", dest="rolling_enabled", action="store_false",
+                    default=DEFAULT_ROLLING_ENABLED,
+                    help="关闭滚动抽取（退回仅每日信号时刻抽取，线上 tmf 恒 0）")
     # 回填专用：指定起点/终点，忽略水位线
     ap.add_argument("--force-start", default=None)
     ap.add_argument("--force-end", default=None)
@@ -353,6 +401,14 @@ def main() -> None:
                 heartbeat(status, {"mode": "daemon", "summary": summary,
                                    "last_run": last_run_date})
             else:
+                # 【2026-09-08】滚动抽取（服务线上推理）：与每日整批共用 EXTRACT 锁，
+                # 异常一律吞掉，绝不影响调度器存活与每日整批。
+                if getattr(args, "rolling_enabled", True):
+                    try:
+                        run_rolling_once(args.rolling_lookback_min,
+                                         DEFAULT_ROLLING_TIMEOUT_MIN)
+                    except Exception as _re:  # noqa: BLE001
+                        log(f"[daemon] rolling extract error (non-fatal): {_re}")
                 heartbeat("IDLE", {"mode": "daemon", "last_run": last_run_date,
                                    "next_due": f"{args.at_hour:02d}:{args.at_minute:02d}Z"})
         except Exception as e:  # noqa: BLE001

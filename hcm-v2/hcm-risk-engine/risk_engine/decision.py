@@ -151,9 +151,24 @@ class DecisionEngine:
                 "risk_max_lot_single",
                 "risk_max_total_lot",
                 "risk_max_open_positions",
-                "risk_max_daily_loss",
                 "risk_max_spread_pips",
             }
+
+            # 【2026-09-08 审计修复 P1】risk_max_daily_loss 不属于 upper-bound 语义：
+            # rule_chain 里 actual_value = 当日 realized_pnl（**负=亏损、正=盈利**），
+            # threshold = 允许亏损额(正数)。原实现 `actual>0 → ratio=actual/threshold`
+            # 恰好判反：盈利 +500/200=2.5 → 误判"接近熔断"触发 DEGRADE；
+            # 而真正亏损(actual<0)被 `actual>0` 过滤掉 → 接近亏损上限反而不预警。
+            # 改为按"亏损额占阈值比例"判定，盈利日不参与。
+            if r.rule_name == "risk_max_daily_loss":
+                _loss = -min(float(r.actual_value or 0.0), 0.0)  # 亏损取正、盈利归 0
+                if _loss > 0 and r.threshold > 0:
+                    _ratio = _loss / float(r.threshold)
+                    if _ratio >= DEGRADE_WARN_RATIO:
+                        near_rules.append(
+                            f"{r.rule_name}: 亏损 {_loss:.2f}/{r.threshold} ({_ratio:.0%})"
+                        )
+                continue
 
             if r.rule_name in upper_bound_rules and r.actual_value > 0:
                 ratio = r.actual_value / r.threshold

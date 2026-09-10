@@ -14,6 +14,10 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+# MT5 pos.time 是经纪商服务器时间（实测比 UTC 快 3h），必须经统一入口校正后再写库，
+# 否则 open_time 偏大 3h → 与 close_time(真值) 倒挂。详见 _mt5_timeutil 模块 docstring。
+from _mt5_timeutil import mt5_time_to_utc, detect_mt5_tz_offset
+
 log = logging.getLogger("mt5_bridge")
 
 
@@ -153,7 +157,7 @@ async def sync_positions(mt5, pool, redis_conn, account_id_mode: Optional[int] =
             # PG 写入（独立 try/except）
             try:
                 await _pg_update_position(
-                    pool, pos, current_price, float_profit, trail_state, self_account
+                    pool, pos, current_price, float_profit, trail_state, self_account, mt5
                 )
             except Exception as e:
                 log.error(f"PG sync failed for #{ticket}: {e}")
@@ -669,7 +673,8 @@ async def _resolve_account_id(pool) -> Optional[int]:
     return _RESOLVED_ACCOUNT_ID
 
 
-async def _pg_update_position(pool, pos, current_price, float_profit, trail_state, account_id: int) -> None:
+async def _pg_update_position(pool, pos, current_price, float_profit, trail_state, account_id: int,
+                              mt5=None) -> None:
     """更新或插入持仓行到 PostgreSQL。
 
     先执行 UPDATE，若 rowcount==0（持仓未在 PG 中）则 INSERT 兜底。
@@ -712,10 +717,17 @@ async def _pg_update_position(pool, pos, current_price, float_profit, trail_stat
 
         if row is None:
             # UPSERT 兜底：持仓尚未写入 PG（例如在 bridge 之外手动开仓）
+            # 时区校正：pos.time 是经纪商服务器时间（实测 +3h），必须减偏移才是真 UTC。
+            # detect_mt5_tz_offset 带合理性校验+缓存+回退；mt5 为 None 时走默认 3h。
             open_time = (
-                datetime.fromtimestamp(pos.time, tz=timezone.utc)
+                mt5_time_to_utc(pos.time, detect_mt5_tz_offset(mt5, pos.symbol))
                 if pos.time else now
             )
+            if open_time is None:
+                open_time = now
+            elif open_time > now:
+                # 防御：开仓时间不可能在未来。校正后仍 > now 说明时间戳异常，clamp 到 now。
+                open_time = now
             await conn.execute(
                 """
                 INSERT INTO hcm_trading.positions
@@ -761,16 +773,21 @@ def _redis_ticket_signal(redis_conn, ticket) -> Optional[int]:
         return None
 
 
-def _record_after_close_cooldown(redis_conn, symbol: str) -> None:
-    """持仓平仓后写『信号冷却』时间戳键，抑制该品种 N 秒内的新开仓信号。
+def _record_after_close_cooldown(redis_conn, symbol: str, direction: str = "") -> None:
+    """持仓平仓后写『信号冷却』时间戳键，抑制**同方向** N 秒内的新开仓信号。
 
     设计（2026-08-11）：
-    - 键:   hcm:after_close_cooldown:{symbol}（symbol=逻辑名，如 XAUUSD）
+    - 键:   hcm:after_close_cooldown:{symbol}:{DIRECTION}（symbol=逻辑名，DIRECTION=BUY/SELL）
     - 值:   冷却截止 epoch（秒，浮点）
     - TTL:  冷却时长 + 10s 缓冲，便于自动清理
     - 配置: close.after_close_cooldown_sec（秒）；0 或缺失=关闭（不写键）
-    - 作用域: 仅按交易品种（per symbol）；主号/跟单号共享同一 Redis 键
-              （任一账户平掉该品种即触发双方冷却，避免刚平完立即被回调信号拉回场）
+    - 作用域: 按 (品种, 方向)；主号/跟单号共享同一 Redis 键
+              （任一账户平掉该品种该方向即触发双方冷却，避免刚平完立即被回调信号拉回场）
+
+    【2026-09-09 变更·仅同方向冷却】原按品种「全方向」冷却：震荡期连续止损平仓会
+    反复续期 120s，把该品种所有方向的新信号一并吞掉（实测 07:08~07:17 连续 4 条
+    SELL 被拦，漏斗「过风控未成交」9/11 条源于此）。现仅冷却被平掉的那一方向，
+    反向信号正常放行（反转/对冲场景不再被误伤）。direction 为空时回退旧的全品种键。
     """
     if redis_conn is None or not symbol:
         return
@@ -783,12 +800,12 @@ def _record_after_close_cooldown(redis_conn, symbol: str) -> None:
         return
     try:
         expiry = time.time() + sec
-        redis_conn.set(
-            f"hcm:after_close_cooldown:{symbol}",
-            f"{expiry:.3f}",
-            ex=int(sec) + 10,
-        )
-        log.info("after_close_cooldown set for %s: %.0fs (until epoch %.0f)", symbol, sec, expiry)
+        _d = str(direction or "").strip().upper()
+        _key = (f"hcm:after_close_cooldown:{symbol}:{_d}" if _d in ("BUY", "SELL")
+                else f"hcm:after_close_cooldown:{symbol}")
+        redis_conn.set(_key, f"{expiry:.3f}", ex=int(sec) + 10)
+        log.info("after_close_cooldown set for %s%s: %.0fs (until epoch %.0f)",
+                 symbol, (":" + _d) if _d in ("BUY", "SELL") else "", sec, expiry)
     except Exception as e:
         log.warning("after_close_cooldown set failed for %s: %s", symbol, e)
 
@@ -809,21 +826,23 @@ _CLOSE_REASON_BY_DEAL = {
 
 
 def _infer_close_reason(mt5, ticket: int, open_price, logger=None) -> tuple:
-    """从 MT5 成交历史推断真实平仓原因。
+    """从 MT5 成交历史推断真实平仓原因 + 成交价 + 已实现盈亏。
 
     BE 判定：reason=SL 且成交价与开仓价之差在容差内 → 移动止损已推至保本。
     容差取 max(0.05, |开仓价| * 1e-4)，对 XAUUSD(约 4500) 约 0.45 美元。
 
     Returns:
-        (reason_str, deal_close_price)；无法判定时返回 ('sync_reconcile', 0.0)。
-        任何异常都被吞掉并回退原值，绝不影响对账主流程。
+        (reason_str, deal_close_price, realized_profit)；无法判定时返回
+        ('sync_reconcile', 0.0, None)。realized_profit 取离场成交的 deal.profit
+        （已实现 PnL，不含 swap/commission），查不到 → None（调用方回退最后同步
+        float_profit）。任何异常都被吞掉并回退原值，绝不影响对账主流程。
     """
     if mt5 is None:
-        return "sync_reconcile", 0.0
+        return "sync_reconcile", 0.0, None
     try:
         deals = mt5.history_deals_get(position=int(ticket))
         if not deals:
-            return "sync_reconcile", 0.0
+            return "sync_reconcile", 0.0, None
         def _fld(obj, name, default=None):
             """MT5 官方返回 namedtuple，但部分封装/代理返回 dict，两种形态都要能读。"""
             v = getattr(obj, name, None)
@@ -837,21 +856,23 @@ def _infer_close_reason(mt5, ticket: int, open_price, logger=None) -> tuple:
                 out = d
                 break
         if out is None:
-            return "sync_reconcile", 0.0
+            return "sync_reconcile", 0.0, None
         reason_id = _fld(out, "reason")
         price = float(_fld(out, "price", 0.0) or 0.0)
+        profit = _fld(out, "profit", None)
+        profit = float(profit) if profit is not None else None
         reason = _CLOSE_REASON_BY_DEAL.get(reason_id)
         if reason is None:
-            return "sync_reconcile", price
+            return "sync_reconcile", price, profit
         if reason == "sl" and open_price:
             tol = max(0.05, abs(float(open_price)) * 1e-4)
             if abs(price - float(open_price)) <= tol:
                 reason = "be"
-        return reason, price
+        return reason, price, profit
     except Exception as e:
         if logger is not None:
             logger.warning("close reason infer failed #%s: %s", ticket, e)
-        return "sync_reconcile", 0.0
+        return "sync_reconcile", 0.0, None
 
 
 async def _close_stale_positions(pool, account_id: int, live_tickets: set[int], redis_conn, mt5=None) -> None:
@@ -903,38 +924,65 @@ async def _close_stale_positions(pool, account_id: int, live_tickets: set[int], 
         for r in rows:
             tid = r["mt5_ticket"]
             if tid not in live_tickets:
-                # ── P2-1: 落库已实现订单（去重：同一 mt5_ticket 仅写一次）──
+                # ── P2-1: 平仓回填已实现订单（根因修复 2026-09-05）──
+                # 开仓时 _execute_signal 已 INSERT 一条 order_status=1 的 open 行；
+                # 对账发现 MT5 已平 → **UPDATE 该行** 回填 close_price/profit/close_time/
+                # close_reason（原实现因"同 ticket 已存在"去重而永不落库 → PnL 黑洞，
+                # orders.close_time 全停在 8/28 之前）。无 open 行（老单/无映射）→ 兜底 INSERT。
                 try:
-                    existing = await conn.fetchval(
-                        "SELECT 1 FROM hcm_trading.orders WHERE mt5_ticket=$1 LIMIT 1",
-                        tid,
+                    _sid = r["signal_id"]
+                    if not _sid and redis_conn is not None:
+                        _sid = _redis_ticket_signal(redis_conn, tid)
+                    # 2026-09-05：回查 MT5 成交历史取真实 deal.reason/成交价/已实现盈亏
+                    _close_reason, _deal_px, _deal_profit = _infer_close_reason(
+                        mt5, tid, r["open_price"], log)
+                    _close_px = _deal_px if _deal_px > 0 else float(r["current_price"] or 0)
+                    _profit = (_deal_profit if _deal_profit is not None
+                               else float(r["float_profit"] or 0))
+                    _oid = await conn.fetchval(
+                        """UPDATE hcm_trading.orders
+                           SET close_price=$1, profit=$2, order_status=2,
+                               close_time=$3, close_reason=$4, updated_at=$3
+                           WHERE mt5_ticket=$5 AND close_time IS NULL
+                           RETURNING order_id""",
+                        _close_px, _profit, now, _close_reason, tid,
                     )
-                    if not existing:
-                        _sid = r["signal_id"]
-                        if not _sid and redis_conn is not None:
-                            _sid = _redis_ticket_signal(redis_conn, tid)
-                        # 2026-09-01：平仓归因——回查 MT5 成交历史取真实 deal.reason，
-                        # 替代原硬编码 'sync_reconcile'。close_price 仍沿用最后同步价
-                        # （保持既有语义；如需精确成交价可改用 _deal_px）。
-                        _close_reason, _deal_px = _infer_close_reason(
-                            mt5, tid, r["open_price"], log)
-                        await conn.execute(
-                            """
-                            INSERT INTO hcm_trading.orders
-                                (signal_id, account_id, mt5_ticket, symbol, direction,
-                                 open_price, close_price, lot, sl, tp, profit,
-                                 order_status, open_time, close_time, close_reason)
-                            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,2,$12,$13,$14)
-                            """,
-                            _sid, account_id, tid, r["symbol"], r["direction"],
-                            r["open_price"], r["current_price"], r["lot"],
-                            r["sl"], r["tp"], r["float_profit"],
-                            r["open_time"], now, _close_reason,
-                        )
+                    if _oid:
                         log.info(
-                            f"P2-1 orders write #{tid}: profit={r['float_profit']} "
-                            f"close={r['current_price']} signal={_sid} reason={_close_reason}"
-                        )
+                            f"P2-1 orders close-backfill #{tid}: profit={_profit} "
+                            f"close={_close_px} reason={_close_reason} (updated open row)")
+                    else:
+                        # ──【2026-09-09 幂等修复·根因】──────────────────────────
+                        # 兜底 INSERT 原为【无条件写入】：只要持仓仍被判为 open，
+                        # 每轮对账(约 1 次/秒)就灌一行，且 UPDATE 因 close_time 非空
+                        # 永远匹配不到 → 恒走本分支。
+                        # 实测事故：2026-09-08 23:05 ~ 09-09 01:48，仅 2 个真实
+                        # mt5_ticket 生成 17738 行重复订单(单均 8869 条)，
+                        # 盈亏/胜率/ai_report 全被放大约 8869 倍。
+                        # 修复：该 ticket 已存在【任何】订单行 → 跳过，不再重复插入。
+                        # （配合 orders(account_id, mt5_ticket) 唯一索引双保险。）
+                        _dup = await conn.fetchval(
+                            """SELECT 1 FROM hcm_trading.orders
+                               WHERE mt5_ticket=$1 LIMIT 1""", tid)
+                        if _dup:
+                            log.info(
+                                f"P2-1 orders skip #{tid}: row already exists "
+                                f"→ idempotent guard, no duplicate insert")
+                        else:
+                            await conn.execute(
+                                """INSERT INTO hcm_trading.orders
+                                   (signal_id, account_id, mt5_ticket, symbol, direction,
+                                    open_price, close_price, lot, sl, tp, profit,
+                                    order_status, open_time, close_time, close_reason)
+                                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,2,$12,$13,$14)""",
+                                _sid, account_id, tid, r["symbol"], r["direction"],
+                                r["open_price"], _close_px, r["lot"],
+                                r["sl"], r["tp"], _profit,
+                                r["open_time"], now, _close_reason,
+                            )
+                            log.info(
+                                f"P2-1 orders write #{tid}: INSERT closed row "
+                                f"profit={_profit} close={_close_px} reason={_close_reason}")
                 except Exception as e:
                     log.error(f"P2-1 orders write failed for #{tid}: {e}")
 
@@ -946,7 +994,8 @@ async def _close_stale_positions(pool, account_id: int, live_tickets: set[int], 
                 )
                 closed += 1
                 # ── 信号冷却（2026-08-11）：持仓刚平仓 → 抑制该品种 N 秒新开仓 ──
-                _record_after_close_cooldown(redis_conn, r["symbol"])
+                _record_after_close_cooldown(
+                    redis_conn, r["symbol"], str(r.get("direction") or "").upper())
                 log.info(f"Pos reconcile #{tid}: MT5 closed → PG status=closed (orders written)")
         if closed:
             log.info(f"Stale reconciliation: closed {closed} ghost position(s) for account {account_id}")

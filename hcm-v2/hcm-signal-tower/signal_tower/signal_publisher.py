@@ -63,6 +63,35 @@ def _regime_to_calib_key(regime_str: str) -> Optional[str]:
     return None
 
 
+# ── 2026-09-08：signal_mode → MT5 magic 逻辑编号 ──
+# 需求：自动信号开仓时把来源逻辑写入 MT5 magic，终端可直接辨识该单由哪条逻辑触发。
+# 0 保留 = 手动单 / 未归类；manual_mirror 保持透传主号原 magic（既有语义，不映射）。
+# 注：live_override 的两个 bar 内子来源（adx 救援 / 实时评分边沿）signal_mode 相同 → 同码 21。
+SIGNAL_MODE_MAGIC = {
+    "hexp": 11,           # HEXP 乘幂引擎 M5 bar 收盘主信号（signal_mode 前缀 "HEXP"）
+    "scoring": 12,        # 默认评分引擎 M5 bar 收盘主信号（"<REGIME>_WEIGHTS" / "indicator_scoring"）
+    "live_override": 21,  # bar 内实时触发（adx 救援 / 实时评分边沿 / momentum_pending 放行）
+    # 【2026-09-09】RANGE 均值回归（range_strategy 注入）→ MT5 magic 55。
+    # 注意：RANGE 是注入到 HEXP 结果之上，signal_mode 仍形如 "HEXP:Regime.RANGE"，
+    #   仅凭 mode 字符串无法与 HEXP 自身在震荡市出的信号区分（后者应仍为 11）。
+    #   故 magic_for_signal_mode 不识别 RANGE，改由 scheduler 依 range_mode 标志
+    #   显式覆盖（单一真源仍在此表）。
+    "range": 55,
+}
+
+
+def magic_for_signal_mode(signal_mode: str) -> int:
+    """signal_mode → MT5 magic 逻辑编号；未识别/空返回 0（手动/未归类）。"""
+    m = str(signal_mode or "").strip().upper()
+    if m.startswith("HEXP"):
+        return SIGNAL_MODE_MAGIC["hexp"]
+    if m == "LIVE_OVERRIDE":
+        return SIGNAL_MODE_MAGIC["live_override"]
+    if m == "INDICATOR_SCORING" or m.endswith("_WEIGHTS"):
+        return SIGNAL_MODE_MAGIC["scoring"]
+    return 0
+
+
 @dataclass
 class SignalData:
     """Complete signal data for publishing."""
@@ -113,6 +142,11 @@ class SignalData:
     # close_ticket：主号被平/改/减仓的 ticket（manual_mirror 中 signal_id == 主号 ticket）
     close_mode: str = "all"
     close_ticket: int = 0
+    # 【2026-09-08 审计修复 P0】信号塔已"锁定止损"标记：趋势启动单(3.5ATR)等由本塔
+    # 显式给定、不应被桥侧「会话 SL 下限兜底」(mt5_bridge 把 <2ATR 的止损抬到会话值)
+    # 反向拉宽的场景置 True。经风控 stream_consumer 透传至 signal:risk_passed，
+    # 由桥 place_mt5_order 消费。默认 False = 桥侧行为完全不变。
+    sl_locked: bool = False
     # ── P0 (2026-07-15): precise-entry zone info (informational, no execution impact) ──
     zone_level: float = 0.0
     zone_type: str = ""
@@ -329,10 +363,18 @@ class SignalPublisher:
             "zone_strength": signal.zone_strength,
             "zone_tp_level": signal.zone_tp_level,
             # 2026-08-25 极值分层裁决标记：hexp 极值+保本追单候选，风控保本闸门消费
-            "extreme_pending": getattr(signal, "extreme_pending", False),
+            # 【2026-09-08 审计修复 P0】Redis Stream 字段值只能是字符串：Python bool
+            # 写入后被编码为 "True"/"False"，下游裸用 bool() 时 bool("False") 恒为
+            # True（非空字符串恒真）→ extreme_pending 恒真使每条信号都进极值追单
+            # 分支（手数被无条件 ×0.5、DB 抖动时 fail-closed 全量拒单）。
+            # 源头统一写 0/1 规范值，下游按 "1" 判定（见 risk rule_chain._as_bool）。
+            "extreme_pending": 1 if getattr(signal, "extreme_pending", False) else 0,
             # 2026-08-26 反向单标记：momentum_flip 封 NO_TRADE 后覆写方向产出的接刀单，
             # 风控 _check_reverse_order 接刀护栏消费
-            "reverse_order": getattr(signal, "reverse_order", False),
+            "reverse_order": 1 if getattr(signal, "reverse_order", False) else 0,
+            # 【2026-09-08 审计修复 P0】"信号塔已锁定止损"标记（趋势抢跑/极值追单等
+            # 由信号塔显式给定止损的场景置 1）→ 风控透传 → 桥跳过会话 SL 下限兜底。
+            "sl_locked": 1 if getattr(signal, "sl_locked", False) else 0,
             # ── P1a/P1c collaboration fields (consumed by mt5_bridge) ──
             "ai_sl_mult": signal.ai_sl_mult,
             "ai_tp_mult": signal.ai_tp_mult,
