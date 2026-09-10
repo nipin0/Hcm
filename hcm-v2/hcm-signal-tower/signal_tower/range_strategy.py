@@ -46,6 +46,20 @@ DEFAULTS = {
     "range.break_guard_enabled": True,
     "range.break_guard_lookback": 50,   # 用近 N 根(不含当前 bar)的高低点定义区间边界
     "range.break_cooldown_bars": 12,    # 判定突破后停用 N 根 M5(≈1h)
+    # ── S1 核心（2026-09-10 实测验证）──
+    # 等回踩 offset 个 ATR 再【市价】进场，取代"信号即市价(d=0)"。
+    # 依据：双障碍回测（292/188 独立事件，扣 0.12ATR 往返点差）
+    #   d=0.0（市价）   E[R]=+0.044 / -0.032，95%CI 跨 0 → 无优势
+    #   d=1.0（等回踩） E[R]=+0.197 / +0.190，CI 下沿 >0 → 显著为正
+    # 注：不用"挂限价等成交"，因桥 _price_in_zone_band 是 ±5points 对称带、
+    #     冲过头不成交（已证缺陷）。改为信号塔侧 armed 状态：等价格走到目标位
+    #     再发市价单，必然成交、零改桥，滑点相对 ATR(≈7.5) 可忽略。
+    "range.entry_offset_atr": 1.0,
+    "range.arm_expire_bars": 12,        # armed 有效期（M5 根数，≈1h），超时作废
+    # 区间宽度过滤（实测 +77%：E[R] +0.190 → +0.296/+0.336，CI 下沿 +0.23）
+    #   太窄 → 装不下 1.0ATR 止盈；太宽 → 已非震荡
+    "range.width_min_atr": 1.5,
+    "range.width_max_atr": 6.0,
     "range.lot_mult": 1.0,           # 不再自乘 0.5：手数交由风控动态手数(见 range.confidence)
     "range.confidence": 55.0,        # 0-100 → 归一 0.55：① ≥ risk_min_confidence(0.10) 放行；
                                      # ② < score_tier_mid 的【代码默认值 0.65】(防配置回退误落 mid 档 ×1.0)

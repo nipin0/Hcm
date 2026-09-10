@@ -383,6 +383,41 @@ def cleanup_old_versions(keep: int | None = None) -> None:
             log(f"[cleanup] {head} 头版本 v{v} 已清理（保留最近 {keep} 版）")
 
 
+def parse_calib_degenerate(stdout: str) -> bool | None:
+    """【2026-09-10 修复·裁判语义撞车】解析【质量头自身】概率校准器是否退化。
+
+    训练侧 train_signal_quality.py 二选一打印::
+
+        [calib] OK: 验证块正样本=N 拟合档位=M
+        [calib] DEGENERATE: 拟合档位仅 M < 8，回退原始概率
+
+    为何必须独立解析（v101 事故复盘）：
+      裁判 prompt 的硬性回滚条件 (1) 写作"校准器退化"，而发给裁判的 payload 里
+      只有 head_health.recalib_required —— 它的真实含义是【方向头/买点头】是否
+      需重校准，与质量头校准器完全是两回事。LLM 把 recalib_required=true 直接
+      读成"校准器退化" → 判 rollback。
+      实测 2026-09-10 v101：AUC=0.677 / 样本=1496 / ds_nonzero_ratio=1.0 全部达标，
+      仅因 dir_hit=0.5102（→ recalib_required=true）被裁判否掉；但 :1168-1190
+      明确记载「用户决策 2：单头不达标不阻塞质量头采纳」「决策 4：不交 DeepSeek
+      裁判」。即裁判的否决【违反既定策略】，是字段语义撞车所致，非模型不合格。
+      现改为只把质量头自身的校准器状态交给裁判，从根上消除歧义。
+    """
+    # 【2026-09-10 再修正】优先认 [calib-final]（**落盘生效**的校准器，权威）；
+    # 仅当训练脚本为旧版、没有该标记时，才回退 [calib]（验证块校准器，仅供参考）。
+    # 原因：train 里 _calib_degenerate 描述的是验证块 iso，而落盘的是 _save_calib
+    # （TSS 最后 fold）。用验证块的退化去否决模型，会在落盘校准器完全有效时
+    # 仍判 rollback → 重训闭环永久堵死（v97~v102 实测落盘均为 NumpyCalibrator）。
+    if "[calib-final] DEGENERATE" in stdout:
+        return True
+    if "[calib-final] OK" in stdout:
+        return False
+    if "[calib] DEGENERATE" in stdout:
+        return True
+    if "[calib] OK" in stdout:
+        return False
+    return None
+
+
 def parse_dir_hit(stdout: str) -> float | None:
     """【阶段 2·健康判定 2026-08-29】解析方向头 C 口径命中率。
 
@@ -436,10 +471,14 @@ def deepseek_judge(api_base: str, api_key: str, payload: dict, timeout: int = 60
             "采用标准：测试 AUC 较基线有实质提升、样本量充足、DeepSeek 特征吸收充分、"
             "无退化迹象。\n"
             "【硬性回滚条件】满足任一即必须 rollback：\n"
-            "  (1) AUC<0.55 或样本<200 或校准器退化；\n"
+            "  (1) AUC<0.55 或样本<200 或 quality_calib_degenerate=true"
+            "（质量头概率校准器退化：拟合档位过少已回退原始概率）；\n"
             "  (2) ds_nonzero_ratio(DeepSeek特征非零占比)<0.30 —— 此时模型未真正吸收 DeepSeek"
             "语义，即使AUC达标也是\"假精准\"，必须回滚（不要因AUC达标就判adopt）。\n"
-            "只有 AUC≥0.55、样本≥200、校准器未退化、且 ds_nonzero_ratio≥0.30 同时满足才 adopt。\n"
+            "只有 AUC≥0.55、样本≥200、quality_calib_degenerate 不为 true、且 "
+            "ds_nonzero_ratio≥0.30 同时满足才 adopt。\n"
+            "【重要·勿误判】本摘要【不含】方向头/买点头健康度（dir_hit/entry_auc）："
+            "该两项按既定策略由本地阈值独立判定、不交裁判，也【不构成回滚理由】。\n"
             "只返回一个 JSON：{\"decision\": \"adopt\" 或 \"rollback\", \"reason\": \"中文简述\"}\n\n"
             f"摘要：{json.dumps(payload, ensure_ascii=False)}"
         )
@@ -1189,15 +1228,26 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
         log("[head-health] 单头不达标 → 按用户决策 2 立即校准（不禁用该头，"
             "不阻塞质量头采纳）")
 
+    quality_calib_degenerate = parse_calib_degenerate(_all_out)
     payload = {
         "model_version": f"v{v}",
         "auc": auc,
         "samples": samples,
         "ds_nonzero_ratio": ds_ratio,
         "baseline_win_rate": None,  # train 输出含，按需扩展解析
-        # 阶段 2：三头健康指标（供 DeepSeek 裁判参考 + 本地决策 + 落库追溯）
+        # 质量头【自身】校准器状态 → 这才是裁判该用的"校准器退化"判据
+        "quality_calib_degenerate": quality_calib_degenerate,
+        # 阶段 2：三头健康指标（本地判定 + 落库追溯；【不交裁判】，见 _judge_payload）
         "head_health": head_health,
     }
+    # 【2026-09-10 修复·落实决策 4】裁判专用 payload：剔除 head_health。
+    # :1168-1190 明确记载「决策 4：走本地阈值，不交 DeepSeek 裁判」，但原实现把含
+    # recalib_required 的 head_health 原样发给裁判；而裁判 prompt 的硬性回滚条件 (1)
+    # 写作"校准器退化" → LLM 把"方向头需重校准"误读为"质量头校准器退化" → rollback。
+    # v101 实测：AUC=0.677/样本=1496/ds_ratio=1.0 全达标仍被否，即此缺陷所致。
+    _judge_payload = {k: v for k, v in payload.items() if k != "head_health"}
+    log(f"[judge-payload] 已剔除 head_health；"
+        f"quality_calib_degenerate={quality_calib_degenerate}")
 
     # 4) 决策：DeepSeek 裁判（路径 B）或本地 AUC 护栏
     # 从 PG 配置中心读取 DeepSeek 真源 key/api_base/model（与系统其他模块一致），
@@ -1211,7 +1261,7 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
     decided_adopt = False
     judge = {"decision": "local_fallback", "reason": "disabled"}
     if use_deepseek:
-        judge = deepseek_judge(ds_api, ds_key, payload, model=ds_model)
+        judge = deepseek_judge(ds_api, ds_key, _judge_payload, model=ds_model)
         if judge.get("decision") == "adopt":
             decided_adopt = True
         elif judge.get("decision") == "rollback":

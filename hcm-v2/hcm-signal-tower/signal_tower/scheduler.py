@@ -2233,35 +2233,114 @@ class Scheduler:
                             logger.warning("range break-guard failed %s: %s",
                                            state.symbol, _bg_e)
 
+                    # ── 区间宽度过滤（实测 +77%：E[R] +0.190 → +0.296/+0.336）──
+                    # 太窄装不下 1.0ATR 止盈；太宽说明已非震荡，均值回归前提不成立。
+                    _w_ok = True
+                    try:
+                        _rh_w = getattr(indicators, "recent_highs", None) or []
+                        _rl_w = getattr(indicators, "recent_lows", None) or []
+                        _atr_w = float(getattr(indicators, "atr_14", 0) or 0)
+                        if len(_rh_w) > 1 and len(_rl_w) > 1 and _atr_w > 0:
+                            _w_hi = max(float(x) for x in _rh_w if x)
+                            _w_lo = min(float(x) for x in _rl_w if x)
+                            _width_atr = (_w_hi - _w_lo) / _atr_w
+                            _wmin = float(_rng_cfg.get("range.width_min_atr") or 0)
+                            _wmax = float(_rng_cfg.get("range.width_max_atr") or 0)
+                            if (_wmin > 0 and _width_atr < _wmin) or \
+                               (_wmax > 0 and _width_atr > _wmax):
+                                _w_ok = False
+                                logger.info(
+                                    "RANGE_MR skip %s: width=%.2fATR outside [%.1f, %.1f]",
+                                    state.symbol, _width_atr, _wmin, _wmax)
+                    except Exception as _wf_e:
+                        logger.warning("range width-filter failed %s: %s", state.symbol, _wf_e)
+
                     _bg_until = getattr(state, "range_break_until", None)
                     if _bg_until is not None and datetime.now(timezone.utc) < _bg_until:
                         logger.info("RANGE_MR skip %s: break_cooldown (until %s)",
                                     state.symbol, _bg_until.strftime("%H:%M:%S"))
-                    elif _rng.get("direction") and \
-                            str(getattr(score_result, "direction", "") or "") in ("", "NO_TRADE"):
-                        _rng_dir = _rng["direction"]
-                        score_result.direction = _rng_dir
-                        score_result.threshold_passed = True   # 注入即放行；AI/风控仍可拦
-                        if not getattr(score_result, "fallback_reason", None):
-                            score_result.fallback_reason = f"range_mr({_rng_dir})"
-                        # 跨段传递 RANGE 标记：供下方 TP/SL 段绕过 R:R 下限（见 _tp_floor）
-                        score_result.range_mode = True
-                        score_result.range_tp_atr = float(_rng_cfg.get("range.tp_atr") or 1.0)
-                        # 置信度：归一后须 ≥ risk_min_confidence(0.10) 才不被风控拒单；
-                        #   55 → 0.55，且远离 score_tier_mid 代码默认值 0.65（防误落 mid 档）。
-                        #   实际手数档位由下方 ai_lot_tier="low" 确定性决定，不依赖本值。
-                        try:
-                            score_result.confidence = float(
-                                _rng_cfg.get("range.confidence") or 55.0)
-                        except Exception:
-                            score_result.confidence = 55.0
-                        logger.info(
-                            "RANGE_MR inject %s: %s (rsi=%.1f pct_b=%.3f periods=%s) 单仓不加仓",
-                            state.symbol, _rng_dir, float(_rsi or 0), float(_pctb or 0.5), _ps)
-                    elif _rng.get("in_range"):
-                        logger.info("RANGE_MR skip %s: %s (rsi=%.1f pct_b=%.3f)",
-                                    state.symbol, _rng.get("reason"),
-                                    float(_rsi or 0), float(_pctb or 0.5))
+                    elif not _w_ok:
+                        pass      # 宽度过滤未通过（已在上记日志）
+
+                    else:
+                        # ── S1 等回踩入场（armed 状态）──
+                        # 信号即市价(d=0) 实测 E[R]≈0（CI 跨 0）；等回踩 offset 个 ATR
+                        # 后【市价】进场实测 +0.197/+0.190（CI 下沿 >0）。
+                        # 不用挂限价：桥 _price_in_zone_band 是 ±5points 对称带，
+                        # 冲过头不成交（已证缺陷）。故在信号塔侧记录 armed 目标位，
+                        # 等价格走到该位再发市价单 —— 必然成交、零改桥。
+                        _off = float(_rng_cfg.get("range.entry_offset_atr") or 0.0)
+                        _atr_v = float(getattr(indicators, "atr_14", 0) or 0)
+                        _close_v = float(indicators.close or 0)
+                        _now_utc = datetime.now(timezone.utc)
+                        _arm_exp = int(float(_rng_cfg.get("range.arm_expire_bars") or 12))
+                        _arm = getattr(state, "range_arm", None)
+                        # armed 超时作废
+                        if _arm is not None and \
+                                (_now_utc - _arm["at"]).total_seconds() > _arm_exp * 300:
+                            logger.info("RANGE_MR arm expired %s: %s target=%.2f",
+                                        state.symbol, _arm.get("dir"), _arm.get("target", 0))
+                            _arm = None
+                            state.range_arm = None
+
+                        _inject_dir = None
+                        # 1) 先检查历史 armed 目标位是否被触及（用当前 bar 高低点）
+                        if _arm is not None:
+                            try:
+                                _bh = float(_rh_w[-1]) if _rh_w else 0.0
+                                _bl = float(_rl_w[-1]) if _rl_w else 0.0
+                            except Exception:
+                                _bh = _bl = 0.0
+                            if (_arm["dir"] == "BUY" and _bl > 0 and _bl <= _arm["target"]) or \
+                               (_arm["dir"] == "SELL" and _bh > 0 and _bh >= _arm["target"]):
+                                _inject_dir = _arm["dir"]
+                                state.range_arm = None
+                                logger.info(
+                                    "RANGE_MR arm filled %s: %s target=%.2f (bar h/l=%.2f/%.2f)",
+                                    state.symbol, _inject_dir, _arm["target"], _bh, _bl)
+
+                        # 2) 本次出现新极值：需等回踩则 arm，否则直接注入
+                        if _inject_dir is None and _rng.get("direction") and \
+                                str(getattr(score_result, "direction", "") or "") in ("", "NO_TRADE"):
+                            _d0 = _rng["direction"]
+                            if _off > 0 and _atr_v > 0 and _close_v > 0:
+                                _tgt = (_close_v - _off * _atr_v) if _d0 == "BUY" \
+                                    else (_close_v + _off * _atr_v)
+                                state.range_arm = {"dir": _d0, "target": _tgt, "at": _now_utc}
+                                logger.info(
+                                    "RANGE_MR arm %s: %s target=%.2f (close=%.2f off=%.2f×atr=%.2f)",
+                                    state.symbol, _d0, _tgt, _close_v, _off, _atr_v)
+                            else:
+                                _inject_dir = _d0
+
+                        if _inject_dir is None:
+                            if _rng.get("in_range"):
+                                logger.info("RANGE_MR skip %s: %s (rsi=%.1f pct_b=%.3f)",
+                                            state.symbol, _rng.get("reason"),
+                                            float(_rsi or 0), float(_pctb or 0.5))
+                        else:
+                            _rng_dir = _inject_dir
+                            score_result.direction = _rng_dir
+                            # 注入即放行；AI/风控仍可拦
+                            score_result.threshold_passed = True
+                            if not getattr(score_result, "fallback_reason", None):
+                                score_result.fallback_reason = f"range_mr({_rng_dir})"
+                            # 跨段传递 RANGE 标记：供下方 TP/SL 段绕过 R:R 下限
+                            score_result.range_mode = True
+                            score_result.range_tp_atr = float(
+                                _rng_cfg.get("range.tp_atr") or 1.0)
+                            # 置信度：归一后须 ≥ risk_min_confidence(0.10) 才不被风控拒单。
+                            # 实际手数档位由下方 ai_lot_tier="low" 确定性决定，不依赖本值。
+                            try:
+                                score_result.confidence = float(
+                                    _rng_cfg.get("range.confidence") or 55.0)
+                            except Exception:
+                                score_result.confidence = 55.0
+                            logger.info(
+                                "RANGE_MR inject %s: %s (rsi=%.1f pct_b=%.3f periods=%s) "
+                                "单仓不加仓",
+                                state.symbol, _rng_dir, float(_rsi or 0),
+                                float(_pctb or 0.5), _ps)
                 except Exception as _re:
                     logger.warning("range_mr inject failed %s: %s", state.symbol, _re)
 

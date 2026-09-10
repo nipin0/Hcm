@@ -394,6 +394,24 @@ CALIB_MIN_LEVELS = 8
 # 以上全部由 _model_feature_cols.MODEL_FEATURE_COLS 权威定义，训练侧 reindex 对齐。
 FEATURE_COLS = MODEL_FEATURE_COLS
 
+# 【2026-09-10 下线兼容】已从 MODEL_FEATURE_COLS 移除、但【线上在用的旧模型】仍会
+# 通过 score_one 的 model.feature_name() 索取的列。
+# 背景：build_features 按 FEATURE_COLS 产出 feats（见下方 :753），若契约移除该列而
+#   线上模型仍是 37 维，则 score_one 里 feats.get(k) → None → 被 to_numeric(...)
+#   .fillna(0.0) 填成【恒 0】。该列训练域为 [558, 26212] 分钟，0 落在域外，
+#   树会把所有样本强推到同一分支 —— 属【静默行为改变】，重启后才暴露，极难排查。
+#
+# 实测（2026-09-10）：线上活跃模型 lgbm_quality_v97 仍是【50 维】，而契约已降至
+#   36 维，差集恰好是下面这 14 列（13 个 tmf_* + event_proximity_min）。
+#   即 09-10 的 "tmf 13 维下线" 是【纯契约改动，从未重训/部署过对应模型】。
+#   若没有本兼容层，sidecar 一旦重启（计划任务每 3 分钟守护，随时可能发生），
+#   v97 就会收到这 14 列恒 0 —— 静默劣化，无异常、无日志。
+#
+# 处理：本列表继续产出真实值。新模型按 feature_name() 取不到 → 自然忽略；
+#   旧模型仍能拿到真实值 → 行为不变。
+# 【TODO】待线上模型重训并切换到与契约同维的版本后，可整体删除本列表。
+LEGACY_FEATURE_COLS = ["event_proximity_min"] + list(TMF_FEATURE_COLS)
+
 
 def load_config(conn, redis_cli=None) -> dict:
     """读 ai.* 配置：PG 为唯一真值，Redis hcm:config:v2 仅作缺失补位。
@@ -750,7 +768,10 @@ def build_features(snapshot: dict, kl: pd.DataFrame,
     for c in TMF_FEATURE_COLS:
         row[c] = _tmf.get(c, 0.0)
     # 所有特征缺则补 0.0，避免 LightGBM 因 None/object dtype 抛错（被 score_one 顶层 except 吞）
-    feats = {c: (row.get(c) if row.get(c) is not None else 0.0) for c in FEATURE_COLS}
+    # 【2026-09-10 下线兼容】额外带上 LEGACY_FEATURE_COLS：旧模型仍会按
+    # feature_name() 索取这些列，缺失会被 score_one 填成恒 0（训练域外）→ 静默错判。
+    feats = {c: (row.get(c) if row.get(c) is not None else 0.0)
+             for c in (list(FEATURE_COLS) + list(LEGACY_FEATURE_COLS))}
     # 【C·特征口径对齐审计】开启 ai.lm.feature_audit 时打印 FEATURE_COLS 顺序与当前样本，
     # 供与训练脚本(train_signal_quality.py --audit)输出 diff，确认推理与训练同构
     # （列顺序/数值范围一致，杜绝训练-推理分布偏移这一 LightGBM 部署头号风险）。
@@ -1693,7 +1714,15 @@ def main():
                     elif model is None:
                         _status = _model_status if _model_status in ("missing", "degraded") else "missing"
                     else:
-                        _status = _model_status if _model_status == "ready" else "ready"
+                        # 【2026-09-10 修复·状态恒真缺陷】原写法
+                        #   `_status = _model_status if _model_status == "ready" else "ready"`
+                        # 三元两个分支同为 "ready"，是无操作表达式：只要 model 非 None，
+                        # status 恒为 "ready"，无法反映 _model_status 实际值（如 degraded/init）。
+                        # 注：实践中自检失败时代码会把 model 置 None 并走上方 elif(model is None)
+                        # 分支，故"degraded"仍可达、未造成线上误报；但本写法会掩盖
+                        # "model 非 None 但 _model_status 非 ready"的任何未来状态，且误导读者。
+                        # 改为直接透传真实状态，缺值时兜底 ready。
+                        _status = _model_status or "ready"
                     out = {
                         "symbol": args.symbol.upper(),
                         "ai_score": round(ai_score, 2) if ai_score is not None else None,

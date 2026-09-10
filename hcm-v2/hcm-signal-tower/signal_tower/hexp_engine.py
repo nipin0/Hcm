@@ -1455,7 +1455,12 @@ class HexpEngine:
         # 先算 verdict（含 M30/H1/H4/D1 按 weight_* 加权），供方向闸与评分段共用。
         verdict = 0.0
         wsum_r = 0.0
-        n_eff = 0  # 有效（非RANGE）周期计数
+        n_eff = 0    # 有效（pv!=0）周期计数
+        # 【2026-09-10 修复·双向死锁 P0】n_trend = 真趋势(TREND_UP/DOWN)周期计数。
+        # 原实现只有 n_eff，它把 RANGE 周期按"低位→+1 / 高位→-1"投出的【均值回归票】
+        # 与真趋势票同等计数，导致 4 个 RANGE 周期同处低位即可凑出 verdict=±1.00 的
+        # "强共识"假象，进而触发 counter_block 硬拦 —— 而此时并无任何周期真正趋势。
+        n_trend = 0
         for p in periods:
             if p == primary:
                 continue
@@ -1465,8 +1470,10 @@ class HexpEngine:
             st = period_states.get(p, _RANGE)
             if st == _TREND_UP:
                 pv = 1.0
+                n_trend += 1
             elif st == _TREND_DOWN:
                 pv = -1.0
+                n_trend += 1
             elif st == _RANGE:
                 # 【2026-09-09 修复·跨周期污染 P0】原实现用【主周期 M5】的 _pos_pct/_rsi
                 # 给【所有】RANGE 周期投票：M5 处于低位时，M30/H1/H4/D1 四个 RANGE 周期
@@ -1566,8 +1573,18 @@ class HexpEngine:
         # 阈值 0.5 由昨日实测标定（逆势 BUY 的 |verdict|=1.0；顺势单多为同向，不受影响）。
         # 阈值 <=0 表示关闭硬拦、退回纯降分，可热回退。
         _cb_th = float(cfg.get("hexp.resonance.counter_block_threshold", 0.5))
+        # 【2026-09-10 修复·双向死锁 P0】硬拦须由【真趋势】周期支撑。
+        # 否则纯 RANGE 周期凑出的伪共识(±1.00)会硬拦反向单，而 momentum_flip 同时
+        # 拦住另一方向 → 两向皆封、必然不下单。实测 M5=TREND_DOWN 场景：
+        #   BUY  ← 被 momentum_flip 拦(mm=-0.20 与做多相反)
+        #   SELL ← 被本 counter_block 拦(verdict=+1.0 与做空相反，而 +1.0 仅由
+        #          4 个 RANGE 周期处低位投出，无任何真趋势)
+        # RANGE 的均值回归票不应具备"否决反向"的强制力。
+        # min_trend <= 0 表示退回原行为（热回退开关）。
+        _cb_min_trend = int(float(cfg.get("hexp.resonance.counter_block_min_trend", 1)))
         if (sig_dir != 0 and _cb_th > 0 and abs(verdict) >= _cb_th
-                and (verdict > 0) != (sig_dir > 0)):
+                and (verdict > 0) != (sig_dir > 0)
+                and (_cb_min_trend <= 0 or n_trend >= _cb_min_trend)):
             _cb_dir = "BUY" if sig_dir > 0 else "SELL"
             direction = "NO_TRADE"
             passed = False

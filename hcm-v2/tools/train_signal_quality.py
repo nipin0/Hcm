@@ -383,13 +383,36 @@ def main():
         # 保存为 { -1: NumpyCalibrator, 0: NumpyCalibrator, 1: NumpyCalibrator } 字典。
         from calib_np import NumpyCalibrator
         from sklearn.isotonic import IsotonicRegression
-        _proba = dir_model.predict_proba(Xd_te)  # (n,3) 类序 [-1,0,1]
         _classes = np.array([-1, 0, 1])
         _dir_calibs = {}
+        # 【2026-09-10 治本·方向头校准器退化】原实现只在【单个测试切片 Xd_te】上拟合
+        # isotonic，样本量小 → 过拟合成粗阶梯（v104 实测三类仅 7/5/4 档 < CALIB_MIN_LEVELS=8）。
+        # 退化校准器会输出 0.95 这类极端概率；一旦开启 ai.lm.direction_fuse，将按
+        # dir_veto_prob=0.65 做【反向否决】→ 用不可信概率否掉 HEXP 已放行的单。
+        # 改为【跨折 OOF 预测汇总后一次性拟合】，样本量约 5 倍，档位数显著增加。
+        _fit_p, _fit_y = None, None
+        try:
+            from sklearn.model_selection import TimeSeriesSplit, cross_val_predict
+            _oof = cross_val_predict(
+                lgb.LGBMClassifier(objective="multiclass", num_class=3, n_estimators=200,
+                                   learning_rate=0.05, num_leaves=15, min_child_samples=20,
+                                   subsample=0.8, colsample_bytree=0.8,
+                                   random_state=args.seed, verbose=-1),
+                Xd, yd, cv=TimeSeriesSplit(n_splits=5), method="predict_proba")
+            _fit_p, _fit_y = _oof, np.asarray(yd)
+        except Exception as _oe:
+            print(f"[dir-calib] OOF 失败，回退测试切片: {_oe}", file=sys.stderr)
+        if _fit_p is None:
+            _fit_p = dir_model.predict_proba(Xd_te)
+            _fit_y = np.asarray(yd_te)
+        _dir_lv = []
         for _i, _c in enumerate(_classes):
             _ir = IsotonicRegression(out_of_bounds="clip")
-            _ir.fit(_proba[:, _i], (yd_te.values == _c).astype(int))
+            _ir.fit(_fit_p[:, _i], (_fit_y == _c).astype(int))
             _dir_calibs[_c] = NumpyCalibrator(_ir.X_thresholds_, _ir.y_thresholds_)
+            _dir_lv.append(f"{_c}:{len(set(np.round(np.asarray(_ir.y_thresholds_), 4)))}")
+        print(f"[dir-calib] 拟合 n={len(_fit_y)} 档位={','.join(_dir_lv)}"
+              f"（阈值 {CALIB_MIN_LEVELS}）", file=sys.stderr)
         # 【阶段 2·版本跟随】与质量头同版本号、同目录（sidecar 按同目录版本发现加载）。
         dir_model.booster_.save_model(os.path.join(_heads_dir, f"lgbm_direction_v{_ver}.txt"))
         with open(os.path.join(_heads_dir, f"calib_dir_np_v{_ver}.pkl"), "wb") as f:
@@ -424,10 +447,30 @@ def main():
         # calib_np.NumpyCalibrator（纯 numpy，生产 sidecar 无 sklearn 也能加载）。
         from calib_np import NumpyCalibrator
         from sklearn.isotonic import IsotonicRegression
-        _e_proba = entry_model.predict_proba(Xe_te)[:, 1]
+        # 【2026-09-10 治本·买点头校准器退化】同方向头：原实现只在单测试切片 Xe_te
+        # 上拟合 → 粗阶梯（v104 实测仅 4 档 <8）。开启 ai.lm.entry_fuse 后会按
+        # entry_veto_prob=0.35 否决"差买点"，退化校准器输出极端值将导致误否决。
+        # 改为跨折 OOF 汇总拟合。
+        _e_fit_p, _e_fit_y = None, None
+        try:
+            from sklearn.model_selection import TimeSeriesSplit, cross_val_predict
+            _e_of = cross_val_predict(
+                lgb.LGBMClassifier(objective="binary", n_estimators=200, learning_rate=0.05,
+                                   num_leaves=15, min_child_samples=20, subsample=0.8,
+                                   colsample_bytree=0.8, random_state=args.seed, verbose=-1),
+                Xe, ye, cv=TimeSeriesSplit(n_splits=5), method="predict_proba")[:, 1]
+            _e_fit_p, _e_fit_y = _e_of, np.asarray(ye)
+        except Exception as _ee:
+            print(f"[entry-calib] OOF 失败，回退测试切片: {_ee}", file=sys.stderr)
+        if _e_fit_p is None:
+            _e_fit_p = entry_model.predict_proba(Xe_te)[:, 1]
+            _e_fit_y = np.asarray(ye_te.values)
         _e_ir = IsotonicRegression(out_of_bounds="clip")
-        _e_ir.fit(_e_proba, ye_te.values)
+        _e_ir.fit(_e_fit_p, _e_fit_y)
         entry_calib = NumpyCalibrator(_e_ir.X_thresholds_, _e_ir.y_thresholds_)
+        print(f"[entry-calib] 拟合 n={len(_e_fit_y)} 档位="
+              f"{len(set(np.round(np.asarray(_e_ir.y_thresholds_), 4)))}"
+              f"（阈值 {CALIB_MIN_LEVELS}）", file=sys.stderr)
         entry_model.booster_.save_model(os.path.join(_heads_dir, f"lgbm_entry_v{_ver}.txt"))
         with open(os.path.join(_heads_dir, f"calib_entry_np_v{_ver}.pkl"), "wb") as f:
             pickle.dump(entry_calib, f)
@@ -542,6 +585,8 @@ def main():
         _tss = TimeSeriesSplit(n_splits=5)
         _aucs, _wrs = [], []
         _fold = 0
+        # 【2026-09-10 治本】跨折汇总 out-of-fold 预测，供最后一次性拟合校准器
+        _oof_p, _oof_y = [], []
         for _tr, _te in _tss.split(X_state):
             _fold += 1
             _pos_ratio = float((y[_tr] == 0).sum()) / max(1, float((y[_tr] == 1).sum()))
@@ -566,10 +611,30 @@ def main():
             print(f"[tss-fold {_fold}] AUC={_auc:.3f} top40%胜率={_wr:.3f} n_te={len(_te)}")
             # 捕获最后一个 fold（最新市场状态）作为成品定版
             _tss_model = _m
+            # 【2026-09-10 治本·原缺陷】此前每折都重新 fit 并【覆盖】_tss_calib，
+            # 最终只剩最后一折那一份（样本量≈全量 1/5）→ isotonic 过拟合为粗阶梯
+            # （实测仅 7 档，且 0.2258→0.6957 巨大断层），把 p_raw=0.302 压到 0.05
+            # 地板 → ai_score 恒 20 → 耦合总分 48.43<50，强趋势 SELL 全被拦。
+            # 改为先收集各折 OOF 预测，循环结束后【汇总一次性拟合】。
             if len(set(_yt)) > 1:
-                _ir = IsotonicRegression(out_of_bounds="clip", y_min=0.05, y_max=0.95)
-                _ir.fit(_p, _yt)
-                _tss_calib = NumpyCalibrator(_ir.X_thresholds_, _ir.y_thresholds_)
+                _oof_p.append(np.asarray(_p, dtype=float).ravel())
+                _oof_y.append(np.asarray(_yt, dtype=float).ravel())
+        # 【2026-09-10 治本】用跨折汇总的 OOF 预测一次性拟合校准器（标准 OOF 校准）。
+        # 样本量约 5 倍于单折 → 档位数显著增加，避免粗阶梯把概率压到 0.05 地板。
+        if _oof_p and _oof_y:
+            try:
+                _all_p = np.concatenate(_oof_p)
+                _all_y = np.concatenate(_oof_y)
+                if len(_all_p) >= 50 and len(set(_all_y.tolist())) > 1:
+                    _ir = IsotonicRegression(out_of_bounds="clip", y_min=0.05, y_max=0.95)
+                    _ir.fit(_all_p, _all_y)
+                    _tss_calib = NumpyCalibrator(_ir.X_thresholds_, _ir.y_thresholds_)
+                    _n_lv = len(set(np.round(np.asarray(_ir.y_thresholds_), 4)))
+                    print(f"[tss-calib] OOF 拟合 n={len(_all_p)} 档位={_n_lv}"
+                          f"{'（<8 仍退化）' if _n_lv < CALIB_MIN_LEVELS else ''}",
+                          file=sys.stderr)
+            except Exception as _ce:
+                print(f"[tss-calib] OOF 拟合失败: {_ce}", file=sys.stderr)
         _aucs_v = [a for a in _aucs if not np.isnan(a)]
         _wrs_v = [w for w in _wrs if not np.isnan(w)]
         if _aucs_v:
@@ -587,6 +652,34 @@ def main():
     else:
         _save_model = model.booster_
         _save_calib = iso
+    # 【2026-09-10 修复·"校准器退化"误判】上方 _calib_degenerate 只描述【验证块】
+    # isotonic(iso)，而**实际落盘生效**的是 _save_calib（优先 TSS 最后 fold 校准器）。
+    # 二者不同：验证块 iso 退化仅影响 [metrics] 校准后概率的展示，并不影响上线模型。
+    # 实测 calib_v97~v102.pkl 全是有效 NumpyCalibrator，但 _calib_degenerate=True 被
+    # auto_retrain 当作"校准器退化"硬性回滚 → 重训闭环被永久堵死（模型其实可用）。
+    # 故单独打印【最终落盘校准器】标记，供 auto_retrain 判定（见其 parse_calib_degenerate）。
+    # 不仅要判"非空"，还要判"档位数"：实测 calib_v101/v102/v103 均为
+    # 3 档阶跃（≤0.30→0.05 / 0.35~0.40→0.17 / ≥0.50→0.95），非空却严重失真，
+    # 把 p_raw=0.302 直接压到 0.05 地板 → ai_score=5 → 钳位[20,85] → 恒 20.0
+    # → 耦合总分 48.43<50，强趋势 SELL 被 COUPLING-BELOW-MIN 全数拦下。
+    _lv = None
+    if _save_calib is not None:
+        try:
+            _probe = np.linspace(0.0, 1.0, 101)
+            _lv = len(np.unique(np.round(
+                np.asarray(_save_calib.predict(_probe)).ravel(), 6)))
+        except Exception:
+            _lv = None
+    if _save_calib is None:
+        print("[calib-final] DEGENERATE: 落盘校准器为 None（上线将用原始概率）",
+              file=sys.stderr)
+    elif _lv is not None and _lv < CALIB_MIN_LEVELS:
+        print(f"[calib-final] DEGENERATE: 落盘校准器仅 {_lv} 档 < {CALIB_MIN_LEVELS}"
+              f"（阶跃失真：会把正常概率压到 0.05 地板，致 ai_score 恒为下限）",
+              file=sys.stderr)
+    else:
+        print(f"[calib-final] OK: 落盘校准器={type(_save_calib).__name__} 档位={_lv}",
+              file=sys.stderr)
     # 【路径修复 2026-09-01】args.model/args.calib 可能自带目录（auto_retrain 传
     # models/lgbm_quality_vN.txt + _artifacts/calib_vN.pkl），原 join(outdir, model)
     # 会重复拼成 _artifacts/models/... 导致质量头保存失败、质量头长期停留在旧版本。
