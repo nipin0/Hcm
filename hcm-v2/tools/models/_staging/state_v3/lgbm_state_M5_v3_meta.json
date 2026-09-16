@@ -1,0 +1,341 @@
+{
+  "tf": "M5",
+  "version": 3,
+  "created_at": "2026-09-14T15:59:42.712737+00:00",
+  "feature_cols": [
+    "box_upper_dist_atr",
+    "box_lower_dist_atr",
+    "box_width_atr",
+    "box_dev",
+    "win_high_dist_atr",
+    "win_low_dist_atr",
+    "hl_range_atr",
+    "close_pctile",
+    "box_break_up",
+    "box_break_dn",
+    "accel_2nd",
+    "atr_14",
+    "atr_chg",
+    "atr_pct",
+    "atr_std_ratio",
+    "atr_box_ratio",
+    "slope_linreg",
+    "r2_linreg",
+    "adx_14",
+    "plus_di",
+    "minus_di",
+    "roc_mom",
+    "new_high_cnt",
+    "new_low_cnt",
+    "consec_same_dir_cnt",
+    "session_eu",
+    "session_us"
+  ],
+  "class_names": [
+    "oscillation",
+    "trend_init_up",
+    "trend_init_down",
+    "trend_mid_up",
+    "trend_mid_down",
+    "trend_fade_up",
+    "trend_fade_down"
+  ],
+  "n_seeds": 5,
+  "model_files": [
+    "lgbm_state_M5_v3_s0.txt",
+    "lgbm_state_M5_v3_s1.txt",
+    "lgbm_state_M5_v3_s2.txt",
+    "lgbm_state_M5_v3_s3.txt",
+    "lgbm_state_M5_v3_s4.txt"
+  ],
+  "class_weight": {
+    "oscillation": 0.35204927742241177,
+    "trend_init_up": 2.608733816107088,
+    "trend_init_down": 2.4974789915966387,
+    "trend_mid_up": 0.8137449517420768,
+    "trend_mid_down": 0.7190032659973388,
+    "trend_fade_up": 3.955634427684117,
+    "trend_fade_down": 3.9803571428571427
+  },
+  "lgbm_params": {
+    "n_estimators": 400,
+    "learning_rate": 0.05,
+    "num_leaves": 31,
+    "min_child_samples": 20,
+    "subsample": 0.85,
+    "subsample_freq": 1,
+    "colsample_bytree": 0.85,
+    "reg_lambda": 1.0,
+    "max_depth": -1
+  },
+  "train_rows": 11888,
+  "train_range": [
+    "2026-06-16T17:20:00+00:00",
+    "2026-09-14T14:45:00+00:00"
+  ],
+  "eval_oof": {
+    "macro_f1": 0.22397916306919366,
+    "auc_ovr_macro": 0.6599270075958169,
+    "form_macro_f1_folded": 0.35084837617933784,
+    "dir_acc_end2end": 0.3449553646622874,
+    "dir_acc_conditional": 0.5209870262019842,
+    "dir_samples": 5937,
+    "per_class": {
+      "oscillation": {
+        "precision": 0.5376814934316663,
+        "recall": 0.5879536290322581,
+        "f1": 0.5616949560611533,
+        "support": 3968
+      },
+      "trend_init_up": {
+        "precision": 0.07569721115537849,
+        "recall": 0.03512014787430684,
+        "f1": 0.047979797979797977,
+        "support": 541
+      },
+      "trend_init_down": {
+        "precision": 0.11870503597122302,
+        "recall": 0.06,
+        "f1": 0.07971014492753623,
+        "support": 550
+      },
+      "trend_mid_up": {
+        "precision": 0.20165745856353592,
+        "recall": 0.2041387024608501,
+        "f1": 0.2028904947192885,
+        "support": 1788
+      },
+      "trend_mid_down": {
+        "precision": 0.23300970873786409,
+        "recall": 0.2549123738714817,
+        "f1": 0.24346943951306113,
+        "support": 1883
+      },
+      "trend_fade_up": {
+        "precision": 0.22564102564102564,
+        "recall": 0.22525597269624573,
+        "f1": 0.22544833475661827,
+        "support": 586
+      },
+      "trend_fade_down": {
+        "precision": 0.20790378006872853,
+        "recall": 0.20543293718166383,
+        "f1": 0.20666097352690008,
+        "support": 589
+      }
+    },
+    "confusion": [
+      [
+        2333,
+        54,
+        70,
+        631,
+        631,
+        118,
+        131
+      ],
+      [
+        199,
+        19,
+        17,
+        108,
+        134,
+        28,
+        36
+      ],
+      [
+        160,
+        18,
+        33,
+        112,
+        149,
+        42,
+        36
+      ],
+      [
+        659,
+        72,
+        48,
+        365,
+        406,
+        101,
+        137
+      ],
+      [
+        653,
+        61,
+        85,
+        410,
+        480,
+        109,
+        85
+      ],
+      [
+        201,
+        17,
+        14,
+        66,
+        120,
+        132,
+        36
+      ],
+      [
+        134,
+        10,
+        11,
+        118,
+        140,
+        55,
+        121
+      ]
+    ],
+    "samples": 9905
+  },
+  "eval_holdout": {
+    "macro_f1": 0.21736033153390272,
+    "auc_ovr_macro": 0.6347590416062311,
+    "form_macro_f1_folded": 0.35406782786351826,
+    "dir_acc_end2end": 0.4344978165938865,
+    "dir_acc_conditional": 0.5223097112860893,
+    "dir_samples": 1832,
+    "per_class": {
+      "oscillation": {
+        "precision": 0.39250493096646943,
+        "recall": 0.36446886446886445,
+        "f1": 0.3779677113010446,
+        "support": 546
+      },
+      "trend_init_up": {
+        "precision": 0.04918032786885246,
+        "recall": 0.019867549668874173,
+        "f1": 0.02830188679245283,
+        "support": 151
+      },
+      "trend_init_down": {
+        "precision": 0.0958904109589041,
+        "recall": 0.03763440860215054,
+        "f1": 0.05405405405405406,
+        "support": 186
+      },
+      "trend_mid_up": {
+        "precision": 0.21137026239067055,
+        "recall": 0.30145530145530147,
+        "f1": 0.24850042844901457,
+        "support": 481
+      },
+      "trend_mid_down": {
+        "precision": 0.2673469387755102,
+        "recall": 0.21906354515050167,
+        "f1": 0.24080882352941177,
+        "support": 598
+      },
+      "trend_fade_up": {
+        "precision": 0.2528409090909091,
+        "recall": 0.4517766497461929,
+        "f1": 0.3242258652094718,
+        "support": 197
+      },
+      "trend_fade_down": {
+        "precision": 0.2535885167464115,
+        "recall": 0.2420091324200913,
+        "f1": 0.24766355140186916,
+        "support": 219
+      }
+    },
+    "confusion": [
+      [
+        199,
+        8,
+        14,
+        119,
+        120,
+        55,
+        31
+      ],
+      [
+        28,
+        3,
+        11,
+        59,
+        18,
+        17,
+        15
+      ],
+      [
+        29,
+        8,
+        7,
+        57,
+        44,
+        26,
+        15
+      ],
+      [
+        107,
+        19,
+        13,
+        145,
+        88,
+        69,
+        40
+      ],
+      [
+        97,
+        16,
+        25,
+        227,
+        131,
+        65,
+        37
+      ],
+      [
+        31,
+        4,
+        2,
+        21,
+        32,
+        89,
+        18
+      ],
+      [
+        16,
+        3,
+        1,
+        58,
+        57,
+        31,
+        53
+      ]
+    ],
+    "samples": 2378
+  },
+  "feature_importance": {
+    "box_upper_dist_atr": 3032.2,
+    "box_lower_dist_atr": 2949.8,
+    "box_width_atr": 2473.0,
+    "box_dev": 2943.8,
+    "win_high_dist_atr": 3577.2,
+    "win_low_dist_atr": 3468.4,
+    "hl_range_atr": 4067.4,
+    "close_pctile": 2480.0,
+    "box_break_up": 0.0,
+    "box_break_dn": 0.0,
+    "accel_2nd": 3815.2,
+    "atr_14": 5340.8,
+    "atr_chg": 4527.0,
+    "atr_pct": 4510.2,
+    "atr_std_ratio": 5404.4,
+    "atr_box_ratio": 1709.6,
+    "slope_linreg": 3762.2,
+    "r2_linreg": 4808.6,
+    "adx_14": 5803.0,
+    "plus_di": 4115.2,
+    "minus_di": 4095.4,
+    "roc_mom": 3943.2,
+    "new_high_cnt": 2799.6,
+    "new_low_cnt": 2973.8,
+    "consec_same_dir_cnt": 1400.0,
+    "session_eu": 0.0,
+    "session_us": 0.0
+  }
+}

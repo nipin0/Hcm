@@ -576,6 +576,21 @@ def _rate_get(r, name, default=0):
     return v if v is not None else default
 
 
+def _kline_writer_allowed() -> bool:
+    """行情库(K 线)写入闸门：仅【主号】桥可写。
+
+    根因（2026-09-14 实测取证）：master(STARTRADERFinancial-Demo) 与
+    follower(MegaFusionGroupPty-Trade) 两个桥终端都【无条件】写同一批
+    (symbol, timeframe, open_time) 行。两家券商报价不同，配合旧 GREATEST/LEAST
+    会把 high/low 合并成"嵌合棒"——实测 high=4435 配 close=4322 这类不可能组合，
+    12 小时内 115 根；推高 atr_14/±DI/adx_14/donchian_q/pullback_depth/spread_atr
+    等全部 high/low 类特征 → auto_retrain PSI 重度漂移（psi_max 13.6、25 维）。
+    口径沿用本文件既有写法 `(IS_MASTER or not IS_FOLLOWER)`：单桥 standalone
+    （两标志皆 False）仍照常写入，不影响单终端部署。
+    """
+    return IS_MASTER or not IS_FOLLOWER
+
+
 async def write_klines_to_pg(pool, rates, symbol, timeframe_str, broker_utc_offset_s: int = 0):
     """Write kline bars to PostgreSQL.
 
@@ -618,8 +633,20 @@ async def write_klines_to_pg(pool, rates, symbol, timeframe_str, broker_utc_offs
                  tick_volume, spread, real_volume, source)
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
             ON CONFLICT (symbol, time_frame, open_time) DO UPDATE SET
-                high = GREATEST(hcm_market.klines.high, EXCLUDED.high),
-                low = LEAST(hcm_market.klines.low, EXCLUDED.low),
+                -- 【P0 根因修复 2026-09-14】原为 `high=GREATEST(...) / low=LEAST(...)`（单调累积）：
+                -- 一次坏写入（陈旧/异常 tick 的实时棒快照）会把伪极值【永久锁死】在该棒上，
+                -- 之后所有正常写入都无法纠正它。实测 2026-09-10 18:00 ~ 09-11 20:00：
+                -- high 悬在 4414~4435 达 12 小时，而 close 始终 4316~4332、实体≈0
+                -- （同窗 325 根中 161 根 `range>30 且 body<5`），伪极值全量传导到
+                -- atr_14/±DI/adx_14/donchian_q/pullback_depth/atr_pct/spread_atr 等
+                -- high/low 类特征 → 触发 auto_retrain PSI 重度漂移（psi_max=13.6、25 维漂移）。
+                -- 判定依据：本函数数据源为 fetch_klines → mt5.copy_rates_from_pos(...,0,count)，
+                -- 每根棒都是 MT5 的【累计快照】（含正在形成中的棒），因此"以最新快照覆盖"
+                -- 才是正确语义；GREATEST/LEAST 既冗余又有害，且与既有 close 覆盖语义不一致。
+                -- 附带收益：即使再出现坏写入，下一次写入（~5s）即自动纠正，无需额外护栏。
+                open = EXCLUDED.open,
+                high = EXCLUDED.high,
+                low = EXCLUDED.low,
                 close = EXCLUDED.close,
                 -- Tier1: tick_volume 取最新快照(覆盖)而非累加。旧逻辑每 5s 重写一次
                 -- 同一收盘 bar 就把 tick_volume 累加 ~120 倍，导致 PG 收盘 bar 成交量
@@ -1441,14 +1468,13 @@ def place_mt5_order(mt5, signal_data, symbol, timeframe_str, redis_conn=None):
     # 原实现无条件把任何 SL 距离 < 会话 trailing_stop_distance×ATR 的止损抬到会话
     # 下限，导致信号塔刻意收紧的止损被反向放大（实证：RANGE 串行加仓单 1×ATR=4.41
     # 被拉宽成 2×ATR≈11.49，orders 开仓即 4408.26，风控形同虚设）。
-    # 豁免条件：① strategy=range（控制器自定义 sl_atr_mult）；② 上游显式透传
-    # sl_locked=1（趋势抢跑/极值追单等已由信号塔锁定止损的场景）。
+    # 豁免条件：上游显式透传 sl_locked=1（趋势抢跑/极值追单等已由信号塔锁定止损的场景）。
+    # 【P2 清理 2026-09-11】原 `strategy=="range"` 豁免恒不触发（SignalData 无 strategy 字段、
+    # 全仓 0 写入点），已删除以免误导读维护者；RANGE 的 SL 语义改由信号塔侧保证——
+    # P0 修复后 RANGE 分支不再写非零 sl_price，本函数 1416 行按会话系数算 SL，天然正确。
     # 未豁免场景行为完全不变（zone/AI 收紧的止损仍受会话下限保护）。
     _sl_locked_raw = signal_data.get("sl_locked", 0)
-    _sl_locked = (
-        str(signal_data.get("strategy", "") or "").strip().lower() == "range"
-        or str(_sl_locked_raw).strip().lower() in ("1", "true", "yes", "on")
-    )
+    _sl_locked = str(_sl_locked_raw).strip().lower() in ("1", "true", "yes", "on")
     if redis_conn and sl > 0 and not _sl_locked:
         try:
             _sess_floor = _current_session()
@@ -3489,8 +3515,12 @@ async def main(dry_run=False):
             except Exception as e:
                 log.warning(f"Cannot fetch {sym} ({tf}): {e}")
         if len(rates) > 0:
-            await write_klines_to_pg(pool, rates, primary_symbol, tf, mt5._broker_utc_offset_s)
-            log.info(f"Initial K-lines loaded: {len(rates)} ({primary_symbol} {tf})")
+            if _kline_writer_allowed():
+                await write_klines_to_pg(pool, rates, primary_symbol, tf, mt5._broker_utc_offset_s)
+                log.info(f"Initial K-lines loaded: {len(rates)} ({primary_symbol} {tf})")
+            else:
+                log.info(f"K-line write skipped (role=follower; 仅主号写行情库) "
+                         f"({primary_symbol} {tf}, {len(rates)} bars)")
         else:
             log.warning(f"No K-line data for {tf} — will retry on next cycle")
 
@@ -3697,8 +3727,12 @@ async def main(dry_run=False):
             # 故取 3 根并整批交给 write_klines_to_pg，由其内部“未收盘棒防御”
             # 跳过当前/未来棒，仅持久化已收盘棒（ON CONFLICT 合并，不丢不重）。
             if now - last_kline > 5:
+                # 【多券商嵌合棒修复 2026-09-14】仅主号桥写行情库：两个桥终端（不同券商）
+                # 无条件写同一批 (symbol, tf, open_time) 行 → high/low 被 GREATEST/LEAST
+                # 合并成"嵌合棒"。非写入者让内层迭代为空即可——不能 `continue`，否则会
+                # 跳过本循环后半段的下单/风控/对账逻辑。
                 for tf in all_timeframes:
-                    for sym in symbols:
+                    for sym in (symbols if _kline_writer_allowed() else []):
                         rates = fetch_klines(mt5, sym, tf, 3)
                         if rates is not None and len(rates) >= 2:
                             latest = rates[-1]
@@ -5021,6 +5055,130 @@ async def _rev_apply_verdicts(mt5, redis_conn, pool):
             log.error("[REV] apply failed ticket=%s: %s", ticket, e)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  【2026-09-15 §43.4 (c)】FSM 持仓管理（magic 61/62）
+#  方案：docs/设计方案_信号塔状态机与交易策略重构_20260914.md §43.4 / §45
+#  FSM 持仓的移动止损 = **既有会话系数 + 塔的收紧系数**（保留 FSM，不复用 hexp 的
+#  `_ai_sl_price`/`_chase_sl_price` 矫准 —— 用户 2026-09-15「保留FSM」决策）。
+# ══════════════════════════════════════════════════════════════════════════
+_FSM_MAGICS = (61, 62)                       # signal_publisher.SIGNAL_MODE_MAGIC
+_FSM_DIRECTIVE_TMPL = "hcm:state:directive:{symbol}"
+
+# ══════════════════════════════════════════════════════════════════════════
+# 【2026-09-15】magic 现在携带**触发下单信号的信息**（8 位十进制 `LL·SS·RR·TT`：
+#   逻辑码 · FSM状态 · 触发原因 · 梯度档），故"是不是 FSM 单 / 是 osc 还是 trend"
+#   **必须按前导逻辑码判定**，不能再精确等于 61/62。
+#
+# 布局与判据的**唯一实现在 `signal_tower/state_strategy.py`**（那里拥有"触发原因"的真源）。
+# 此处按**已验证的** importlib 路径加载（先例：`tools/position_sync.py` 加载
+# `state_machine`），不新增文件、不改 compose 挂载。
+#
+# 降级：加载失败 → 只认**裸 61/62**（= 历史单语义）+ WARNING。绝不静默改变仓位归属
+#   （若失败还"猜"新格式，可能把非 FSM 仓当成 FSM 仓去收紧止损 = 动别人的止损）。
+# `_FSM_MAGICS` 保留为**旧格式**白名单（兼容库中/终端里的历史单）。
+# ══════════════════════════════════════════════════════════════════════════
+_SS_CACHE: dict = {}
+
+
+def _state_strategy_mod():
+    """按路径惰性加载 state_strategy（只加载一次；失败缓存 None）。"""
+    if "m" not in _SS_CACHE:
+        try:
+            import importlib.util as _ilu
+            import sys as _sys
+            _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "hcm-signal-tower", "signal_tower",
+                              "state_strategy.py")
+            _sp = _ilu.spec_from_file_location("state_strategy", _p)
+            _m = _ilu.module_from_spec(_sp)
+            # ⚠ **必须在 exec_module 之前注册 sys.modules**（本仓库既有 `_load` 约定的那一行）：
+            # `state_strategy.py` 用了 `from __future__ import annotations` → 注解是**字符串**，
+            # 而 `@dataclass` 解析注解时要查 `sys.modules[cls.__module__].__dict__`。
+            # 漏注册 ⇒ dataclass 处理阶段抛异常 ⇒ 整个模块加载失败（本行实测踩到：
+            # 表现为 `_is_fsm_magic` 静默降级为"只认裸 61/62"，**新格式单不被识别**，
+            # ④不收紧、§57 离场匹配不上）。诊断见 verify_bridge_fsm_trail.py §3b。
+            _sys.modules.setdefault("state_strategy", _m)
+            _sp.loader.exec_module(_m)
+            _SS_CACHE["m"] = _m
+        except Exception as _e:  # noqa: BLE001
+            log.warning("state_strategy 加载失败（magic 判据降级为「只认裸 61/62」）：%s", _e)
+            _SS_CACHE["m"] = None
+    return _SS_CACHE["m"]
+
+
+def _is_fsm_magic(magic) -> bool:
+    """是否 FSM 单（新 8 位格式或历史裸 61/62）。"""
+    _m = _state_strategy_mod()
+    if _m is not None:
+        try:
+            return bool(_m.is_fsm_magic(magic))
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return int(magic or 0) in _FSM_MAGICS
+    except (TypeError, ValueError):
+        return False
+
+
+def _fsm_magic_logic(magic) -> str:
+    """magic → "osc" / "trend" / ""（非 FSM）。用于 §57 离场指令的 scope 匹配。"""
+    _m = _state_strategy_mod()
+    if _m is not None:
+        try:
+            return str(_m.fsm_magic_logic(magic) or "")
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        _v = int(magic or 0)
+    except (TypeError, ValueError):
+        return ""
+    return "osc" if _v == 61 else "trend" if _v == 62 else ""
+
+# 【§57-12.3-2】箱体突破"立即离场"的**重试节流**（ticket → 上次尝试时刻）。
+# 为什么需要：塔在破界持续期间**每根 bar 都会重发** exit_now（这是对的——我们要出去），
+# 而本管理循环是 tick 级（秒级）。若平仓因故失败（市场关闭/retcode 非 10009），
+# 无节流会**每秒打一次 order_send + 一条日志**直到塔在下一根 bar 撤销指令。
+# 30s 节流把最坏情况压到"每 30s 一次重试"，既不放弃离场也不打风暴。
+_FSM_EXIT_LAST: dict = {}
+_FSM_EXIT_MIN_INTERVAL_SEC = 30.0
+
+
+def _fsm_read_directive(redis_conn, symbol: str) -> dict:
+    """读塔每 bar 刷新的 FSM 指令（`trail_mult` / `exit_ready` / `trail_lookback`）。
+
+    **任何失败一律返回 {}** → 调用方保持既有行为（不收紧）。
+    即"塔失联/键过期时不改变现有止损行为" —— 既不放宽也不收紧，避免风控被静默削弱。
+    """
+    try:
+        raw = redis_conn.get(_FSM_DIRECTIVE_TMPL.format(symbol=symbol))
+        if not raw:
+            return {}
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else {}
+    except Exception as _e:  # noqa: BLE001
+        log.debug(f"FSM directive read failed ({symbol}): {_e}")
+        return {}
+
+
+def _fsm_clamp_trail_sl(side: str, cand: float, market: float, min_dist: float) -> float:
+    """FSM 移动止损的**最小安全距离**约束（纯函数；方案 §43.4 三步规则第 2 步）。
+
+    规格字面的"近 N 根极值 ∓ ATR×k"会产出**无效止损**（比如此前实测：多头 SL 被放到
+    **市价上方**，MT5 必拒单；该口径还会让回放均值 R 从 +0.059 虚增到 +0.407，见 §41）。
+    故对 FSM 持仓施加"不许越过市价 + 留出最小距离"：
+
+        多头: sl = min(cand, market − min_dist)
+        空头: sl = max(cand, market + min_dist)
+
+    第 3 步"只前移不放宽"由调用方的棘轮（`candidate > pos.sl`）保证，此处不重复。
+    """
+    if side == "BUY":
+        return min(float(cand), float(market) - float(min_dist))
+    if side == "SELL":
+        return max(float(cand), float(market) + float(min_dist))
+    return float(cand)
+
+
 async def _update_trailing_stops(mt5, redis_conn, pool):
     """保本 + 单线移动止盈（方案乙，2026-07-14）。
 
@@ -5125,6 +5283,75 @@ async def _update_trailing_stops(mt5, redis_conn, pool):
             new_sl = pos.sl or 0.0
             pos_type = "BUY" if pos.type == 0 else "SELL" if pos.type == 1 else ""
 
+            # ── 【§43.4 (c)】FSM 持仓（magic 61/62）：按塔指令收紧移动止损 ──
+            # **非 FSM 持仓完全不变**（_trail_wide_eff == trail_wide、_fsm_dir is None）。
+            # 收紧系数来自 `hcm:state:directive:{symbol}`（塔每 bar 刷新）而非开仓时快照 ——
+            # S4/反转头是**后来**发生的，快照拿不到。
+            _trail_wide_eff, _fsm_dir, _fsm_min_dist = trail_wide, None, 0.0
+            if _is_fsm_magic(pos.magic):
+                _fsm_dir = _fsm_read_directive(redis_conn, pos.symbol)
+                # ── 【§57-12.3-2】箱体突破**立即离场**（塔侧只做判定，平仓必须由桥执行）──
+                # 为什么复用本指令键：本循环**已经每 tick 读它**（为 trail_mult），
+                #   故"平仓"无需新增通道（新增通道 = 同一意图两份真值，本仓库红线）。
+                # 为什么必须校验 scope：指令键是**按品种**的，而同一品种可能同时存在
+                #   箱体单(61) 与趋势单(62) —— 不做 scope 匹配，"箱体结构破坏"会把
+                #   **正在正常奔跑的趋势单**一并平掉。
+                # 安全性：读键失败已由 `_fsm_read_directive` 兜成 {}（**不动作** —— 既不误平
+                #   也不放宽止损）；重试节流见 `_FSM_EXIT_LAST`。
+                if bool(_fsm_dir.get("exit_now")):
+                    _esc = str(_fsm_dir.get("exit_scope") or "")
+                    if _esc and _esc == _fsm_magic_logic(pos.magic):
+                        _now = datetime.now(timezone.utc).timestamp()
+                        if (_now - float(_FSM_EXIT_LAST.get(pos.ticket, 0.0))
+                                >= _FSM_EXIT_MIN_INTERVAL_SEC):
+                            _FSM_EXIT_LAST[pos.ticket] = _now
+                            try:
+                                _ct = (mt5.ORDER_TYPE_SELL if pos.type == 0
+                                       else mt5.ORDER_TYPE_BUY)
+                                _r = mt5.order_send({
+                                    "action": mt5.TRADE_ACTION_DEAL,
+                                    "position": pos.ticket, "symbol": pos.symbol,
+                                    "volume": pos.volume, "type": _ct,
+                                    "price": tick.bid if pos.type == 0 else tick.ask,
+                                })
+                                if _r and _r.retcode == 10009:
+                                    log.warning(
+                                        "#%s FSM 立即离场成交（reason=%s magic=%d）"
+                                        "← 塔侧箱体突破止损（§57-12.3-2）",
+                                        pos.ticket, _fsm_dir.get("exit_reason", "?"),
+                                        pos.magic)
+                                else:
+                                    log.error(
+                                        "#%s FSM 立即离场失败 retcode=%s（%ds 后重试）",
+                                        pos.ticket, (_r.retcode if _r else "N/A"),
+                                        int(_FSM_EXIT_MIN_INTERVAL_SEC))
+                            except Exception as _ee:  # noqa: BLE001
+                                log.exception("#%s FSM 立即离场异常：%s", pos.ticket, _ee)
+                            continue      # 已请求平仓 → 本 tick 不再对该仓做 SL 管理
+                try:
+                    _tm = float(_fsm_dir.get("trail_mult", 1.0) or 1.0)
+                except (TypeError, ValueError):
+                    _tm = 1.0
+                # 【冲突②修复】trail_mult 按 scope 作用域收紧：指令键按品种，同品种可能
+                # 同时存在箱体单(61/osc)与趋势单(62/trend)。不带 scope 匹配会把另一子类
+                # 的持仓一并收紧（例如趋势态 S4 收紧意图误伤正常奔跑的箱体单）。
+                # 空 scope（向后兼容/未限定）= 对所有 FSM 持仓生效（= 改动前行为）。
+                _ts = str(_fsm_dir.get("trail_scope") or "")
+                if _tm > 0 and (not _ts or _ts == _fsm_magic_logic(pos.magic)):
+                    _trail_wide_eff = trail_wide * _tm
+                # 最小安全距离 = max(配置×ATR, 经纪商 stops_level×point)：
+                # 前者防"贴脸止损"被噪音扫掉，后者防 MT5 `Invalid stops` 拒单。
+                _fsm_min_dist = max(
+                    atr * _get_close_config(redis_conn, "state.trend.min_sl_atr", 0.3), 0.0)
+                try:
+                    _si = mt5.symbol_info(pos.symbol)
+                    _fsm_min_dist = max(
+                        _fsm_min_dist,
+                        float(getattr(_si, "trade_stops_level", 0) or 0)
+                        * float(getattr(_si, "point", 0.0) or 0.0))
+                except Exception:  # noqa: BLE001
+                    pass
+
             # ── BE 标志记录（先用当前 SL 估算；下方修改成功后用 new_sl 覆盖）──
             _dir = "BUY" if pos.type == 0 else "SELL"
             _eff_sl = pos.sl or 0.0
@@ -5160,8 +5387,15 @@ async def _update_trailing_stops(mt5, redis_conn, pool):
                 # 过保本门槛：先抬保本地板；仅当盈利 > trail_start 才启动移动止盈线
                 breakeven_floor = round(entry + be_buffer, 2)
                 if profit > _trail_start_eff:
-                    trailing_sl = round(tick.bid - trail_wide, 2)
+                    trailing_sl = round(tick.bid - _trail_wide_eff, 2)
                     candidate = max(breakeven_floor, trailing_sl)
+                    # 【§43.4 (c)】FSM clamp：过近/越过市价 → **本次不动 SL**（不放到更差的位置）
+                    if _fsm_dir is not None:
+                        _c2 = _fsm_clamp_trail_sl("BUY", candidate, tick.bid, _fsm_min_dist)
+                        if _c2 < candidate:
+                            log.info(f"#{pos.ticket} FSM clamp: cand={candidate}→{_c2} 过近"
+                                     f"（min_dist={_fsm_min_dist:.2f}）→ 跳过本次移动")
+                            candidate = pos.sl or 0.0
                     # 移动止盈接力 TP 追利: TP 同步前移, 锁 50% 盈利 + trail_wide 缓冲
                     if tp_relay_enabled:
                         # 承接 TP 追利: TP 跟随现价前移, 保持在价格前方 tp_trail_wide 缓冲,
@@ -5188,8 +5422,15 @@ async def _update_trailing_stops(mt5, redis_conn, pool):
                     continue
                 breakeven_floor = round(entry - be_buffer, 2)
                 if profit > _trail_start_eff:
-                    trailing_sl = round(tick.ask + trail_wide, 2)
+                    trailing_sl = round(tick.ask + _trail_wide_eff, 2)
                     candidate = min(breakeven_floor, trailing_sl)
+                    # 【§43.4 (c)】FSM clamp：过近/越过市价 → **本次不动 SL**
+                    if _fsm_dir is not None:
+                        _c2 = _fsm_clamp_trail_sl("SELL", candidate, tick.ask, _fsm_min_dist)
+                        if _c2 > candidate:
+                            log.info(f"#{pos.ticket} FSM clamp: cand={candidate}→{_c2} 过近"
+                                     f"（min_dist={_fsm_min_dist:.2f}）→ 跳过本次移动")
+                            candidate = pos.sl or 0.0
                     if tp_relay_enabled:
                         # 承接 TP 追利: TP 跟随现价前移, 保持在价格前方 tp_trail_wide 缓冲
                         # (SELL 在价格下方), 价格跌破原 TP 后继续承接趋势奔跑; 棘轮只进不退。

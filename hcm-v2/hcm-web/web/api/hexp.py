@@ -189,6 +189,24 @@ HEXP_KEYS: dict[str, Any] = {
     # 2026-08-27 位置因子趋势态降权系数：趋势/反转态下 pos_factor 权重乘此值（默认 0.25），
     # 避免下跌趋势 pos_cycle 低位强推 BUY 与真实 SELL 反向（死标签根因）。
     "hexp.pos_factor.trend_scale": 0.25,
+    # ── 【A/B/C 2026-09-11 趋势优先治理】治「上涨趋势中发 SELL」的架构性缺陷 ──
+    # 缺陷：f_rsi(RSI>70→-1) 与 f_pos(顶部→-1) 均为均值回归语义，anti_cancel 又升权
+    # rsi、降权 ma → 强趋势高位时 dir_sum 转负 → 逆势开空（实证 09-11 12:52 SELL@4379，
+    # 该单 -20 止损）。以下键已登记白名单可热调；默认值 = 零行为变化（shadow/off）。
+    "hexp.anti_cancel.enabled": True,
+    "hexp.anti_cancel.curve": 1.0,
+    "hexp.anti_cancel.ma_floor": 0.35,
+    # B2：确认趋势态(主周期 TREND_UP/DOWN)时跳过 anti_cancel 均值回归调制。默认 false。
+    "hexp.anti_cancel.trend_guard": False,
+    # B1：趋势态 RSI 语义 off(旧:超买推空) | shadow(默认,只观测) | on(超买不再推空)。
+    "hexp.trend_rsi_mode": "shadow",
+    # B4：方向迟滞「保守维持」TTL(根)；连续维持超过该值即允许翻向。0=关闭(默认)。
+    "hexp.direction_hysteresis_ttl_bars": 0,
+    # C：趋势优先 off | shadow(默认,只观测) | on(确认趋势态时禁逆势开单)。
+    "hexp.trend_priority_mode": "shadow",
+    # C 重新标定(2026-09-12)：趋势优先闸门作用域收窄旋钮（与引擎 _DEFAULTS 对齐）。
+    "hexp.trend_priority_block_states": "RANGE,TRANSITION",
+    "hexp.trend_priority_block_min_strength": 0.7,
     # 精确信号闸门：最低可下单分级（S/A/B/C）。低于此级只落库观测、不产交易方向。
     "hexp.min_grade": "C",
     # 部署意图档位：一键诊断 min_grade_drift 节点的"锚点"。换档位只改此键即可，
@@ -284,12 +302,12 @@ HEXP_KEYS: dict[str, Any] = {
     # 再开，使「切入生产」成为一次纯配置变更（秒级可回退，无需改代码发版）。
     "hexp.trend_start.new_mode_order_allowed": False,
     # 新判定参数（回测最优；40 组 SL×HOLD×RR 中 30 组样本内外净 R 同正，属平原非孤峰）
-    "hexp.trend_start.bbw_max": 20.0,      # 压缩：bbw 分位低于此值
+    "hexp.trend_start.bbw_max": 25.0,      # 压缩：bbw 分位低于此值
     "hexp.trend_start.don_look": 10,       # 突破：Donchian 周期(根)
     "hexp.trend_start.h1_ema": 50,         # 共振：H1 EMA 周期
     "hexp.trend_start.sl_atr_mult": 3.5,   # 出场：SL = 3.5 × ATR
     "hexp.trend_start.rr": 1.5,            # 出场：TP = 5.25 × ATR
-    "hexp.trend_start.hold_bars": 90,      # 出场：持有上限 90 根 M5(7.5h)
+    "hexp.trend_start.hold_bars": 30,      # 出场：持有上限 30 根 M5(2.5h)
     # 旧判定参数（hexp.trend_start_mode=phase_ignite 热回退时生效）
     "hexp.trend_start_phases": "ignite,establish",
     "hexp.trend_start_mm_min": -0.05,
@@ -301,6 +319,29 @@ HEXP_KEYS: dict[str, Any] = {
     # lot_mult 默认 1.0 = 完全不干预，仅在确需微调时才配置。
     "hexp.trend_start.lot_tier": "low",
     "hexp.trend_start_order_lot_mult": 1.0,
+    # ── 【P1b 2026-09-11 审计纳管】HEXP 入场闸门配置键族 ──
+    # 历史遗漏：本族键由 micro_state.load_config（theta/pullback/accel）与
+    # precision_entry.load_config（weight/min_rr）读取，且在 PG 已有 seed，
+    # 但从未登记 HEXP_KEYS → 面板无控件（只能直写配置中心）。
+    # 注：scheduler._shadow_v2_loaded 置真后每进程仅 load_config 一次，
+    #     热改需重启进程（P1c 已修）。此处仅补白名单使其可经面板管理。
+    "hexp.entry_gate_enabled": True,       # 入场闸门总开关（scheduler 消费；关=跳过 θ 裁决）
+    "hexp.entry_gate_force_pass": False,   # 强制放行（调试/影子验证用）
+    "hexp.entry.theta.TREND_PULLBACK": 0.30,   # 状态门槛 θ（趋势回踩最低）
+    "hexp.entry.theta.TREND_ACCEL": 0.45,
+    "hexp.entry.theta.TREND_EXHAUST": 0.55,    # 衰竭最高（最谨慎）
+    "hexp.entry.theta.RANGE": 0.45,
+    "hexp.entry.theta.REVERSAL": 0.50,
+    "hexp.entry.pullback_atr_min": 0.5,        # 回踩深度黄金区间（ATR 归一化）
+    "hexp.entry.pullback_atr_max": 1.5,
+    "hexp.entry.accel_strict_enabled": True,   # 加速度严格判定（横盘防御）
+    "hexp.entry.accel_lookback": 12,
+    "hexp.entry.accel_er_min": 0.35,
+    "hexp.entry.accel_disp_atr_min": 1.0,
+    "hexp.entry.weight.align": 0.40,           # 精确入场加权（方向对齐/结构/R:R）
+    "hexp.entry.weight.structure": 0.40,
+    "hexp.entry.weight.rr": 0.20,
+    "hexp.entry.min_rr": 1.2,                  # 风险回报硬门槛（R:R<此值降权）
 }
 
 

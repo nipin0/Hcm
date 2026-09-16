@@ -235,6 +235,36 @@ def evaluate(name, y_true, p):
     return "\n".join(out)
 
 
+def oof_proba_time_series(build_model, X, y, n_splits: int = 5):
+    """【2026-09-11 修复】时序 OOF 概率汇总（手写循环，替代 cross_val_predict）。
+
+    根因（实测）：`cross_val_predict(..., cv=TimeSeriesSplit(n_splits=5))` 必抛
+      ValueError: cross_val_predict only works for partitions
+    —— TimeSeriesSplit 的**首段永远不进测试集**，不构成 partition。
+    原实现把该调用包在 `try/except` 里 → 异常被静默吞掉 → `_fit_p is None`
+    → 回退到**单测试切片**拟合 isotonic（样本量小）→ 校准器退化成粗阶梯
+    （档位 < CALIB_MIN_LEVELS=8）。这正是"方向头/买点头校准器反复退化"的真根因，
+    也是 2026-09-10「改 OOF 治本」未能生效的原因。
+
+    返回 (oof_p, y_covered)：oof_p 形状 (n_covered, n_class)；无可覆盖折返回 (None, None)。
+    """
+    from sklearn.model_selection import TimeSeriesSplit
+    y = np.asarray(y)
+    tss = TimeSeriesSplit(n_splits=n_splits)
+    oof = None
+    for tr, te in tss.split(X):
+        m = build_model()
+        m.fit(X.iloc[tr], y[tr])
+        p = m.predict_proba(X.iloc[te])
+        if oof is None:
+            oof = np.full((len(X), p.shape[1]), np.nan)
+        oof[te] = p
+    if oof is None:
+        return None, None
+    cov = ~np.isnan(oof[:, 0])
+    return oof[cov], y[cov]
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--labels", default="labels.csv")
@@ -390,19 +420,17 @@ def main():
         # 退化校准器会输出 0.95 这类极端概率；一旦开启 ai.lm.direction_fuse，将按
         # dir_veto_prob=0.65 做【反向否决】→ 用不可信概率否掉 HEXP 已放行的单。
         # 改为【跨折 OOF 预测汇总后一次性拟合】，样本量约 5 倍，档位数显著增加。
-        _fit_p, _fit_y = None, None
-        try:
-            from sklearn.model_selection import TimeSeriesSplit, cross_val_predict
-            _oof = cross_val_predict(
-                lgb.LGBMClassifier(objective="multiclass", num_class=3, n_estimators=200,
-                                   learning_rate=0.05, num_leaves=15, min_child_samples=20,
-                                   subsample=0.8, colsample_bytree=0.8,
-                                   random_state=args.seed, verbose=-1),
-                Xd, yd, cv=TimeSeriesSplit(n_splits=5), method="predict_proba")
-            _fit_p, _fit_y = _oof, np.asarray(yd)
-        except Exception as _oe:
-            print(f"[dir-calib] OOF 失败，回退测试切片: {_oe}", file=sys.stderr)
+        # 【2026-09-11 修复】原 cross_val_predict + TimeSeriesSplit 必抛
+        # "only works for partitions" 且被 except 静默吞掉 → 回退单测试切片 →
+        # 校准器退化（档位 < CALIB_MIN_LEVELS）。改用手写时序 OOF。
+        _fit_p, _fit_y = oof_proba_time_series(
+            lambda: lgb.LGBMClassifier(objective="multiclass", num_class=3, n_estimators=200,
+                                       learning_rate=0.05, num_leaves=15, min_child_samples=20,
+                                       subsample=0.8, colsample_bytree=0.8,
+                                       random_state=args.seed, verbose=-1),
+            Xd, yd)
         if _fit_p is None:
+            print("[dir-calib] OOF 无可覆盖折，回退测试切片", file=sys.stderr)
             _fit_p = dir_model.predict_proba(Xd_te)
             _fit_y = np.asarray(yd_te)
         _dir_lv = []
@@ -451,18 +479,17 @@ def main():
         # 上拟合 → 粗阶梯（v104 实测仅 4 档 <8）。开启 ai.lm.entry_fuse 后会按
         # entry_veto_prob=0.35 否决"差买点"，退化校准器输出极端值将导致误否决。
         # 改为跨折 OOF 汇总拟合。
-        _e_fit_p, _e_fit_y = None, None
-        try:
-            from sklearn.model_selection import TimeSeriesSplit, cross_val_predict
-            _e_of = cross_val_predict(
-                lgb.LGBMClassifier(objective="binary", n_estimators=200, learning_rate=0.05,
-                                   num_leaves=15, min_child_samples=20, subsample=0.8,
-                                   colsample_bytree=0.8, random_state=args.seed, verbose=-1),
-                Xe, ye, cv=TimeSeriesSplit(n_splits=5), method="predict_proba")[:, 1]
-            _e_fit_p, _e_fit_y = _e_of, np.asarray(ye)
-        except Exception as _ee:
-            print(f"[entry-calib] OOF 失败，回退测试切片: {_ee}", file=sys.stderr)
-        if _e_fit_p is None:
+        # 【2026-09-11 修复】同方向头：cross_val_predict + TimeSeriesSplit 抛错被吞
+        # → 回退单切片 → 校准器退化。改用手写时序 OOF。
+        _e_oof, _e_y = oof_proba_time_series(
+            lambda: lgb.LGBMClassifier(objective="binary", n_estimators=200, learning_rate=0.05,
+                                       num_leaves=15, min_child_samples=20, subsample=0.8,
+                                       colsample_bytree=0.8, random_state=args.seed, verbose=-1),
+            Xe, ye)
+        if _e_oof is not None:
+            _e_fit_p, _e_fit_y = _e_oof[:, 1], _e_y
+        else:
+            print("[entry-calib] OOF 无可覆盖折，回退测试切片", file=sys.stderr)
             _e_fit_p = entry_model.predict_proba(Xe_te)[:, 1]
             _e_fit_y = np.asarray(ye_te.values)
         _e_ir = IsotonicRegression(out_of_bounds="clip")

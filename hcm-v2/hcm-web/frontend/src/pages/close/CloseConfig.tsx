@@ -6,15 +6,9 @@ import client from '../../api/client';
 const fields: ConfigField[] = [
   // ── Group 1: 平仓策略（位置：左上，灰）──
   { type: 'section', key: '_s1', label: '平仓策略', color: '#94a3b8', description: '仓位退出规则与触发条件' },
-  { key: 'close_method', label: '平仓策略', type: 'select', defaultValue: 'auto', options: [
-    { label: '信号平仓', value: 'auto' },
-    { label: '止损止盈', value: 'sl_tp' },
-    { label: '时间平仓', value: 'time' },
-    { label: '组合策略', value: 'hybrid' },
-  ]},
-  // 注：close_on_reverse_signal / close_at_market_close / friday_close_enabled /
-  // partial_close_trigger 已移除——后端 close.py 默认值与桥(mt5_bridge)均不消费这些键，
-  // 属面板孤儿（保存只会写入 Redis 无人读取的 close.* 孤儿键），故不再展示。
+  // 注：close_method / close_timeout / close_on_reverse_signal / close_at_market_close /
+  // friday_close_enabled / partial_close_trigger 已移除——后端 close.py 默认值与桥
+  // (mt5_bridge) 均不消费这些键，属面板孤儿（保存只写无人读取的 close.* 孤儿键）。
   { key: 'partial_close_enabled', label: '启用分批平仓', type: 'switch', defaultValue: true },
   { key: 'partial_close_ratio', label: '分批平仓比例', type: 'number', defaultValue: 0.5, min: 0.1, max: 1, step: 0.1 },
 

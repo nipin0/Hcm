@@ -367,11 +367,30 @@ class KlineCollector:
                            (symbol, time_frame, open_time, open, high, low, close, tick_volume, spread, source)
                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                            ON CONFLICT (symbol, time_frame, open_time) DO UPDATE SET
-                           high = GREATEST(hcm_market.klines.high, $5),
-                           low = LEAST(hcm_market.klines.low, $6),
-                           close = $7,
-                           tick_volume = hcm_market.klines.tick_volume + $8,
-                           spread = GREATEST(hcm_market.klines.spread, $9)""",
+                           -- 【P0 根因修复 2026-09-15，与 tools/mt5_bridge.py:647-660 同源】
+                           -- 原为 `high=GREATEST(旧,新) / low=LEAST(旧,新)`（**单调累积**）：
+                           -- 一次坏写入（陈旧/异常 tick 的实时棒快照）把伪极值【永久锁死】在该棒，
+                           -- 之后所有正常写入都无法纠正 ⇒ 伪极值全量传导到 atr_14/±DI/adx_14/
+                           -- donchian_q/pullback_depth/atr_pct/spread_atr 等 high/low 类特征。
+                           -- 该模式已实测造成 M5 上 18.39% 的污染行（方案 §36，污染期约 7 周，
+                           -- 峰值周 58.98%）—— 本次是**同一有害模式在采集器侧的第二处**，
+                           -- 当前虽未在写行情库（`_pg_write_enabled`），但**一旦启用即重新引入**。
+                           --
+                           -- 本函数的数据源是"已收盘 K 线"（`_ready_klines`），对同一根棒应为
+                           -- **权威快照**，因此"以最新快照覆盖"才是正确语义；且必须与
+                           -- `close` 的既有覆盖语义一致（原实现只有 close 被覆盖，
+                           -- 于是形成"close 全对、open/high/low 全错"的特征签名）。
+                           -- 另两处同类缺陷一并修正：
+                           --   · `open` 原先**从不更新**（漏列）→ 已加入覆盖；
+                           --   · `tick_volume` 原为 `+=` 累加 → 每重写一次就翻倍（桥侧实测达 120×），
+                           --     PG 成交量远超实时 bar → 下游 vol_q≈0 误杀信号；改为覆盖；
+                           --   · `spread = GREATEST(...)` 同为单调累积，改为覆盖。
+                           open = EXCLUDED.open,
+                           high = EXCLUDED.high,
+                           low = EXCLUDED.low,
+                           close = EXCLUDED.close,
+                           tick_volume = EXCLUDED.tick_volume,
+                           spread = EXCLUDED.spread""",
                         kline["symbol"],
                         kline["time_frame"],
                         kline["open_time"],

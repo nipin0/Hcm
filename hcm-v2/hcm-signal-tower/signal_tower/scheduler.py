@@ -52,6 +52,16 @@ def _current_session_utc() -> str:
     return "asia"
 
 
+# 【2026-09-12 会话键死配置修复】以下 ai.* 键支持"按盘口覆盖全局"：
+#   {key}.{session}(asia/europe/us) 非空时优先于全局键 {key}。
+# 由 Scheduler._ai_cfg_dict() 在构造 cfg 时直读配置中心实现（不依赖白名单）。
+_AI_SESSION_OVERRIDE_KEYS = (
+    "ai.lm.dir_veto_prob",     # 方向头反向否决阈值（quality_gate.py:367）
+    "ai.lm.entry_veto_prob",   # 买点头差买点否决阈值（quality_gate.py:389）
+    "ai.lm.entry_boost_prob",  # 买点头好买点增强阈值（quality_gate.py:388）
+)
+
+
 async def _session_float(redis, suffix: str, default: float, fallback_keys=()) -> tuple:
     """会话优先读取浮点配置。
 
@@ -147,8 +157,26 @@ from signal_tower.signal_publisher import (
 from signal_tower.watchdog import WatchdogManager
 from signal_tower.quality_gate import decide as ai_quality_decide
 from signal_tower.quality_gate import log_gate_decision as ai_log_gate_decision
+# 【§6.1 执行体 2026-09-11】评审器 DOWNGRADE 需压级 → 复用 quality_gate 的档位表/索引
+from signal_tower.quality_gate import grade_index as ai_grade_index
+from signal_tower.quality_gate import GRADE_ORDER as AI_GRADE_ORDER
 from signal_tower import range_strategy
 from signal_tower.rev_daily import aggregate_rev_daily as _aggregate_rev_daily
+# [2026-09-14 Phase B] 行情状态机：4 类 LightGBM 推理（进程内）+ FSM/防抖。
+# 新增文件，须与 docker-compose 绑定挂载同步（缺则此处 import 直接崩溃）。
+# 纪律：本链路**只观测**（落库 + 上屏），在 state.shadow_only=true 下不改变交易行为。
+from signal_tower.state_infer import StateInferer
+from signal_tower.state_machine import MarketStateMachine
+from signal_tower.state_strategy import StateStrategy
+# 【2026-09-15 §43.2】塔→桥下单契约（纯函数，唯一实现点）—— (a) 发布 FSM 信号用
+from signal_tower.state_strategy import to_signal_fields
+# 【2026-09-15】magic 携带触发信号信息（8 位可读布局）—— 唯一实现点在该模块
+from signal_tower.state_strategy import encode_fsm_magic
+# (c) 前置：持仓管理指令（trail_mult / exit_ready），桥侧 FSM 分支读取
+from signal_tower.state_strategy import DIRECTIVE_KEY_TMPL, to_directive
+# 【P2 2026-09-11】信号级评审器（模块级只依赖 stdlib；lightgbm 在 Reviewer.load 内惰性导入，
+# 故容器缺依赖时本 import 仍安全，评审自动降级为 pass_through）
+from signal_tower.reviewer import Reviewer, ReviewInput, log_review
 from signal_tower.ai_async_client import (
     calibrate_lm_score,
     read_ds_out,
@@ -209,6 +237,31 @@ def _threshold_reason(score_result) -> str:
         band = getattr(score_result, "co_band", "") or ""
         return f"no_trade_direction(pre={pre:.3f},thr={thr:.3f},band={band})"
     return f"below_threshold({pre:.3f}<{thr:.3f})"
+
+def _fsm_magic_of(fields: dict, dec: Any, strategy: Any) -> int:
+    """FSM 下单意图 → 携带**触发信息**的 MT5 magic（布局的唯一真值在 state_strategy）。
+
+    布局 `LL SS RR TT`（8 位十进制）= 逻辑码 · FSM状态 · 触发原因 · 梯度档，
+    例 `61010100` = state_osc · S1_OSC · 触下沿 · 梯度档 0。
+
+    为什么单独一个函数：构造它需要"从策略层 tuning **反查**梯度档"这一跨对象动作，
+    塞在发布点里会把真正的契约代码淹没。
+
+    梯度档 = `lot_multiplier` 在 `ladder` 中的下标。
+    ⚠ 若 ladder 有重复档位（如灰度期被压平成 0.5×4），`index()` 取首个 ⇒ 恒 0；
+      可接受（压平本就无梯度可言），但**不要**据此判断"梯度没生效"。
+
+    Returns: 0 = 非 FSM 子模式 → 调用方回落 `magic_for_signal_mode` 的基码。
+    """
+    try:
+        _lad = list((strategy.tuning.get("ladder") if strategy else None) or [])
+        _mult = (fields.get("_fsm") or {}).get("lot_multiplier")
+        _tier = _lad.index(_mult) if _mult in _lad else 0
+    except Exception:  # noqa: BLE001
+        _tier = 0
+    return encode_fsm_magic(fields.get("signal_mode", ""), fields.get("reason", ""),
+                            getattr(dec, "state", ""), int(_tier))
+
 
 # ── Default Config ─────────────────────────────
 
@@ -372,6 +425,17 @@ class Scheduler:
         self._precision_entry = PrecisionEntryScorer(config_provider=config_provider)
         self._shadow_v2_loaded = False
 
+        # ── 行情状态机（Phase B·2026-09-14）──
+        # 4 类 LightGBM 状态模型（M5/M15/H1 **各自独立**，禁止跨周期混用）+ FSM/防抖。
+        # 产物去向：hcm_signal.market_state_log（审计/评估）+ hcm:live:state:{symbol}（上屏）。
+        self._state_infer = StateInferer(config_provider=config_provider)
+        self._state_machine = MarketStateMachine(
+            config_provider=config_provider, redis_client=redis_client)
+        # 策略层（状态 → 交易意图）。默认 state.order_enabled=False → **只算意图不下单**；
+        # SL/TP 数值一律由桥按 close.<session>.* 时段系数计算（用户 2026-09-14 决策）。
+        self._state_strategy = StateStrategy(
+            config_provider=config_provider, redis_client=redis_client)
+
         # Per-symbol state
         self._symbols: dict[str, SymbolState] = {}
         self._tasks: dict[str, asyncio.Task] = {}
@@ -385,6 +449,11 @@ class Scheduler:
         # Config hot-reload (P0: live parameter tuning)
         self._config_reload_task: Optional[asyncio.Task] = None
         self._config_reload_interval: int = DEFAULT_CONFIG_RELOAD_INTERVAL_SECONDS
+        # 【2026-09-15】触发器/方向参数快照（方案 §31.4）。
+        # 为什么放在调度层而不是模块内：`trend_trigger` / `trend_direction` 是**纯函数**模块
+        # （无配置、无 IO），这是它们可离线精确验证的前提；若让它们自己读配置就破坏了这一点。
+        # 故参数由调度层读取并作为 cfg 传入。**仅收录本层实际消费的键**（禁死键）。
+        self._trigger_cfg: dict = {}
 
         # P0 fix (2026-07-15): kline feed staleness ceiling (seconds). Beyond
         # this, the feed is treated as broken and production is paused (no
@@ -404,11 +473,24 @@ class Scheduler:
             "circuit_trips": 0,
             "bar_confirm_fails": 0,
             "ai_gate_rejects": 0,
+            # 【D 2026-09-11 修复·丢单】原缺此键，而 :2805 无条件 `_stats["value_gate_rejects"] += 1`
+            # → 价值闸门否决时 KeyError 冒泡出 _produce_signal → 信号被整个丢弃（每 3s 刷
+            # "Live score publisher error: 'value_gate_rejects'"）。实证 7 日 value_gate 命中 61 次。
+            "value_gate_rejects": 0,
         }
         # 2026-08-18：AI 闸门决策落库暂存（signal_id 生成前先缓存，生成后补记真实 signal_id，
         # 供 daily_kpi 用 gate_decision.signal_id ↔ orders.signal_id 做 AI 盈亏归因）。
         # key=symbol → (_snap, _decision, _ai_cfg)
         self._pending_ai_gate: dict[str, tuple] = {}
+        # 【P2 2026-09-11】信号级评审器（惰性加载；默认 ai.review.enabled=false 不启用）
+        self._reviewer: Optional[Reviewer] = None
+        # 【2026-09-11】评审行 id 暂存：评审发生在 signal_id 生成之前，故先落库占位、
+        # 待拿到真实 signal_id 后回填。key=symbol → hcm_ai.review_log.id
+        self._pending_review_id: dict[str, int] = {}
+        # 【2026-09-11 去重】上次评审的 bar 键（key=symbol → bar_open_epoch）。
+        # _live_score_publisher 每 3s 触发 _produce_signal(bar 内即时成交) → 同一 bar
+        # 的评审会重复落库。评审仅观测、不参与下单，故按 bar 去重（每 bar 至多 1 行）。
+        self._review_bar: dict[str, int] = {}
 
         # ── Prompt templates (per-model routing, P2 multi-model) ──
         # Global (legacy) fallback templates — loaded from Redis.
@@ -507,6 +589,29 @@ class Scheduler:
         self._running = True
         self._start_time = time.time()
 
+        # 【2026-09-11 预热】评审器首次 load 需构建 3 个 LightGBM Booster（实测 ~450ms
+        # 的磁盘 IO + 树解析）。若留到首条信号才加载，该条会因 > ai.review.timeout_ms
+        # 被降级为 pass_through/TIMEOUT，且把加载耗时写进 latency_ms 污染延迟统计。
+        # 此处**在信号循环之前**预热 → 首条信号即走热路径（实测热态 0.68ms）。
+        # 失败仅告警、不影响启动（fail-safe，铁律五.3）。
+        try:
+            if self._config is not None and \
+                    await self._config.get_bool("ai.review.enabled", False):
+                if self._reviewer is None:
+                    self._reviewer = Reviewer()
+                _pwm = str(await self._config.get("ai.review.mode") or "shadow").strip().lower()
+                _pwd = ((await self._config.get("ai.review.shadow_model_dir"))
+                        if _pwm == "shadow" else None) or \
+                    (await self._config.get("ai.review.model_dir")) or "/app/review_models"
+                _pwt = time.perf_counter()
+                if self._reviewer.load(str(_pwd)):
+                    logger.info("[reviewer] pre-warm OK dir=%s took=%.1fms",
+                                _pwd, (time.perf_counter() - _pwt) * 1000.0)
+                else:
+                    logger.info("[reviewer] pre-warm skipped (load failed) dir=%s", _pwd)
+        except Exception as _pwe:  # noqa: BLE001
+            logger.warning("[reviewer] pre-warm failed (non-fatal): %s", _pwe)
+
         # Start per-symbol tasks with staggered delay
         for i, sym in enumerate(symbols):
             st = self._symbols[sym]
@@ -542,10 +647,6 @@ class Scheduler:
         # P0: 周期性标注回写（每 900s 把已平仓盈亏写回 labeled_samples.label，
         # 解锁校准层/Optuna 的真实盈亏样本，是 AI 自我发展的前提）
         asyncio.create_task(self._label_reconcile_loop(interval_sec=900))
-
-        # P1: 周期性每日校准快照（每 3600s 重算各体制累计胜率→校准因子时序，
-        # 供「校准时序」页回放 AI 自我发展轨迹；仅新标注时才重算）
-        asyncio.create_task(self._calibration_daily_loop(interval_sec=3600))
 
         # 2026-08-18：AI 每日 KPI 聚合（方案 B：日表 + 后台每小时聚合 + AI 真实盈亏贡献）。
         # fail-open：DB 故障/表缺失静默跳过，不影响交易主循环。
@@ -647,10 +748,9 @@ class Scheduler:
             "ai.enabled", "ai.mode",
             "ai.ds.enabled", "ai.ds.timeout_sec",
             "ai.fuse.ds_max_age_sec",
-            "ai.lm.pass_threshold", "ai.lm.down_threshold", "ai.lm.up_threshold",
+            "ai.lm.down_threshold", "ai.lm.up_threshold",
             # 【B6 修复 2026-08-14】veto_floor 此前漏进白名单 → 面板调否决线不生效
             "ai.lm.veto_floor",
-            "ai.lm.veto_quantile", "ai.lm.down_quantile", "ai.lm.up_quantile",
             # 【B8】sl_coeff clamp 上下限配置化（此前 P1a 硬编码 0.8/1.5）
             "ai.ds.sl_coeff_min", "ai.ds.sl_coeff_max",
             "ai.cpl.enabled", "ai.cpl.w_trend", "ai.cpl.w_neutral", "ai.cpl.w_range",
@@ -660,6 +760,20 @@ class Scheduler:
             # ai.lm.direction_fuse / ai.lm.dir_veto_prob，此前漏进白名单 → cfg 恒缺键 →
             # quality_gate 读 fallback False → 反向否决/同向增强形同虚设（配置了≠生效）。
             "ai.lm.direction_fuse", "ai.lm.dir_veto_prob",
+            # 【P0 2026-09-11 解除耦合·补白名单】以下键此前不在白名单 → cfg 恒缺键 →
+            # quality_gate 读 CFG_FALLBACK（coupling_pass_threshold=50 / pullback_chase_enabled=True /
+            # entry_fuse=False）→ 耦合闸门与追单 VETO 无法经配置关闭（"配置了≠生效"）。
+            # 补入后配置面板/中心对这些键权威生效。
+            "ai.lm.entry_fuse", "ai.lm.entry_boost_prob", "ai.lm.entry_veto_prob",
+            "ai.lm.pullback_chase_enabled", "hexp.coupling_pass_threshold",
+            # 【P1a 2026-09-11 审计补白名单】以下键 quality_gate/引擎会读，但此前不在白名单
+            # → cfg 恒缺键 → 恒读 CFG_FALLBACK（配置中心/面板改这些键不生效）。补入后权威生效：
+            #   · ai.cpl.k_exhaust_min / ai.cpl.w_exhaust / ai.cpl.w_neutral_low
+            #     —— 耦合 k 分档权重（EXHAUST 档），quality_gate.py:161/166/172 读取
+            #   · ai.lm.pullback_chase_mm_abs —— 追单抑制微动量阈值（此前 PG 无 seed，完全不可配）
+            #   · hexp.lot_tier_enabled —— hexp 独立路径手数分档总开关
+            "ai.cpl.k_exhaust_min", "ai.cpl.w_exhaust", "ai.cpl.w_neutral_low",
+            "ai.lm.pullback_chase_mm_abs", "hexp.lot_tier_enabled",
         ]
         out: dict = {}
         for k in keys:
@@ -670,6 +784,26 @@ class Scheduler:
                     out[k] = v
             except Exception:
                 pass
+        # ── 【2026-09-12 修复·会话键死配置】───────────────────────────────
+        # ai.lm 三头共振阈值支持按当前盘口覆盖：{key}.{session} 非空 → 覆盖全局键。
+        # 缺陷史：该覆盖原写在 _produce_signal 内，读的是本函数产物
+        #   _ai_cfg.get(f"{key}.{session}")，但上面 keys 白名单只登记全局键
+        #   → 恒 None → 会话键"配置中心可改、引擎永不读"（9 个键空转的空转）。
+        # 修法：会话键在此【直读配置中心】，白名单不再是会话键生效的前提；
+        #   本函数 4 个调用点（:782 / :790 / :821 / :2474）同时获得会话感知。
+        # 优先级：会话键 > 全局键 > quality_gate.CFG_FALLBACK。
+        try:
+            _sess = _current_session_utc()
+        except Exception:
+            _sess = ""
+        if _sess:
+            for _sk in _AI_SESSION_OVERRIDE_KEYS:
+                try:
+                    _sv = await self._config.get(f"{_sk}.{_sess}")
+                except Exception:
+                    _sv = None
+                if _sv is not None and str(_sv).strip() != "":
+                    out[_sk] = _sv
         return out
 
     async def _ai_ds_loop_for_symbol(self, symbol: str) -> None:
@@ -786,6 +920,9 @@ class Scheduler:
         ai_entry = None
         ai_state = None
         ai_mm = None
+        ai_feats = None          # 【P2 2026-09-11】信号级评审的市场特征快照（lm_features 全量）
+        # 【§3.1 新鲜度 2026-09-11】快照写入时刻（sidecar ts）→ 供 reviewer 判 FEAT_STALE
+        ai_feat_ts = None
         try:
             if self._redis is not None:
                 raw = await self._redis.get(f"hcm:live:hexp:ai:{symbol.upper()}")
@@ -827,6 +964,10 @@ class Scheduler:
                         if isinstance(_st, str) and _st:
                             ai_state = _st
                         ai_mm = None
+                        _lf = obj.get("lm_features")
+                        if isinstance(_lf, dict):
+                            ai_feats = _lf      # 【P2】透出给信号级评审器 reviewer
+                            ai_feat_ts = obj.get("ts")   # 【§3.1】快照新鲜度基准
                         try:
                             _mm_v = (obj.get("lm_features") or {}).get("mm")
                             if _mm_v is not None:
@@ -988,6 +1129,10 @@ class Scheduler:
         fusion["ai_entry"] = ai_entry
         fusion["ai_state"] = ai_state
         fusion["ai_mm"] = ai_mm
+        # 【P2 2026-09-11】市场特征快照透出，供信号级评审器（reviewer）组特征用；缺失 → None
+        fusion["lm_features"] = ai_feats
+        # 【§3.1 2026-09-11】快照写入时刻 → reviewer 据此判 FEAT_STALE（同根 M5 容差）
+        fusion["lm_feat_ts"] = ai_feat_ts
 
         return fusion
 
@@ -1747,6 +1892,618 @@ class Scheduler:
             logger.warning("Live entry price read failed for %s: %s", symbol, exc)
             return None
 
+    # ─────────────────────────────────────────────────────────────────────
+    # 行情状态机·Phase B 影子（2026-09-14）
+    #
+    # 纪律红线（务必遵守）：
+    #   · 只观测：本组方法**不得**修改 direction/grade/lot/下单决策 —— 影子期产物只落库上屏。
+    #   · 零侵入：任何异常只告警，必须被 _run_shadow_state 的 try/except 吞掉，
+    #     绝不允许影响信号生产（调用点位于 _produce_signal 的 K 线取回之后）。
+    # ─────────────────────────────────────────────────────────────────────
+    async def _resolve_state_tf(self, symbol: str, default_tf: str) -> str:
+        """状态机模型的周期（决策 Q6：`state.tf.{symbol}`，品种级可配）。
+
+        仅允许 M5/M15/H1（三套独立模型，契约：**禁止跨周期混用**）；
+        未配置或配成非法值时回落到该品种的信号周期，保证"不配即不变"。
+        """
+        if self._config is None:
+            return default_tf
+        try:
+            tf = (await self._config.get(f"state.tf.{symbol}", "") or "").strip().upper()
+        except Exception:
+            return default_tf
+        if not tf:
+            return default_tf
+        if tf not in ("M5", "M15", "H1"):
+            logger.warning(
+                "state.tf.%s=%s 非法（仅支持 M5/M15/H1，禁止跨周期混用）→ 回落 %s",
+                symbol, tf, default_tf)
+            return default_tf
+        return tf
+
+    @staticmethod
+    def _as_epoch_s(value: Any) -> Optional[int]:
+        """open_time → Unix 秒（UTC）。无法解析返回 None。
+
+        _fetch_klines 的 open_time 有**三种来源**，必须全部兼容（实测踩坑）：
+          1. 历史棒：asyncpg → datetime
+          2. 刚收盘棒被实时 bar **覆盖**（scheduler.py:4736-4739，`klines[-1]=live_bar`）
+             → Redis JSON → **整数 epoch**（且不带 is_live_forming，剥离逻辑抓不到）
+          3. 新周期形成棒被 append → 同上，整数 epoch
+        另兼容 ISO 字符串与毫秒 epoch（>1e11 视为毫秒）。
+        """
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, datetime):
+            _dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            return int(_dt.timestamp())
+        if isinstance(value, (int, float)):
+            _v = float(value)
+            return int(_v / 1000.0) if _v > 1e11 else int(_v)
+        try:
+            _s = str(value).strip()
+            # 纯数字字符串（Redis 某些路径会把 epoch 序列化成字符串）
+            try:
+                _v = float(_s)
+                return int(_v / 1000.0) if _v > 1e11 else int(_v)
+            except ValueError:
+                pass
+            _dt = datetime.fromisoformat(_s.replace("Z", "+00:00"))
+            if _dt.tzinfo is None:
+                _dt = _dt.replace(tzinfo=timezone.utc)
+            return int(_dt.timestamp())
+        except (ValueError, TypeError):
+            return None
+
+    async def _count_fsm_open_positions(self, symbol: str) -> int:
+        """该品种 **FSM 逻辑**（magic 61/62）的在仓**信号**数（= DISTINCT signal_id）。
+
+        **用 `COUNT(DISTINCT p.signal_id)` 而非 `COUNT(*)`**：加仓以 signal（轮次）为单位，
+        一笔 signal 若因 BUG 等原因产生多个 position 行，`COUNT(*)` 会把加仓计数虚高、
+        提前触发 `mid_max_adds_reached` 封顶、误吞后续加仓轮次（2026-09-16 冲突①修复）。
+        正常 1 signal=1 position 时两者等价。
+
+        **失败/无 DB 返回 -1（未知）**，而不是 0 —— 返回 0 会被上游解读为"无 FSM 持仓"
+        → 允许加仓，而实际可能有仓 → **不安全**。返回 -1 则上层回退自增计数（既有行为）。
+
+        用途：S3 加仓笔数以**真实成交轮次**为权威（= 本数 − 1），避免"意图已产生但被风控/
+        限仓拦下"造成的计数虚高（→ 提前 `mid_max_adds_reached` 封顶）。
+
+        **识别方式（实测确定）**：`hcm_trading.positions` **没有 `magic` 列**（PG 侧不记录
+        magic，magic 只写在 MT5 订单上）→ 不能按 magic 过滤。改用
+        `positions.signal_id → hcm_signal.signals.signal_mode LIKE 'state%'`
+        （同 `tools/position_sync.py` 判定 FSM 订单的口径，**同一真源**）。
+        """
+        if self._db is None or not getattr(self._db, "is_initialized", False):
+            return -1
+        try:
+            row = await self._db.fetchrow(
+                """SELECT COUNT(DISTINCT p.signal_id)::int AS n
+                   FROM hcm_trading.positions p
+                   JOIN hcm_signal.signals s ON s.signal_id = p.signal_id
+                   WHERE p.symbol = $1 AND p.status = 'open' AND p.lot > 0
+                     AND s.signal_mode LIKE 'state%'""",
+                symbol,
+            )
+            return int(row["n"]) if row else -1
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("fsm position count failed (%s): %s", symbol, exc)
+            return -1
+
+    async def _publish_fsm_intent(self, state: "SymbolState", dec, intent,
+                                  price: float, bar_key: str = "") -> None:
+        """把策略层意图发布为**可执行信号**（方案 §43.2）。
+
+        ⚠ **默认不发布**：调用方已用 `state.order_enabled` 门控（生产当前 False）。
+        本方法只做"补元数据 + 交付"，**字段契约由
+        `state_strategy.to_signal_fields()`（纯函数）统一给出** —— 不在此另写一份映射。
+
+        与既有路径的差异（刻意如此）：
+          · `lot` 传 **0**，`lot_multiplier` 放 `_fsm` 由桥应用 —— 与既有路径
+            "塔不决定手数、桥按默认逻辑定"一致（既有 hexp/filtered 路径同样传 lot=0）。
+          · `sl_price` 恒 0（桥按会话系数算）；`tp1` 仅 S1 传冻结箱体中值。
+          · `confidence` 用 FSM 的**决策边际**（top1−top2），不是评分引擎的量纲 ——
+            风控层对 FSM 单的处置见 (d)，**本步不假设风控会放行**。
+        """
+        try:
+            fields = to_signal_fields(intent)          # base_lot 默认 0 → lot=0
+            if not fields:
+                return
+            # ── 【2026-09-16 修复 BUG-4：同一根 bar 只允许发布一次】──────────────
+            # 背景：`_run_shadow_state` 对**同一根 bar 可能被调用两次**（既有实现已知：
+            #   `market_state_log` 的 INSERT 注释写明"同一 bar 的首行可能早于**策略层
+            #   就绪**或早于 **live_override 重入** 写入"）。
+            #   FSM 自身用 `last_bar_time` 去重 ⇒ **状态不会重复推进**，但**发布不在那条
+            #   去重路径里** ⇒ 同一根 bar 会发出**两个 signal_id**。
+            # 实测后果（2026-09-15）：14:40 与 17:10 各下发两个 signal_id ⇒ 叠加
+            #   master+follower 扇出 ⇒ **同一时刻落 4 笔持仓**，而策略层以为只有 1 笔
+            #   （`positions_open>0` 要到**下一次**决定才生效 → 拦不住已发出的第二单）
+            #   ⇒ 实际敞口达设计意图的 **4 倍**。
+            # 修法：以 **(symbol, bar)** 为键做 NX 认领（与桥侧"信号新鲜度闸门"同取向）。
+            #   为什么用 bar 而非时间窗：策略层契约就是**每 bar 至多一个意图**
+            #   （`decide` 每 bar 只被调用一次，见 `state_machine._keep` 注释）
+            #   ⇒ 同一 bar 的第二个信号**必然是重复**，不是新机会。
+            #   为什么失败要 fail-open：认领异常（Redis 抖动）时**不得静默吞单** ——
+            #   宁可重复一次（有桥侧新鲜度闸门兜底），也不能因基础设施抖动漏单。
+            if bar_key and self._redis is not None:
+                try:
+                    _claimed = await self._redis.set(
+                        f"hcm:state:fsm_sent:{state.symbol}:{bar_key}", "1",
+                        ex=3600, nx=True)
+                    if not _claimed:
+                        logger.warning(
+                            "[fsm] %s 本 bar(%s) 已发布过 FSM 信号 → 跳过重复发布"
+                            "（防同一 bar 双发造成超仓；BUG-4 修复）",
+                            state.symbol, bar_key)
+                        return
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("[fsm] %s bar 去重键异常（继续发布，避免漏单）：%s",
+                                   state.symbol, exc)
+            acc_id = await self._resolve_account_id()
+            if acc_id is None:
+                logger.error("[fsm] %s 无法解析主交易账户 → 跳过 FSM 发布", state.symbol)
+                return
+            signal_id = await self._signal_publisher.generate_signal_id()
+            _fmt = fields["_fsm"]
+            signal_data = SignalData(
+                signal_id=signal_id,
+                task_id=0,
+                account_id=acc_id,
+                symbol=state.symbol,
+                time_frame=state.timeframe,
+                direction=fields["direction"],
+                entry_price=round(float(price), 5),
+                sl_price=fields["sl_price"],          # 恒 0 → 桥算会话 SL
+                tp1=fields["tp1"],                    # S1 = 冻结箱体中值；其余 0
+                tp2=0.0,
+                lot=fields["lot"],                    # 0 → 桥按默认逻辑定手数
+                confidence=round(float(getattr(dec, "margin", 0.0) or 0.0), 6),
+                signal_mode=fields["signal_mode"],
+                # 【2026-09-15 用户要求】magic 携带**触发下单信号的信息**（8 位可读布局）：
+                #   逻辑码·FSM状态·触发原因·梯度档 —— 见 `state_strategy.encode_fsm_magic`。
+                # 原为裸 61/62（`magic_for_signal_mode`）：终端里**看不出**是哪个状态、
+                #   哪条规则触发的，只能回查 DB。
+                # ⚠ 永久契约：magic 写在**已成交订单**上、事后改不回来 ⇒ 布局只允许
+                #   追加低位数；`is_fsm_magic` 向后兼容裸 61/62（历史单）。
+                # 梯度档位 = `lot_multiplier` 在 ladder 中的下标（非 S1 恒 0）。
+                magic=(_fsm_magic_of(fields, dec, self._state_strategy)
+                       or magic_for_signal_mode(fields["signal_mode"])),
+                sl_locked=fields["sl_locked"],
+                # FSM 顶层流字段（跨组件消费；新增字段必须同步风控白名单，见 SignalData 注释）
+                fsm_state=_fmt["state"],
+                fsm_lot_multiplier=_fmt["lot_multiplier"],
+                # ── L4 触价入场（方案 §49）：`zone_level>0` + `entry_trigger_wait>0`
+                #    才触发桥侧既有 P1a zone gate（等价格触及再成交）。
+                #    风控白名单**已透传**这三个字段（stream_consumer.py:596-600）；
+                #    桥侧闸门 `signal_tower.zone_trigger_enabled` 生产**已为 true**。
+                #    ⚠ `entry_trigger_wait=0` 时三者整体退化 → 立即市价成交（既有行为）。
+                zone_level=float(fields.get("zone_level", 0.0) or 0.0),
+                zone_type=str(fields.get("zone_type", "") or ""),
+                entry_trigger_wait=int(fields.get("entry_trigger_wait", 0) or 0),
+                indicator_values={
+                    "_fsm": _fmt,
+                    "fsm_state": dec.state,
+                    "fsm_predicted_class": getattr(dec, "predicted_class", ""),
+                    "fsm_proba": getattr(dec, "proba", {}) or {},
+                    "fsm_reason": fields.get("reason", ""),
+                },
+            )
+            await self._signal_publisher.publish(signal_data)
+            logger.info(
+                "[fsm] 已发布 FSM 信号 id=%d %s %s %s lot×%.2f tp1=%.3f (%s)",
+                signal_id, state.symbol, fields["signal_mode"], fields["direction"],
+                _fmt["lot_multiplier"], fields["tp1"], fields.get("reason", ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[fsm] %s FSM 信号发布失败：%s", state.symbol, exc)
+
+    async def _count_symbol_open_positions(self, symbol: str) -> int:
+        """该品种 **FSM 逻辑**（state_osc / state_trend）的在仓持仓数。
+
+        【2026-09-16 口径修复：由"全品种"改为"FSM 口径"】
+        本数参与的全是 **FSM 自己的策略生命周期**判断：
+          · `flat_reset`（趋势态 + 无持仓 → 复位 S0；`state_machine.py` 第 6 步）
+          · 轮次结束清零 `add_count`（`state_strategy.py` 趋势轮次生命周期）
+          · S5 清锁（"该品种全部持仓平完"）
+        ⇒ 与 hexp / manual / live_override 等**其它来源**的持仓无关。原实现按 symbol
+          全量计数，实测（2026-09-16，开闸后 152 根窗口）`positions_open` 取过 2/3/4，
+          而当日 FSM 最多 3 笔 ⇒ 外部来源被计入 ⇒ `flat_reset` 不触发、S3/S4 滞留。
+        识别方式与 `_count_fsm_open_positions` **同一真源**（`positions` 无 magic 列，
+          经 `signal_id → signals.signal_mode`）⇒ 直接复用，不写第二份 SQL。
+        失败语义：**返回 0**（允许复位）—— 与本方法原有约定一致；加仓笔数的权威取值
+          另走 `_count_fsm_open_positions`（那里失败返回 −1，更保守）。
+        """
+        n = await self._count_fsm_open_positions(symbol)
+        return 0 if n < 0 else int(n)
+
+    async def _open_position_dir(self, symbol: str) -> str:
+        """该品种在仓持仓的**唯一**方向（BUY/SELL）；无法判定时返回 ""。
+
+        用途：S3「**禁逆势加仓**」（规格 10.2）需要**持仓方向** —— 仅有 `positions_open`
+        这个数量无法判断加仓方向是顺势还是逆势，该约束会退化为空转。
+        返 "" 的两种情形（均**不拦单**，避免拦错反而阻断正常加仓）：
+          · 多空混合持仓（方向不唯一）；
+          · 查询失败 / 无 DB（保守放行，与 `_count_symbol_open_positions` 的失败语义一致）。
+        """
+        if self._db is None or not getattr(self._db, "is_initialized", False):
+            return ""
+        try:
+            row = await self._db.fetchrow(
+                # 【2026-09-16 口径修复】同 `_count_symbol_open_positions`：本结果用于
+                # S3「禁逆势加仓」（规格 10.2），比对对象是 **FSM 自己的仓**，
+                # 故必须按子模式过滤 —— 否则 hexp 等外部持仓会让该约束误拦。
+                """SELECT MIN(p.direction) AS d, COUNT(DISTINCT p.direction)::int AS k
+                   FROM hcm_trading.positions p
+                   JOIN hcm_signal.signals s ON s.signal_id = p.signal_id
+                   WHERE p.symbol = $1 AND p.status = 'open' AND p.lot > 0
+                     AND s.signal_mode LIKE 'state%'""",
+                symbol,
+            )
+            if not row or int(row["k"] or 0) != 1:
+                return ""
+            return str(row["d"] or "").strip().upper()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("state machine position dir failed (%s): %s", symbol, exc)
+            return ""
+
+    async def _run_shadow_state(self, state: "SymbolState", klines: list) -> None:
+        """推进一根 bar 的状态机并落库/上屏（影子，不改变交易行为）。"""
+        if self._state_infer is None or not self._state_infer.enabled:
+            return
+        tf = await self._resolve_state_tf(state.symbol, state.timeframe)
+        # 特征集需要 ~122 根（percentile_window=120），而 _fetch_klines 默认只给 100 根
+        # → 不足时按需补取（同周期常见路径 len>=需要值，零额外查询）。
+        _need = self._state_infer.min_bars
+        kl = klines
+        if tf != state.timeframe or len(kl or []) < _need:
+            kl = await self._fetch_klines(state.symbol, tf, limit=max(400, _need * 2))
+        if not kl or len(kl) < _need:
+            logger.debug("[shadow_state] %s/%s K 线不足（%d）→ 跳过",
+                         state.symbol, tf, len(kl or []))
+            return
+
+        # 只喂**已收盘** bar：_fetch_klines 末尾可能带实时形成棒（其 open_time 来自
+        # Redis JSON 反序列化，是**字符串**而非 datetime）。用未收盘棒既语义错
+        # （特征不稳定）又会让 TIMESTAMPTZ 写入报 "expected datetime, got str"。
+        # 与仓库既有惯例一致（见本文件 bar-quality 日志处的 is_live_forming 跳过）。
+        while len(kl) > 1 and kl[-1].get("is_live_forming"):
+            kl = kl[:-1]
+
+        high = [float(k["high"]) for k in kl]
+        low = [float(k["low"]) for k in kl]
+        close = [float(k["close"]) for k in kl]
+        epoch: Optional[list] = []
+        for k in kl:
+            _e = self._as_epoch_s(k.get("open_time"))
+            if _e is None:
+                epoch = None
+                break
+            epoch.append(_e)
+
+        infer = self._state_infer.infer(tf, high, low, close, epoch)
+        pos = await self._count_symbol_open_positions(state.symbol)
+        # 持仓方向：S3「禁逆势加仓」的判定输入（仅有数量无法判定，见 _open_position_dir）
+        pos_dir = await self._open_position_dir(state.symbol) if pos > 0 else ""
+        # FSM 已成交加仓笔数：以**真实持仓**为权威（= FSM 持仓数 − 1）；未知 → -1（回退自增）
+        _fsm_pos = await self._count_fsm_open_positions(state.symbol)
+        _fsm_adds = -1 if _fsm_pos < 0 else max(0, _fsm_pos - 1)
+        # bar_time 保证"一根 bar 只推进一次"：live_override 路径会在 bar 内每 ~30s
+        # 反复进 _produce_signal，若按调用计数会让防抖的"连续 N 根"形同虚设。
+        _bar_eps = self._as_epoch_s(kl[-1].get("open_time"))
+
+        # ── 三件套的两个输入：方向（规则模块）+ 起点触发器（rise|donchian）──
+        # 惰性导入：本文件顶部注释已记录"缺文件即崩溃"的教训（见 Phase B 说明），
+        # 故此处 import 失败只降级触发器/方向，绝不影响状态机与信号生产。
+        # 实测依据（方案 §30）：触发器 漏检 0.4% / 误报 16.6% / 中位提前 −1.0 根；
+        # 对照 4 类 argmax 推导为 20% / 67.8% / **滞后 +3.5**。方向用于 NONE 否决。
+        _dir_name, _trg = "", {"on": False, "reason": "disabled"}
+        # 【路线 B】波动扩张概率（P(未来窗口振幅/ATR ≥ 阈值)）。
+        # None = 未算出（模型缺失/量价数组缺失）⇒ 下游按"**不裁决**"处理。
+        # 语义方向很重要：`-1`（未知）与 `0.0`（明确判波动收敛）**必须分开** ——
+        # 把"算不出"当 0 会变成"波动收敛"而**放行**箱体单，属静默失真。
+        _vol_p: Optional[float] = None
+        # 【item 2】实际使用的**方向来源周期**。放进链路自检日志：排查"方向不对"时，
+        # "用了哪个周期"是第一个要看的信息；只写进配置则必须翻配置才能对齐日志。
+        _dir_src = tf
+        try:
+            from signal_tower import trend_direction as _TD
+            from signal_tower.trend_direction import latest_direction
+            from signal_tower.trend_trigger import latest as _trigger_latest
+            # 参数优先级：配置中心（显式设置）> 起点模型 meta 的标定阈值 > 模块默认。
+            # 为什么 meta 要参与：`rise_thr` 是 ΔP 的目标触发率分位，随模型/周期标定，
+            # 换模型必须跟着换；配置中心未显式设置时以 meta 为准（避免用旧阈值配新模型）。
+            _cfg = dict(getattr(self, "_trigger_cfg", {}) or {})
+            if "state.trigger.rise_thr" not in _cfg:
+                # 【2026-09-15 修复·量纲陷阱】只有 meta 阈值**落在 ΔP 的合理量级**时才采用。
+                # 为什么：meta["threshold"] 是"按最大 F1 标定的**概率**判定阈值"
+                # （本次实测 0.9998），而 rise_thr 是 **ΔP = P[t] − P[t−m] 的分位阈值**
+                # （实测 ~0.29）—— 两者**量纲不同**。若把 0.9998 当 ΔP 阈值，
+                # 上升分支要求"概率在 m 根内跳 0.9998"，**几乎永不触发** ⇒ 静默退化为
+                # 纯 donchian，且无任何告警（正是方案 §34 警告的"用最大 F1 标定触发率"之误）。
+                # 注：`state.trigger.rise_thr` 已在配置中心显式设为分位标定值，本兜底通常不生效；
+                # 但一旦该键缺失，旧写法就会静默禁用 rise 分支，故必须加这道量纲闸。
+                _m = self._state_infer.onset_threshold
+                if _m and 0.0 < float(_m) <= 0.9:
+                    _cfg["state.trigger.rise_thr"] = float(_m)
+                elif _m:
+                    logger.warning(
+                        "[trigger] 起点模型 meta 阈值=%s 超出 ΔP 合理量级 (0, 0.9] → **不采用**，"
+                        "改用 trend_trigger 模块默认/配置值。请在配置中心显式设置 "
+                        "state.trigger.rise_thr（须按**目标触发率分位**标定，不可用最大 F1）", _m)
+            # ── 方向来源周期（item 2，方案 §56）：默认 = 信号周期（**既有行为，零变化**）──
+            # 动机：`tools/eval_trend_direction.py --sweep` 在洁净数据上实测（21 组 thr×k 全网格）
+            #   M5 判方向 both_edge **21/21 组为负**（DOWN 侧符号反向，§20/§51.7）；
+            #   H1 判方向 both_edge **21/21 组为正** ⇒ H1 才是可用方向源。
+            # 为什么只改周期、不改阈值：`state.dir.slope_thr_atr=1.0 / debounce=3` 是
+            #   既有标定值且处在**网格中部**；网格最优点 (thr=3.0,k=5) 撞边界，
+            #   按 §52.3 的教训（撞边界的最优点不可信）不予采用 ⇒ 保持可归因的最小改动。
+            _dtf = str(_cfg.get("state.dir.tf") or tf).upper()
+            _dok = False
+            if _dtf != tf:
+                _dh, _dl, _dc, _dep = await self._fetch_dir_series(state.symbol, _dtf)
+                # 前视闭合：取"**已收盘**且早于本根 bar 开盘"的最后一根方向 bar
+                # （`close_time ≤ base_open`）。与离线标定/离线回放**同一函数**，
+                # 不在此另写时间过滤 —— 见 `trend_direction.align_last_closed`。
+                _pos = -1
+                if _dc and _bar_eps is not None:
+                    _pos = int(_TD.align_last_closed(_dep, _dtf, [_bar_eps])[-1])
+                if _pos >= 0:
+                    _dser = _TD.compute_direction_series(_dh, _dl, _dc, cfg=_cfg)
+                    if bool(_dser["valid"][_pos]):
+                        _dr = {"valid": True,
+                               "name": _TD.dir_name(int(_dser["confirmed"][_pos]))}
+                    else:
+                        # valid=False 是"**判不了**"（数据不足/指标异常），
+                        # **不是**"判过、无方向"（模块 docstring 明确定义）。
+                        # 必须可见：否则方向源一坏就把趋势态入口**静默**全挡掉（§53 教训）。
+                        _dr = {"valid": False, "name": "none"}
+                        logger.warning(
+                            "[shadow_state] 方向源 %s 在本根 bar(epoch=%s) valid=False"
+                            "（数据不足/指标异常）→ 本根 direction=none（趋势入口将被否决）",
+                            _dtf, _bar_eps)
+                        self._chain_degraded = True
+                    _dok = True
+                    _dir_src = _dtf
+            if not _dok:
+                if _dtf != tf:
+                    # **不许静默降级**（§53 教训）：方向源不可用必须可见。
+                    logger.warning("[shadow_state] 方向源 %s 不可用（%s）→ 本根 bar 回落 %s 判方向",
+                                   _dtf, state.symbol, tf)
+                    self._chain_degraded = True
+                _dr = latest_direction(high, low, close, cfg=_cfg)
+                _dir_src = tf
+            # 【2026-09-15 契约修复】`valid=False` = **"判不了"（数据不足/指标异常）**，
+            # 而 `trend_direction` docstring 明令："valid=False ⇒ 数据不足
+            # （**不得**当作 NONE 用）"。原实现一律映射成 `"none"` ⇒ 撞上 FSM
+            # `direction == "none"` 的**无条件否决** ⇒ **一次数据问题就把趋势入口静默封死**，
+            # 且在日志/落库里**看不出来**（与"真的判过、确实没方向"无法区分）。
+            # 改为 `""`（= 未接入方向模块 → FSM 明确**不否决**）+ 可见告警（每 bar 一条，
+            # 5min/条 不构成刷屏）—— "判不了"必须与"判过没方向"分开表达。
+            if _dr.get("valid"):
+                _dir_name = str(_dr.get("name") or "")
+            else:
+                _dir_name = ""
+                logger.warning(
+                    "[shadow_state] 方向模块 valid=False（数据不足/指标异常）→ 本根 "
+                    "direction=\"\"（**不否决**趋势入口）；%s/%s",
+                    state.symbol, tf)
+            _tail = self._state_infer.infer_onset_tail(tf, high, low, close, tail=8)
+            _trg = _trigger_latest(high, low, close, _tail, cfg=_cfg)
+            # 【路线 B】波动扩张概率。量价/点差数组取自同一份 `kl`
+            # （`_fetch_klines` 的 SELECT 本就含 `tick_volume, spread`，无需改取数）。
+            # 失败/缺列 → None ⇒ 下游不裁决（不猜数值）。
+            try:
+                _vol_arr = [float(k.get("tick_volume") or 0.0) for k in kl]
+                _spr_arr = [float(k.get("spread") or 0.0) for k in kl]
+            except Exception:  # noqa: BLE001
+                _vol_arr, _spr_arr = None, None
+            _vol_p = self._state_infer.infer_vol_proba(
+                tf, high, low, close, volume=_vol_arr, spread=_spr_arr)
+        except Exception as _trg_exc:  # noqa: BLE001
+            # 【2026-09-15 P0 治理·日志提级】原为 logger.debug ——
+            # 实测后果：`trend_direction.py` / `trend_trigger.py` **未加入 compose 挂载清单**
+            # → 容器内 import 抛 ModuleNotFoundError → 本 except 每根 bar 吞掉异常 →
+            # 方向恒 "" (策略层退化为 slope_fallback，而 M5 斜率符号实测反向 §20/§51)、
+            # 触发器恒不运行 (趋势入口退化为 §30 实测最差的模型 argmax 推导)，
+            # 而**日志级别为 DEBUG，INFO 级完全看不见**，故障长期静默（方案 §53）。
+            # 现提为 WARNING + 记入链路自检：凡"整条链路降级"的失败，必须可见。
+            logger.warning("[shadow_state] 方向/触发器不可用（%s/%s，本根 bar 降级）：%s",
+                           state.symbol, tf, _trg_exc)
+            self._chain_degraded = True
+
+        dec = await self._state_machine.step(
+            state.symbol, tf, infer, positions_open=pos,
+            bar_time=(str(_bar_eps) if _bar_eps is not None else None),
+            trigger_on=bool(_trg.get("on")), direction=_dir_name)
+
+        # ── 链路自检日志（每根 bar 一行，**仅当组成变化时打印**）──
+        # 为什么需要：三件套（方向/触发器/年龄）此前**整条降级却不可见**（§53）。
+        # 判据是"链路是否能跑通"，故只要各部件的**可用性标志**（而非取值）变化就打一次；
+        # 取值本身每根 bar 都变，打出来会淹没有效信息。
+        try:
+            _chain = (
+                # infer 是否可用（模型加载成功 + 特征契约通过）
+                bool(getattr(infer, "ok", False) or getattr(infer, "decided", False)),
+                # 方向模块是否产出（valid=False 表示数据不足，而非"判过没方向"）
+                bool(_dr.get("valid", False)) if "_dr" in locals() else False,
+                # 起点模型是否加载（rise 分支的前置）
+                bool(self._state_infer.onset_threshold) if self._state_infer else False,
+                # 触发器是否可用
+                bool(_trg.get("valid", False)) and str(_trg.get("reason")) != "disabled",
+                # 【item 2】方向**来源周期**也计入签名：它是"我改了配置到底生效没有"的
+                # 第一手信号。若只放在日志体里（签名不变就不打印），切换周期时会**看不见**
+                # —— 正是本仓库反复出现的"配置了≠生效"盲区。
+                str(_dir_src),
+            )
+            if _chain != getattr(self, "_chain_sig", None):
+                self._chain_sig = _chain
+                logger.info(
+                    "[chain] %s/%s 链路自检 | infer=%s direction=%s onset_model=%s "
+                    "trigger=%s | 当前值 dir=%r(dir_src=%s) trigger_on=%s(%s) 模型=%s",
+                    state.symbol, tf,
+                    "OK" if _chain[0] else "DOWN",
+                    "OK" if _chain[1] else "DOWN",
+                    "OK" if _chain[2] else "MISSING(rise 分支不可用)",
+                    "OK" if _chain[3] else "DOWN",
+                    _dir_name, _dir_src, bool(_trg.get("on")), str(_trg.get("reason") or ""),
+                    getattr(dec, "model_version", ""),
+                )
+                if not all(_chain[:4]):
+                    logger.warning("[chain] %s/%s **链路存在降级部件**：%s"
+                                   "（详见方案 §53；'disabled' 表示走了异常兜底而非真判定）",
+                                   state.symbol, tf, _chain[:4])
+        except Exception as _cexc:  # noqa: BLE001
+            logger.debug("[chain] 自检异常：%s", _cexc)
+
+        # ── 策略层意图（只算「若要下单会怎么下」；是否真下单由 state.order_enabled 决定，
+        #    默认 False = 纯观测。SL/TP 数值不在此计算 —— 由桥按 close.<session>.* 时段系数执行。）
+        intent = None
+        try:
+            intent = await self._state_strategy.decide(
+                state.symbol, dec.state,
+                high=high, low=low, close=close,
+                # 复用推理时算好的特征：保证策略与模型看到**同一份**世界状态
+                atr=float(infer.feats.get("atr_14", 0.0) or 0.0),
+                slope=float(infer.feats.get("slope_linreg", 0.0) or 0.0),
+                positions_open=pos, hold_only=dec.hold_only,
+                # 三件套输入（方案 §31.3）：方向用于 NONE 否决；年龄/形状当前仅记录
+                direction=dec.direction or _dir_name,
+                age_bars=dec.age_bars,
+                # 持仓方向：S3 禁逆势加仓的判定输入（空 = 无法判定 → 不拦）
+                position_dir=pos_dir,
+                # 加仓笔数权威：真实 FSM 持仓数−1（-1 = 未知 → 回退自增）
+                fsm_adds_used=_fsm_adds,
+                # 【路线 B】波动扩张概率；None ⇒ 传 -1.0 = "未知/不裁决"（契约见 decide 文档）
+                vol_expand_proba=(-1.0 if _vol_p is None else float(_vol_p)),
+            )
+            if intent.action in ("open", "add"):
+                logger.info(
+                    "[state_strategy] %s %s 意图=%s %s lot×%.2f tp_anchor=%s (%s) "
+                    "[order_enabled=%s → %s]",
+                    state.symbol, dec.state, intent.action, intent.direction,
+                    intent.lot_multiplier, intent.tp_anchor, intent.reason,
+                    self._state_strategy.order_enabled,
+                    "会下单" if self._state_strategy.order_enabled else "仅观测不下单",
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[state_strategy] 意图计算失败（%s）：%s", state.symbol, exc)
+
+        # ── (a) FSM 下单发布（方案 §43.2）─────────────────────────────
+        # **默认不发布**：仅当 `state.order_enabled=True`（当前生产为 False）。
+        # 放在意图 try/except **之外**：发布失败不应被误报成"意图计算失败"。
+        # 发布只在 action ∈ {open, add} 时发生（契约函数对其它意图返回空字典）。
+        if (intent is not None and self._state_strategy.order_enabled
+                and self._signal_publisher is not None):
+            await self._publish_fsm_intent(
+                state, dec, intent, float(close[-1]),
+                # 【BUG-4 修复】把 bar 身份传进去做发布级去重（见该方法内注释）
+                bar_key=str(kl[-1].get("open_time") or ""))
+
+        # ── (c) 前置：持仓管理指令（每 bar 刷新，**与下单解耦**）──────────────
+        # 桥侧 FSM 分支按 `hcm:state:directive:{symbol}` 决定收紧多少（S4）/是否准备离场。
+        # 与下单**解耦**：即使 `order_enabled=False`（纯观测）也写 —— 便于灰度期先验证
+        # 桥侧读取正确，再谈真正下单。
+        # ⚠ 安全细节：塔"看不见"时（`no_box_or_atr`，特征/箱体不可算）**不写** ——
+        #   写默认值 trail_mult=1.0 会把 S4 已收紧的止损**无声放宽**。不写则桥保持上次值
+        #   （保守侧：宁可维持已收紧，也不因塔失效而放松风控）。
+        if (intent is not None and intent.reason != "no_box_or_atr"
+                and self._redis is not None):
+            try:
+                await self._redis.set(
+                    DIRECTIVE_KEY_TMPL.format(symbol=state.symbol),
+                    json.dumps(to_directive(intent), ensure_ascii=False),
+                    ex=900,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[fsm] %s 指令写入失败：%s", state.symbol, exc)
+
+        # 上屏（TTL 300s）：面板读此键展示"当前行情态 + 四类概率"
+        if self._redis is not None and getattr(self._redis, "is_initialized", False):
+            try:
+                await self._redis.set(
+                    f"hcm:live:state:{state.symbol}",
+                    json.dumps({
+                        "symbol": state.symbol, "time_frame": tf,
+                        "state": dec.state, "prev_state": dec.prev_state,
+                        "since": (self._state_machine.since_of(state.symbol)
+                                  if self._state_machine else ""),
+                        "hold_only": dec.hold_only, "note": dec.note,
+                        # 状态年龄（已持续 bar 数）："初生/中段"由它承载，不靠分类预测（方案 §25）
+                        "age_bars": dec.age_bars,
+                        # 方向（up/down/none）与起点触发器状态（三件套的另两项，方案 §30）
+                        "direction": dec.direction,
+                        "trigger_on": bool(_trg.get("on")),
+                        "trigger_reason": str(_trg.get("reason") or ""),
+                        "infer_ok": dec.infer_ok, "infer_reason": dec.infer_reason,
+                        "decided": dec.infer_decided,
+                        "predicted_class": dec.predicted_class,
+                        "proba": dec.proba, "margin": round(dec.margin, 6),
+                        "model_version": dec.model_version,
+                        "positions_open": pos,
+                        "intent": intent.as_dict() if intent is not None else None,
+                        "tuning": self._state_machine.tuning if self._state_machine else {},
+                        "strategy_tuning": (self._state_strategy.tuning
+                                            if self._state_strategy else {}),
+                        # 【2026-09-15 灰度】此前是**硬编码 True**。全仓核查：它不门控任何
+                        # 行为（塔内仅此一处写、桥内 0 引用）⇒ `state.order_enabled=true` 后
+                        # 它会在面板上**谎报"仅观测"**，属"显示与实际不符"的误导性字段。
+                        # 改为反映真实状态：shadow_only = 当前**未开**下单。
+                        "shadow_only": not bool(
+                            self._state_strategy.order_enabled
+                            if self._state_strategy else False),
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }, ensure_ascii=False),
+                    ex=300,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[shadow_state] 上屏失败：%s", exc)
+
+        # 落库（审计/评估：状态序列 vs 后续行情结果）
+        if self._db is not None and getattr(self._db, "is_initialized", False):
+            try:
+                if _bar_eps is None:
+                    raise ValueError(f"bar open_time 不可解析: {kl[-1].get('open_time')!r}")
+                _bar_open = datetime.fromtimestamp(_bar_eps, tz=timezone.utc)
+                await self._db.execute(
+                    """
+                    INSERT INTO hcm_signal.market_state_log
+                        (symbol, time_frame, bar_open_time, state, prev_state,
+                         transitioned, predicted_class, prob_oscillation, prob_trend_init,
+                         prob_trend_mid, prob_trend_fade, margin, decided, infer_ok,
+                         infer_reason, hold_only, model_version, positions_open, note,
+                         intent_action, intent_direction, intent_lot_mult, intent_reason,
+                         age_bars, direction, trigger_on, trigger_reason)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+                            $20,$21,$22,$23,$24,$25,$26,$27)
+                    -- 同一 bar 的首行可能早于策略层就绪（或早于 live_override 重入）写入，
+                    -- 故冲突时**只回填意图列**，既保持"一根 bar 一行"幂等，又不丢意图观测。
+                    ON CONFLICT (symbol, time_frame, bar_open_time) DO UPDATE SET
+                        intent_action    = EXCLUDED.intent_action,
+                        intent_direction = EXCLUDED.intent_direction,
+                        intent_lot_mult  = EXCLUDED.intent_lot_mult,
+                        intent_reason    = EXCLUDED.intent_reason
+                    """,
+                    state.symbol, tf, _bar_open, dec.state, dec.prev_state,
+                    bool(dec.transitioned), dec.predicted_class,
+                    dec.proba.get("oscillation"), dec.proba.get("trend_init"),
+                    dec.proba.get("trend_mid"), dec.proba.get("trend_fade"),
+                    round(dec.margin, 6), bool(dec.infer_decided), bool(dec.infer_ok),
+                    dec.infer_reason, bool(dec.hold_only), dec.model_version, pos, dec.note,
+                    (intent.action if intent is not None else None),
+                    (intent.direction if intent is not None else None),
+                    (round(intent.lot_multiplier, 4) if intent is not None else None),
+                    (intent.reason if intent is not None else None),
+                    # 三件套各自的贡献（方案 §31.4）：缺这些列无法回算
+                    # "这次进趋势态是触发器带来的还是类别带的"、以及方向是否为 none
+                    int(dec.age_bars), (dec.direction or None),
+                    bool(_trg.get("on")), str(_trg.get("reason") or "") or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # 用 WARNING（不是 DEBUG）：观测表写入失败必须可见，否则影子期
+                # "以为在观测、其实一行都没落"（本次即此坑：0 行却只打 DEBUG）。
+                logger.warning("[shadow_state] 状态观测落库失败（%s/%s）：%s",
+                               state.symbol, tf, exc)
+
     async def _produce_signal(
         self,
         state: SymbolState,
@@ -1773,6 +2530,11 @@ class Scheduler:
         """
         trace_id = uuid.uuid4().hex[:12]
         logger.info("Signal production: symbol=%s, trace_id=%s", state.symbol, trace_id)
+
+        # 【2026-09-11】清掉上一轮可能残留的评审行 id 暂存：若某轮设了暂存却在生成
+        # signal_id 之前 return（各类闸门/异常），残留 id 会被**后续**轮次误回填 →
+        # 评审记录归因到错误信号（污染在线校准数据）。每轮入口先清，保证只回填本轮。
+        self._pending_review_id.pop(state.symbol, None)
 
         # ── AI 手数分档透传初始化（链动风控面板动态手数，2026-08-14 需求）──
         # ai_lot_tier: "none"(默认，纯 HEXP 不干预手数) / "low" / "mid" / "high"
@@ -1886,6 +2648,18 @@ class Scheduler:
         highs = np.array([k["high"] for k in klines], dtype=np.float64)
         lows = np.array([k["low"] for k in klines], dtype=np.float64)
         opens = np.array([k["open"] for k in klines], dtype=np.float64)
+
+        # ── 行情状态机（Phase B 影子）：唯一调用点 ──
+        # 位置刻意选在"K 线已取回校验、所有交易闸门之前"：
+        #   · 每根 bar 都会执行（不受后续 return 影响）→ 状态序列连续可评估；
+        #   · 复用已取回的 klines，避免重复查库；
+        #   · 整体 try/except 包裹：状态机任何异常都不得影响信号生产（铁律第十一章）。
+        try:
+            await self._run_shadow_state(state, klines)
+        except Exception as _sm_exc:  # noqa: BLE001
+            logger.warning(
+                "Shadow state machine failed (%s) — signal production unaffected: %s",
+                state.symbol, _sm_exc)
 
         if self._watchdog:
             await self._watchdog.report_step("kline", time.time() - t0)
@@ -2083,6 +2857,17 @@ class Scheduler:
                 _ms_dir = getattr(_ms, "direction", "") or ""
                 _ms_dir_map = {"UP": "BUY", "DOWN": "SELL"}
                 _cur_dir = score_result.direction
+                # H1 趋势方向（indicators.h1_trend_direction 已于 :1982 注入；
+                # h1_context.trend_direction 为 micro_state 同源读数）。用于 H1 门控(b)。
+                _h1_dir = (getattr(h1_context, "trend_direction", "") or "") or getattr(indicators, "h1_trend_direction", "") or ""
+                _h1_signal = _ms_dir_map.get(_h1_dir)  # BUY/SELL/None
+                # 可热配最小盈亏比硬地板（Gate C），与 precision_entry._min_rr 同键。
+                _min_rr = 1.2
+                if self._config is not None:
+                    try:
+                        _min_rr = float(await self._config.get_float("hexp.entry.min_rr", 1.2))
+                    except Exception:
+                        _min_rr = 1.2
                 # 精准点位闸门（precision_entry 三维买点分：R:R 位置 + 方向对齐）独立开关，
                 # 默认 False=向后兼容；接入后对 hexp 已有方向的信号做"点位质量否决"。
                 # 1) 衰竭否决：趋势末端追单必亏（保留，防接刀）
@@ -2091,16 +2876,30 @@ class Scheduler:
                 # 与"放行严格回到 scorecard_total"冲突；micro_state 仅作方向补强（见 #2），
                 # 不作为否决闸门。故彻底删除 1b 分支及 _pg_enabled 读取。
                 if _cur_dir in ("BUY", "SELL") and _ms_state == MicroState.TREND_EXHAUST:
-                    score_result.direction = "NO_TRADE"
-                    score_result.threshold_passed = False
-                    if not score_result.fallback_reason:
-                        score_result.fallback_reason = (
-                            "hexp_entry_gate(TREND_EXHAUST 衰竭末端不追)"
-                        )
-                    logger.info(
-                        "hexp entry gate BLOCK %s: dir 被否决, micro_state=TREND_EXHAUST "
-                        "(衰竭末端不追单)",
-                        state.symbol)
+                    # (b) H1 门控：hexp 顺向单与 H1 同向时不误杀（跳否决，交由 6 维分裁决）
+                    if _h1_signal == _cur_dir:
+                        logger.info("hexp entry gate H1-SHIELD %s: TREND_EXHAUST 但 dir=%s 顺H1=%s → 不误杀", state.symbol, _cur_dir, _h1_dir)
+                    else:
+                        score_result.direction = "NO_TRADE"
+                        score_result.threshold_passed = False
+                        if not score_result.fallback_reason:
+                            score_result.fallback_reason = ("hexp_entry_gate(TREND_EXHAUST 衰竭末端不追)")
+                        logger.info("hexp entry gate BLOCK %s: dir 被否决, micro_state=TREND_EXHAUST (衰竭末端不追单)", state.symbol)
+                # ── 新 Gate A (P2): TREND_ACCEL 拦截/跟势 ──
+                # 加速中段：hexp 逆加速方向或逆 H1 → 不接刀（拦截摸顶抄底）；
+                # 顺加速且顺 H1 → 跟势放行（加速中段仍有空间）。
+                elif _cur_dir in ("BUY", "SELL") and _ms_state == MicroState.TREND_ACCEL:
+                    _accel_signal = _ms_dir_map.get(_ms_dir)
+                    _against_accel = bool(_accel_signal) and _cur_dir != _accel_signal
+                    _against_h1 = bool(_h1_signal) and _cur_dir != _h1_signal
+                    if _against_accel or _against_h1:
+                        score_result.direction = "NO_TRADE"
+                        score_result.threshold_passed = False
+                        if not score_result.fallback_reason:
+                            score_result.fallback_reason = ("hexp_entry_gate(TREND_ACCEL 逆加速/逆H1 不接刀)")
+                        logger.info("hexp entry gate BLOCK %s: dir=%s 被否决, micro_state=TREND_ACCEL (逆加速=%s 逆H1=%s 不接刀)", state.symbol, _cur_dir, _against_accel, _against_h1)
+                    else:
+                        logger.info("hexp entry gate ACCEL-FOLLOW %s: dir=%s 顺加速+顺H1 → 跟势放行", state.symbol, _cur_dir)
                 # 2) 方案3：micro_state 直接参与方向 —— 回踩/反转给出明确趋势方向、
                 #    而 hexp 因滞后组未确认仍 NO_TRADE 时，用 micro_state 方向补方向，
                 #    并以精准买点分 entry_quality >= 自适应门槛 θ 保证质量（不无脑放行）。
@@ -2109,47 +2908,30 @@ class Scheduler:
                     _new_dir = _ms_dir_map[_ms_dir]
                     if float(_eq) >= float(_theta):
                         score_result.direction = _new_dir
-                        # 【2026-08-28 P1-6】"补方向后强制过闸"改为可热关（默认 True =
-                        # 保持现有生产行为，不擅自改变信号输出）。
-                        #
-                        # 风险说明：本分支由 micro_state 单维状态 + 买点分 _eq>=θ
-                        # 造出方向，并直接置 threshold_passed=True，绕过了 hexp 的
-                        # 6 维综合分（scorecard_total）闸门；且本段**先于** AI 闸门
-                        # 执行，AI 随后看到 passed=True 即可合法 UPGRADE，形成
-                        # "micro_state 造方向 + AI 升级"的非 hexp 放行链，与铁律 5.1
-                        # 「辅助模块无独立开仓权」的精神冲突。
-                        #
-                        # 保持默认 True 以不动既有策略；运维可经配置中心把
-                        # hexp.entry_gate_force_pass 置为 false 止血：届时仅补方向、
-                        # 不再强制过闸，交由 6 维综合分正常裁决。
                         _force_pass = True
                         if self._config is not None:
                             try:
-                                _force_pass = bool(await self._config.get_bool(
-                                    "hexp.entry_gate_force_pass", True))
+                                _force_pass = bool(await self._config.get_bool("hexp.entry_gate_force_pass", True))
                             except Exception:
                                 _force_pass = True
                         score_result.threshold_passed = _force_pass
                         score_result.pre_score = round(float(_eq), 4)
                         if not score_result.fallback_reason:
-                            score_result.fallback_reason = (
-                                f"hexp_entry_gate({_ms_state.value} 补方向 {_new_dir})"
-                            )
-                        logger.info(
-                            "hexp entry gate FILL %s: micro_state=%s dir=%s eq=%.3f>=θ=%.3f "
-                            "→ 补方向 %s",
-                            state.symbol, _ms_state.value, _ms_dir, _eq, _theta, _new_dir)
+                            score_result.fallback_reason = (f"hexp_entry_gate({_ms_state.value} 补方向 {_new_dir})")
+                        logger.info("hexp entry gate FILL %s: micro_state=%s dir=%s eq=%.3f>=θ=%.3f → 补方向 %s", state.symbol, _ms_state.value, _ms_dir, _eq, _theta, _new_dir)
                     else:
-                        logger.info(
-                            "hexp entry gate SKIP %s: micro_state=%s dir=%s eq=%.3f<θ=%.3f "
-                            "(买点分不足，不补方向)",
-                            state.symbol, _ms_state.value, _ms_dir, _eq, _theta)
-
-        # ── value_drive：前瞻价值头正向注入（P1 实盘试水，2026-09-05 用户授权）──
-        # 价值头产出「顺向世界(world) + 贴低位高价值(score)」；当引擎本根 bar 未给方向
-        # （NO_TRADE）时，按世界方向正向注入一单并强制过闸 → 走后续 AI 闸门（仍可 VETO）
-        # 与风控链。只注入引擎无方向处，不与 HEXP 已给方向打架；节流在 _value_drive_loop。
-        # 方向语义：world=+1 多头世界做 BUY / world=-1 空头世界做 SELL（顺向）。
+                        logger.info("hexp entry gate SKIP %s: micro_state=%s dir=%s eq=%.3f<θ=%.3f (买点分不足，不补方向)", state.symbol, _ms_state.value, _ms_dir, _eq, _theta)
+                # ── 新 Gate C (P2): min_rr 硬地板（独立终检，覆盖 Gate2 补方向后信号）──
+                # 任何 BUY/SELL（含 Gate2 补出）若实时 R:R < hexp.entry.min_rr → 硬拒单。
+                # 读 score_result.direction 当前值（Gate2 可能已改），非旧 _cur_dir。
+                if str(getattr(score_result, "direction", "")) in ("BUY", "SELL"):
+                    _rr = float((_brk or {}).get("rr") or 0.0)
+                    if _rr < _min_rr:
+                        score_result.direction = "NO_TRADE"
+                        score_result.threshold_passed = False
+                        if not score_result.fallback_reason:
+                            score_result.fallback_reason = (f"hexp_entry_gate(min_rr={_rr:.2f}<{_min_rr})")
+                        logger.info("hexp entry gate BLOCK %s: rr=%.2f<%.2f → 低盈亏比拒单", state.symbol, _rr, _min_rr)
         if value_drive and value_drive_info:
             try:
                 _vworld = int(value_drive_info.get("world") or 0)
@@ -2379,6 +3161,93 @@ class Scheduler:
         ai_q = await self._read_ai_quality(state.symbol)
         logger.info("AI gate probe: symbol=%s ai_q_is_none=%s c_ai=%s",
                     state.symbol, ai_q is None, (ai_q or {}).get("c_ai"))
+        # ── 【F1 2026-09-16】decoupled 模式评审观测恢复（H2 根因修复）──
+        # H2 根因：ai.mode=decoupled 时 _read_ai_quality 在 :1097-1098 直接 return None
+        # → 下方 c_ai 守卫恒 False → 整个评审/闸门写块静默跳过，review_log 自 09-11 停写。
+        # 此处把"信号级评审观测（仅落 review_log，绝不拦单/改档）"移出 c_ai 守卫，
+        # 使 decoupled 下也能恢复 review_log 留痕。VETO/DOWNGRADE 执行体仍保留在 c_ai 守卫内
+        # （红线：AI 不得独立拦单）。
+        # 特征来源：直接读 hcm:live:hexp:ai:{symbol}.lm_features（sidecar 实时发布，与 ai.mode 无关），
+        # 使评审有真实特征、避免 FEAT_MISSING 空评。
+        _rv_on = await self._config.get_bool("ai.review.enabled", False)
+        if _rv_on and (ai_q is None or ai_q.get("c_ai") is None):
+            # 仅当 decoupled / c_ai 缺失（即原被跳过路径）才走本观测分支；
+            # coupled 且 c_ai 存在时由下方 c_ai 守卫内的评审块负责（互不重复）。
+            try:
+                if not hasattr(self, "_review_bar_f1"):
+                    self._review_bar_f1 = {}
+                _bs = int(getattr(state, "bar_seconds", 300) or 300)
+                _bt = getattr(state, "last_bar_open_time", None)
+                try:
+                    _t = float(_bt.timestamp()) if _bt is not None else time.time()
+                except Exception:  # noqa: BLE001
+                    _t = time.time()
+                _bkey = int(_t // _bs) * _bs
+                if self._review_bar_f1.get(state.symbol) != _bkey:
+                    self._review_bar_f1[state.symbol] = _bkey
+                    if self._reviewer is None:
+                        self._reviewer = Reviewer()
+                    _f1_feats = {}
+                    _f1_fts = None
+                    try:
+                        if self._redis is not None:
+                            _lm_raw = await self._redis.get(f"hcm:live:hexp:ai:{state.symbol.upper()}")
+                            if _lm_raw:
+                                if isinstance(_lm_raw, (bytes, bytearray)):
+                                    _lm_raw = _lm_raw.decode("utf-8", "ignore")
+                                import json as _json
+                                _lm_obj = _json.loads(_lm_raw) if isinstance(_lm_raw, str) else _lm_raw
+                                if isinstance(_lm_obj, dict):
+                                    _f1_lf = _lm_obj.get("lm_features")
+                                    if isinstance(_f1_lf, dict):
+                                        _f1_feats = _f1_lf
+                                    _f1_fts = _lm_obj.get("ts")
+                    except Exception:  # noqa: BLE001
+                        _f1_feats, _f1_fts = {}, None
+                    _f1_dir = getattr(score_result, "direction", "NO_TRADE") or "NO_TRADE"
+                    _f1_snap = {
+                        "hp_score": float(getattr(score_result, "hp_score", 0.0) or 0.0),
+                        "scorecard_total": float(getattr(score_result, "scorecard_total", 0.0) or 0.0),
+                        "k": float(getattr(score_result, "k_value", 1.0) or 1.0),
+                        "grade": getattr(score_result, "grade", "C") or "C",
+                        "passed": bool(score_result.threshold_passed),
+                        "direction": _f1_dir,
+                        "range_mode": bool(getattr(score_result, "range_mode", False)),
+                        "close": float(getattr(score_result, "close", 0.0) or 0.0),
+                        "signal_mode": getattr(score_result, "signal_mode", ""),
+                    }
+                    _f1_cfg = {
+                        "ai.review.mode": (await self._config.get("ai.review.mode")) or "shadow",
+                        "ai.review.model_dir": (await self._config.get("ai.review.model_dir")) or "/app/review_models",
+                        "ai.review.shadow_model_dir": (await self._config.get("ai.review.shadow_model_dir")) or "",
+                        "ai.review.w_entry": float(await self._config.get("ai.review.w_entry") or 0.6),
+                        "ai.review.w_quality": float(await self._config.get("ai.review.w_quality") or 0.4),
+                        "ai.review.pass_threshold": float(await self._config.get("ai.review.pass_threshold") or 0.45),
+                        "ai.review.veto_floor": float(await self._config.get("ai.review.veto_floor") or 0.15),
+                        "ai.review.dir_conflict_prob": float(await self._config.get("ai.review.dir_conflict_prob") or 0.65),
+                        "ai.review.dir_conflict_action": (await self._config.get("ai.review.dir_conflict_action")) or "downgrade",
+                        "ai.review.max_feat_missing": float(await self._config.get("ai.review.max_feat_missing") or 0.3),
+                    }
+                    _f1_rin = ReviewInput(
+                        symbol=state.symbol, direction=str(_f1_dir or ""),
+                        entry_price=float(_f1_snap.get("close") or 0.0),
+                        sl_price=0.0, tp_price=0.0,
+                        hp_score=float(_f1_snap.get("hp_score") or _f1_snap.get("scorecard_total") or 0.0),
+                        grade=str(_f1_snap.get("grade") or ""), session="", regime="",
+                        signal_mode=str(_f1_snap.get("signal_mode") or ""),
+                        feats=_f1_feats,
+                        feat_bar_time=_f1_fts,
+                    )
+                    _f1_rv = self._reviewer.review(_f1_rin, _f1_cfg)
+                    _rid = await log_review(
+                        self._db if (self._db is not None and getattr(self._db, "is_initialized", False)) else None,
+                        _f1_rin, _f1_rv)
+                    logger.info(
+                        "Reviewer(decoupled) %s %s action=%s score=%.2f reasons=%s rid=%s",
+                        state.symbol, _f1_dir, _f1_rv.action, _f1_rv.review_score or 0.0,
+                        ",".join(_f1_rv.reason_codes), _rid)
+            except Exception as _f1e:  # noqa: BLE001
+                logger.warning("F1 decoupled reviewer failed (non-fatal): %s", _f1e)
         if ai_q is not None and ai_q.get("c_ai") is not None:
             # 注：final_direction 在 L1847 才赋值，此处用 score_result.direction
             _direction = getattr(score_result, "direction", "NO_TRADE") or "NO_TRADE"
@@ -2396,19 +3265,12 @@ class Scheduler:
                 # 详见 quality_gate.decide 内注释）。非 RANGE 信号恒为 False。
                 "range_mode": bool(getattr(score_result, "range_mode", False)),
             }
+            # 【2026-09-12 修复】此处原有"会话键覆盖全局键"的 try 块，读的是
+            # _ai_cfg.get(f"{key}.{session}")，而 _ai_cfg_dict() 白名单不含会话变体
+            # → 恒 None → 死代码（ai.lm.{dir_veto,entry_veto,entry_boost}_prob.{session}
+            # 配置了不生效）。现该覆盖已下沉进 _ai_cfg_dict() 直读配置中心，
+            # 此处无需再处理（保留此注释以阻断回归）。
             _ai_cfg = await self._ai_cfg_dict()
-            # 【会话化 2026-09-04】三头共振参数按当前 session(asia/europe/us) 覆盖：
-            # ai.lm.{dir_veto_prob,entry_veto_prob,entry_boost_prob}.{session} 优先于全局键。
-            # 会话上下文由此真正参与 gate 裁决（用户需求：方向/买入/反转头会话化）。
-            try:
-                _cur_sess = _current_session_utc()
-                for _sk in ("ai.lm.dir_veto_prob", "ai.lm.entry_veto_prob",
-                            "ai.lm.entry_boost_prob"):
-                    _sv = _ai_cfg.get(f"{_sk}.{_cur_sess}")
-                    if _sv is not None:
-                        _ai_cfg[_sk] = _sv
-            except Exception:
-                pass
             # 2026-08-31 纠偏：耦合模式判定（手数档位改交风控面板 risk.score_tier_* 裁决）。
             _ai_coupled = str(_ai_cfg.get("ai.mode", "decoupled")) == "coupled"
             # 【阶段 1·方向共振】把 sidecar 的 dir_lm 传给 gate，与 _snap.direction(dir_hexp)共振。
@@ -2425,6 +3287,117 @@ class Scheduler:
                 ai_mm=ai_q.get("ai_mm"),
             )
             self._ai_quality_last[state.symbol] = _decision
+            # ── 【P2 2026-09-11】信号级评审器（shadow 灰度；ai.review.enabled 默认 false）──
+            # 与上面的耦合分闸门**并列**的新评审机制：直接针对本条信号做 LightGBM 三头评审，
+            # 落 hcm_ai.review_log（含 VETO，修"评审黑洞"）。shadow 模式只记录不拦截。
+            # 全链路 try/except fail-safe：任何异常都不影响信号生产（铁律五.3）。
+            try:
+                # 【2026-09-11 去重】同一根 bar 只评审/落库一次。
+                # 根因：`_live_score_publisher` 每 3s 触发 _produce_signal(live_override=True)
+                # 以实现「bar 内即时成交」（:1572），使同一 bar 的评审重复落库（实测
+                # review_log 131 行中仅 8 行对应真实信号 ≈94% 冗余）。评审是**观测**、
+                # 不参与信号生产，故按 bar 去重**不影响下单行为**。
+                _rv_on = await self._config.get_bool("ai.review.enabled", False)
+                _bkey = None
+                if _rv_on:
+                    _bs = int(getattr(state, "bar_seconds", 300) or 300)
+                    _bt = getattr(state, "last_bar_open_time", None)
+                    try:
+                        # 下取整到 bar 边界：`last_bar_open_time` 在 bar 内可能被实时
+                        # 合并 bar 刷新而漂移（实测落库间隔 1~2min < M5 的 5min），
+                        # 取整后同一根 bar 的键恒定 → 严格「每 bar 至多 1 行」。
+                        _t = float(_bt.timestamp()) if _bt is not None else time.time()
+                    except Exception:  # noqa: BLE001
+                        _t = time.time()
+                    _bkey = int(_t // _bs) * _bs
+                if _rv_on and self._review_bar.get(state.symbol) != _bkey:
+                    self._review_bar[state.symbol] = _bkey
+                    if self._reviewer is None:
+                        self._reviewer = Reviewer()
+                    _rv_cfg = {
+                        "ai.review.mode": (await self._config.get("ai.review.mode")) or "shadow",
+                        "ai.review.model_dir": (await self._config.get("ai.review.model_dir"))
+                        or "/app/review_models",
+                        # 【F 2026-09-11】shadow 专用目录（仅 shadow 模式下被 reviewer 读取）
+                        "ai.review.shadow_model_dir": (
+                            await self._config.get("ai.review.shadow_model_dir")) or "",
+                        "ai.review.w_entry": float(await self._config.get("ai.review.w_entry") or 0.6),
+                        "ai.review.w_quality": float(await self._config.get("ai.review.w_quality") or 0.4),
+                        "ai.review.pass_threshold": float(
+                            await self._config.get("ai.review.pass_threshold") or 0.45),
+                        "ai.review.veto_floor": float(
+                            await self._config.get("ai.review.veto_floor") or 0.15),
+                        "ai.review.dir_conflict_prob": float(
+                            await self._config.get("ai.review.dir_conflict_prob") or 0.65),
+                        "ai.review.dir_conflict_action": (
+                            await self._config.get("ai.review.dir_conflict_action")) or "downgrade",
+                        "ai.review.max_feat_missing": float(
+                            await self._config.get("ai.review.max_feat_missing") or 0.3),
+                    }
+                    _rin = ReviewInput(
+                        symbol=state.symbol, direction=str(_direction or ""),
+                        entry_price=float(_snap.get("close") or 0.0),
+                        sl_price=0.0, tp_price=0.0,
+                        hp_score=float(_snap.get("hp_score") or _snap.get("scorecard_total") or 0.0),
+                        grade=str(_snap.get("grade") or ""), session="", regime="",
+                        signal_mode=str(_snap.get("signal_mode") or ""),
+                        feats=(ai_q.get("lm_features") or {}),
+                        # 【§3.1/§3.4 2026-09-11】传入快照写入时刻，使 FEAT_STALE 降级链生效
+                        feat_bar_time=ai_q.get("lm_feat_ts"),
+                    )
+                    _rv = self._reviewer.review(_rin, _rv_cfg)
+                    _rmode = str(_rv_cfg["ai.review.mode"]).lower()
+                    # 【§3.3/§6.1 执行体 2026-09-11】分模式执行裁决。
+                    # 原实现：仅在 shadow 分支落库，`_rv.action` **无任何消费方**
+                    # （全仓仅 logger.info 引用）→ canary/active 为观测空壳。
+                    #   shadow : 只记录（默认，零实盘影响）
+                    #   canary : 只执行 DOWNGRADE —— 评审器判 VETO 时降为 DOWNGRADE，
+                    #            不拦单（方案 §6.1「只开 DOWNGRADE，不开 VETO」）
+                    #   active : VETO 拦单 + DOWNGRADE 降级（一键回退：mode=shadow）
+                    _ract = _rv.action
+                    if _rmode == "canary" and _ract == "VETO":
+                        _ract = "DOWNGRADE"
+                    # 全模式落库（修「仅 shadow 落库」→ canary/active 曾失去留痕）；
+                    # 返回行 id → 暂存，待 signal_id 生成后回填（见下方 signal_id 段）
+                    _rid = await log_review(
+                        self._db if (self._db is not None
+                                     and getattr(self._db, "is_initialized", False)) else None,
+                        _rin, _rv)
+                    if _rid is not None:
+                        self._pending_review_id[state.symbol] = _rid
+                    if _rmode in ("canary", "active") and _ract in ("VETO", "DOWNGRADE"):
+                        if _ract == "VETO":
+                            self._stats["ai_gate_rejects"] += 1
+                            logger.info(
+                                "Reviewer VETO(%s): %s %s score=%s reasons=%s — suppressed",
+                                _rmode, state.symbol, _direction, _rv.review_score,
+                                ",".join(_rv.reason_codes))
+                            _rvd = dict(_decision)
+                            _rvd.update({"action": "VETO",
+                                         "final_grade": _snap.get("grade"),
+                                         "review_score": _rv.review_score,
+                                         "review_reasons": ",".join(_rv.reason_codes)})
+                            await ai_log_gate_decision(
+                                self._db if (self._db is not None
+                                             and getattr(self._db, "is_initialized", False))
+                                else None,
+                                None, state.symbol, _snap, _rvd, cfg=_ai_cfg)
+                            return
+                        # DOWNGRADE：压一级 grade（自"耦合门最终档"再降），不下单、不改方向
+                        _cur_grade = str(_decision.get("final_grade")
+                                         or _snap.get("grade") or "C")
+                        _dgd = AI_GRADE_ORDER[max(0, ai_grade_index(_cur_grade) - 1)]
+                        _decision["final_grade"] = _dgd
+                        logger.info(
+                            "Reviewer DOWNGRADE(%s): %s %s %s→%s score=%s reasons=%s",
+                            _rmode, state.symbol, _direction, _cur_grade, _dgd,
+                            _rv.review_score, ",".join(_rv.reason_codes))
+                    logger.info(
+                        "Reviewer(%s): %s %s action=%s score=%s lat=%.2fms reasons=%s",
+                        _rv.mode, state.symbol, _direction, _rv.action,
+                        _rv.review_score, _rv.latency_ms, ",".join(_rv.reason_codes))
+            except Exception as _rve:  # noqa: BLE001
+                logger.warning("signal-level reviewer failed (non-fatal): %s", _rve)
             # 2026-08-18 变更：AI 闸门决策暂存，待 signal_id 生成后（L2314 之后）补记真实
             # signal_id 落库 hcm_ai.gate_decision。VETO/被拦信号在下方 return 不再发布，
             # 其 signal_id 永远为 None（且不成交，无需归因盈亏），故仅暂存"会发布"的路径。
@@ -2444,6 +3417,17 @@ class Scheduler:
                 logger.info(
                     "AI quality gate VETO: %s %s c_ai=%.2f — signal suppressed",
                     state.symbol, _direction, ai_q["c_ai"],
+                )
+                # 【P0 2026-09-11·评审黑洞修复】VETO 全量落库。
+                # 原实现直接 return 不落库 → 被 AI 拦掉的信号无任何留痕，"该不该拦"
+                # 无法事后回算（评审/闸门迭代的唯一数据资产丢失）。
+                # 此刻 signal_id 尚未生成（在 L3167），故落 NULL
+                # （hcm_ai.gate_decision.signal_id 可空）；log_gate_decision 内部
+                # fail-safe（pool=None / 异常均静默），绝不影响信号流。
+                await ai_log_gate_decision(
+                    self._db if (self._db is not None
+                                 and getattr(self._db, "is_initialized", False)) else None,
+                    None, state.symbol, _snap, _decision, cfg=_ai_cfg,
                 )
                 return
             # 【阶段 1·纪律修正】原 ai_opened 覆盖逻辑已删除：铁律要求 AI 绝不独立开出
@@ -3166,6 +4150,19 @@ class Scheduler:
 
         signal_id = await self._signal_publisher.generate_signal_id() if self._signal_publisher else int(time.time() * 1000000) % 1000000000
 
+        # 【2026-09-11】回填评审行 signal_id —— 在线滚动校准按 signal_id join labels，
+        # 而评审发生在 signal_id 生成之前（原实现该列恒 NULL → 校准永远取不到数据）。
+        # fail-open：失败仅告警，绝不影响信号发布（铁律五.3）。
+        _rev_rid = self._pending_review_id.pop(state.symbol, None)
+        if _rev_rid is not None and signal_id is not None and self._db is not None:
+            try:
+                await self._db.execute(
+                    "UPDATE hcm_ai.review_log SET signal_id=$1 WHERE id=$2",
+                    signal_id, _rev_rid,
+                )
+            except Exception as _rfe:  # noqa: BLE001
+                logger.warning("review_log signal_id backfill failed (non-fatal): %s", _rfe)
+
         # 2026-08-18：补记 AI 闸门决策（带真实 signal_id，供 daily_kpi 盈亏归因）。
         # 仅当该 symbol 本轮有暂存的闸门决策（ai_quality_decide 已跑）才落库。
         _pending = self._pending_ai_gate.pop(state.symbol, None)
@@ -3236,15 +4233,25 @@ class Scheduler:
             _entry_a = live_entry_price if live_entry_price else indicators.close
             if _atr_a > 0 and _entry_a > 0:
                 _sl_a = min(ai_sl_mult, 1.8)  # 防御性封顶，与桥 max_sl_atr_mult 一致
-                if final_direction == "BUY":
-                    _ai_sl_price = round(_entry_a - _sl_a * _atr_a, 5)
-                    _ai_tp1 = round(_entry_a + ai_tp_mult * _atr_a, 5)
-                elif final_direction == "SELL":
-                    _ai_sl_price = round(_entry_a + _sl_a * _atr_a, 5)
-                    _ai_tp1 = round(_entry_a - ai_tp_mult * _atr_a, 5)
+                # 【P0 修复·2026-09-11】ai_sl_mult==0 的语义 =「SL 交桥会话系数」
+                # （RANGE 均值回归专用，见上方 ~3105）。此时【绝不能】写非零 sl_price：
+                # 否则 _sl_a=0 会算出 sl_price=入场价，而桥对非零 sl_price 直接采用
+                # （mt5_bridge.py:1293 → 1377），仅靠会话 SL 下限兜底(1452)才偶然正确；
+                # redis 缺失/兜底被豁免时即退化为「开仓即止损」。故仅在 _sl_a>0 时写 sl_price，
+                # _sl_a==0 时保持 0 → 桥 1416 行按会话系数算 SL。TP 不受影响照常写。
+                if _sl_a > 0:
+                    if final_direction == "BUY":
+                        _ai_sl_price = round(_entry_a - _sl_a * _atr_a, 5)
+                    elif final_direction == "SELL":
+                        _ai_sl_price = round(_entry_a + _sl_a * _atr_a, 5)
+                if ai_tp_mult > 0:
+                    if final_direction == "BUY":
+                        _ai_tp1 = round(_entry_a + ai_tp_mult * _atr_a, 5)
+                    elif final_direction == "SELL":
+                        _ai_tp1 = round(_entry_a - ai_tp_mult * _atr_a, 5)
                 logger.info(
                     "AI SL scale explicit price [%s]: sl_mult=%.2f sl=%.2f tp=%.2f "
-                    "(bridge adopts nonzero sl_price)",
+                    "(sl=0 → bridge session fallback)",
                     _sess, _sl_a, _ai_sl_price, _ai_tp1)
         _ind_vals = {
             "adx_14": round(indicators.adx_14, 2),
@@ -3295,6 +4302,9 @@ class Scheduler:
                 # 写进生产 hexp 信号的 indicator_values._hexp（shadow 在 active_model=hexp 时
                 # 被跳过，故必须挂主信号才能积累评估数据）。仅观测不下单。
                 "trend_start_candidate": getattr(score_result, "trend_start_candidate", None),
+                # 【B/C 2026-09-11 趋势治理观测】确认趋势态 / 趋势优先是否应拦·已拦 /
+                # RSI 语义切换前后值 / 位置因子贡献 / 迟滞维持计数 —— 供 D 报表与影子验证。
+                "trend_governance": getattr(score_result, "trend_governance", None),
             }
         # 2026-08-27 周期位置观测字段：hexp 与 co(和乘幂) 路径统一落库（不在 _hexp 子结构内），
         # 支撑两侧守卫命中率统计。co_source 不设 mm，本无 mm 闪烁缺陷；此处补齐位置观测一致性。
@@ -3506,6 +4516,18 @@ class Scheduler:
                 "h1_trend_direction": indicators.h1_trend_direction,
                 "h1_trend_strength": round(indicators.h1_trend_strength, 3),
                 "h1_adx": round(indicators.h1_adx, 2),
+                # 【D 2026-09-11】被拦(NO_TRADE/filtered)信号同样落 _hexp 观测。
+                # 根因：本路径原只写 4 指标 + h1_*，不含 _hexp → B/C 的影子验证只能看到
+                # "会发布的信号"，而待验证的恰恰是被拦单 → 观测缺失（此前"观测通道为空"的坑）。
+                "position_cycle": getattr(score_result, "position_cycle", None),
+                "position_z": getattr(score_result, "position_z", None),
+                "_hexp": {
+                    "hp_score": getattr(score_result, "hp_score", None),
+                    "dir_sum": getattr(score_result, "dir_sum", None),
+                    "k": getattr(score_result, "k_value", None),
+                    "verdict": getattr(score_result, "resonance_verdict", None),
+                    "trend_governance": getattr(score_result, "trend_governance", None),
+                },
             },
             fallback_reason=(
                 # P2c: prefer the aggregated suppress reason when supplied —
@@ -4211,6 +5233,50 @@ class Scheduler:
 
     # ── K-line Fetching ─────────────────────────
 
+    async def _fetch_dir_series(self, symbol: str, dir_tf: str) -> tuple:
+        """取**方向来源周期**已收盘的 K 线 + 各自 open epoch（item 2，方案 §56）。
+
+        本方法**只负责"拿到数据"**，包含一条纪律：
+          · **丢掉实时形成棒**（`is_live_forming`）：未收盘 bar 的 close 随 tick 变，
+            其方向值没有意义。
+
+        **前视闭合不在本方法内做** —— 那是 `trend_direction.align_last_closed` 的职责，
+        由离线标定（`tools/eval_trend_direction.py`）、离线回放
+        （`tools/replay_state_chain.py`）与线上三处**共用同一实现**。
+        若在此另写一份时间过滤，"基准 bar 能看到哪些大周期 bar"就有了两个定义，
+        其中一处写成 `≤ base_close` 即构成前视泄露，且三处结论会互相印证"没问题"
+        （本仓库已知事故类型：双实现漂移）。
+
+        Returns:
+            (high, low, close, open_epoch) 四个 list。取失败/为空 → 四个**空 list**，
+            由调用方降级并告警（**不得**把空当作"判过但没方向"）。
+        """
+        try:
+            rows = await self._fetch_klines(symbol, dir_tf, limit=400)
+        except Exception as _e:  # noqa: BLE001
+            logger.warning("方向周期 %s 的 K 线获取失败（%s）：%s", dir_tf, symbol, _e)
+            return [], [], [], []
+        if not rows:
+            return [], [], [], []
+        hh: list = []
+        ll: list = []
+        cc: list = []
+        ee: list = []
+        for k in rows:
+            if k.get("is_live_forming"):
+                continue
+            _e = self._as_epoch_s(k.get("open_time"))
+            if _e is None:
+                continue
+            try:
+                hh.append(float(k["high"]))
+                ll.append(float(k["low"]))
+                cc.append(float(k["close"]))
+            except (TypeError, ValueError, KeyError):
+                continue
+            ee.append(int(_e))
+        return hh, ll, cc, ee
+
     async def _fetch_klines(
         self, symbol: str, timeframe: str, limit: int = 100
     ) -> list[dict]:
@@ -4775,6 +5841,16 @@ class Scheduler:
             await _safe_load("micro_state.load_config", self._micro_state.load_config())
         if hasattr(self, "_precision_entry"):
             await _safe_load("precision_entry.load_config", self._precision_entry.load_config())
+        # ── 行情状态机（Phase B）：推理器 + FSM 参数热加载 ──
+        if hasattr(self, "_state_infer"):
+            await _safe_load("state_infer.load_config", self._state_infer.load_config())
+        if hasattr(self, "_state_machine"):
+            await _safe_load("state_machine.load_config", self._state_machine.load_config())
+        if hasattr(self, "_state_strategy"):
+            await _safe_load("state_strategy.load_config",
+                             self._state_strategy.load_config(list(self._symbols.keys())))
+        # 触发器/方向参数（纯函数模块的参数快照，见 _load_trigger_config）
+        await _safe_load("_load_trigger_config", self._load_trigger_config())
         if hasattr(self, "_manual_mode"):
             await _safe_load("manual_mode.load_config", self._manual_mode.load_config())
         if self._watchdog:
@@ -4865,55 +5941,6 @@ class Scheduler:
                 logger.warning("Label reconcile loop failed: %s", exc)
             await asyncio.sleep(interval_sec)
 
-    # ── 每日校准快照（P1：校准报告时序）────────
-    async def _calibration_daily_loop(self, interval_sec: int = 3600) -> None:
-        """周期计算每日校准快照（含历史回填），解锁「校准时序」页展示。
-
-        每小时调用 signal_publisher.reconcile_calibration_daily()：
-        仅在有新标注样本时才重算（函数内 skip 判定），首次运行全量回填。
-        重算后各体制校准因子/胜率按时序落库 calibration_daily，
-        前端「校准时序」页即能回放 AI 自我发展的历史轨迹。
-        """
-        await asyncio.sleep(45)  # 启动稍候，确保 publisher/db 依赖就绪
-        while True:
-            try:
-                pub = self._signal_publisher
-                if pub is not None and getattr(pub, "_db", None) is not None:
-                    n = await pub.reconcile_calibration_daily()
-                    if not n:
-                        continue
-                    logger.info("Calibration daily: %d snapshot rows", n)
-                    # 读最新校准因子（仅非冷启动且偏离 1.0 的体制）
-                    factors = await pub.compute_latest_calib_factors()
-                    # 有新快照才重新生成 AI 自然语言诊断（无 key/失败则静默跳过，
-                    # web 端点回退到确定性诊断）。诊断在写回前生成，供护栏判 needs_review
-                    diag = await pub.generate_calibration_diagnosis()
-                    if diag:
-                        logger.info(
-                            "Calibration AI diagnosis: confidence=%s, review=%s",
-                            diag.get("confidence"), diag.get("needs_review"),
-                        )
-                    # 闭环：把校准因子自动写回 co.calib.*（热重载循环会重读生效）。
-                    # 护栏：显式关闭(auto_apply=False)或 AI 建议需人工复核时跳过写回，
-                    # 但仍保留快照与诊断供观测。
-                    if factors and self._config is not None:
-                        auto_apply = await self._config.get_bool(
-                            "co.calib.auto_apply", True
-                        )
-                        needs_review = bool(diag.get("needs_review")) if diag else False
-                        if auto_apply and not needs_review:
-                            await self._config.set_batch(factors, category="co_source")
-                            await pub.mark_calibration_applied()
-                            logger.info("Calibration auto-applied to co.calib.*: %s", factors)
-                        else:
-                            logger.info(
-                                "Calibration NOT auto-applied (auto_apply=%s, needs_review=%s): %s",
-                                auto_apply, needs_review, factors,
-                            )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Calibration daily loop failed: %s", exc)
-            await asyncio.sleep(interval_sec)
-
     # ── AI 每日 KPI 聚合（2026-08-18：方案 B 日表 + 后台每小时聚合）──
     async def _ai_daily_kpi_loop(self, interval_sec: int = 3600) -> None:
         """每小时聚合 4 张观测表 → hcm_ai.daily_kpi（含 AI 真实盈亏贡献）。
@@ -4958,7 +5985,7 @@ class Scheduler:
 
         AI 盈亏归因：gate_decision.signal_id ↔ orders.signal_id JOIN。
         标记"AI 赋能单"= 该 signal_id 在 gate_decision 中有记录（VETO/UPGRADE/
-        ai_opened/source!=none 任一）。其盈亏从 orders.profit 聚合。
+        source!=none 任一）。其盈亏从 orders.profit 聚合。
         """
         _day_start = datetime.combine(trade_date, datetime.min.time())
         _day_end = _day_start + timedelta(days=1)
@@ -4983,8 +6010,7 @@ class Scheduler:
                        COUNT(*) FILTER (WHERE passed) AS passed,
                        COUNT(*) FILTER (WHERE action='VETO') AS veto,
                        COUNT(*) FILTER (WHERE action='UPGRADE') AS up,
-                       COUNT(*) FILTER (WHERE action='DOWNGRADE') AS down,
-                       COUNT(*) FILTER (WHERE action='UPGRADE' AND NOT passed) AS opened
+                       COUNT(*) FILTER (WHERE action='DOWNGRADE') AS down
                    FROM hcm_ai.gate_decision
                    WHERE created_at >= $1 AND created_at < $2""",
                 _day_start, _day_end,
@@ -5010,12 +6036,10 @@ class Scheduler:
                    WHERE o.open_time >= $1 AND o.open_time < $2""",
                 _day_start, _day_end,
             )
-            # 融合来源分布（从 gate_decision.c_ai_meta->>'source'）
+            # 评分来源分布（c_ai 单源，仅 lm_only 存活；fused/ds_only 已随解耦废弃）
             _src = await db.fetchrow(
                 """SELECT
-                       COUNT(*) FILTER (WHERE gd.signal_id IS NOT NULL AND gd.c_ai_meta->>'source'='fused') AS fused,
-                       COUNT(*) FILTER (WHERE gd.signal_id IS NOT NULL AND gd.c_ai_meta->>'source'='lm_only') AS lm_only,
-                       COUNT(*) FILTER (WHERE gd.signal_id IS NOT NULL AND gd.c_ai_meta->>'source'='ds_only') AS ds_only
+                       COUNT(*) FILTER (WHERE gd.signal_id IS NOT NULL AND gd.c_ai_meta->>'source'='lm_only') AS lm_only
                    FROM hcm_trading.orders o
                    JOIN hcm_ai.gate_decision gd ON gd.signal_id = o.signal_id
                    WHERE o.open_time >= $1 AND o.open_time < $2""",
@@ -5034,7 +6058,6 @@ class Scheduler:
             _veto = int(_gd["veto"] or 0)
             _up = int(_gd["up"] or 0)
             _down = int(_gd["down"] or 0)
-            _opened = int(_gd["opened"] or 0)
             _win = int(_tr["win"] or 0)
             _loss = int(_tr["loss"] or 0)
             _total = int(_tr["total"] or 0)
@@ -5043,32 +6066,28 @@ class Scheduler:
             _ai_pnl = float(_tr["ai_pnl"] or 0)
             _non_ai_pnl = round(_pnl - _ai_pnl, 2)
             _ai_ratio = round(_ai_pnl / _pnl, 4) if _pnl not in (0, 0.0) else 0.0
-            _fused = int(_src["fused"] or 0)
             _lm_only = int(_src["lm_only"] or 0)
-            _ds_only = int(_src["ds_only"] or 0)
 
             await db.execute(
                 """INSERT INTO hcm_ai.daily_kpi
                    (trade_date, lm_inferences, ds_calls, ds_success, ds_fail, ds_timeout,
                     cache_hits, fuse_events, degrade_events, hp_candidates, ai_passed,
-                    ai_vetoed, ai_upgraded, ai_downdgraded, ai_opened, total_orders,
+                    ai_vetoed, ai_upgraded, ai_downdgraded, total_orders,
                     total_pnl, win_orders, loss_orders, ai_enhanced_orders, ai_enhanced_pnl,
-                    non_ai_pnl, ai_contrib_ratio, fused_orders, lm_only_orders, ds_only_orders,
-                    updated_at)
+                    non_ai_pnl, ai_contrib_ratio, lm_only_orders, updated_at)
                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-                           $20,$21,$22,$23,$24,$25,$26, now())
+                           $20,$21,$22,$23, now())
                    ON CONFLICT (trade_date) DO UPDATE SET
                        lm_inferences=$2, ds_calls=$3, ds_success=$4, ds_fail=$5, ds_timeout=$6,
                        cache_hits=$7, fuse_events=$8, degrade_events=$9, hp_candidates=$10,
                        ai_passed=$11, ai_vetoed=$12, ai_upgraded=$13, ai_downdgraded=$14,
-                       ai_opened=$15, total_orders=$16, total_pnl=$17, win_orders=$18,
-                       loss_orders=$19, ai_enhanced_orders=$20, ai_enhanced_pnl=$21,
-                       non_ai_pnl=$22, ai_contrib_ratio=$23, fused_orders=$24,
-                       lm_only_orders=$25, ds_only_orders=$26, updated_at=now()""",
+                       total_orders=$15, total_pnl=$16, win_orders=$17,
+                       loss_orders=$18, ai_enhanced_orders=$19, ai_enhanced_pnl=$20,
+                       non_ai_pnl=$21, ai_contrib_ratio=$22, lm_only_orders=$23, updated_at=now()""",
                 trade_date, _lm, _ds_calls, _ds_ok, _ds_fail, _ds_to,
-                _ch, _fuse, _deg, int(_hp), _passed, _veto, _up, _down, _opened,
+                _ch, _fuse, _deg, int(_hp), _passed, _veto, _up, _down,
                 _total, round(_pnl, 2), _win, _loss, _ai_orders, round(_ai_pnl, 2),
-                _non_ai_pnl, _ai_ratio, _fused, _lm_only, _ds_only,
+                _non_ai_pnl, _ai_ratio, _lm_only,
             )
             logger.info(
                 "AI daily KPI aggregated: date=%s orders=%d pnl=%.2f ai_orders=%d ai_pnl=%.2f",
@@ -5272,6 +6291,54 @@ class Scheduler:
             self._system_prompt = None
             self._prompt_templates = {}
             self._system_prompts = {}
+
+    async def _load_trigger_config(self) -> None:
+        """触发器/方向参数热加载（方案 §31.4）。
+
+        惯例说明（为何用 `get(k, None)` 而非 `get_float(k, 默认值)`）：
+        本层需要区分"配置中心**显式设过**该键"与"键不存在" —— 因为
+        `state.trigger.rise_thr` 是**模型标定产物**，未显式配置时应回落到
+        起点模型 meta 里的阈值（见 §29.1）。传 `get_float(k, 默认值)` 无法区分二者。
+
+        任一项读取失败只告警并**保留上一次可用快照**（不整体回退），
+        避免一个键读错把其余已生效参数也打回默认。
+        """
+        if self._config is None:
+            return
+        c: dict = {}
+        try:
+            for k in ("state.trigger.donchian_w", "state.trigger.rise_m"):
+                v = await self._config.get(k, None)
+                if v is not None and str(v).strip() != "":
+                    c[k] = float(v)
+            # 该键**刻意允许缺失** → 缺失时由调用点回落到模型 meta 阈值
+            v = await self._config.get("state.trigger.rise_thr", None)
+            if v is not None and str(v).strip() != "":
+                c["state.trigger.rise_thr"] = float(v)
+            for k in ("state.trigger.use_rise", "state.trigger.use_donchian"):
+                c[k] = 1.0 if await self._config.get_bool(k, True) else 0.0
+            for k in ("state.dir.slope_thr_atr", "state.dir.debounce_bars"):
+                v = await self._config.get(k, None)
+                if v is not None and str(v).strip() != "":
+                    c[k] = float(v)
+            # 【item 2（方案 §56）】方向**来源周期**。**字符串键**，故不能走上面 float 分支。
+            # 为什么单独一个键而不是复用某个数值键：它决定"用哪个周期的行情判方向"，
+            # 语义与阈值正交；混在一起会让"改周期"看起来像"改阈值"（不可归因）。
+            # 缺省/非法 → 不写入 → 调用点回落 tf（= 既有行为，零变化）。
+            _dtf = (await self._config.get("state.dir.tf", "") or "").strip().upper()
+            if _dtf in ("M5", "M15", "H1"):
+                c["state.dir.tf"] = _dtf
+            elif _dtf:
+                logger.warning(
+                    "state.dir.tf=%r 非法（仅 M5/M15/H1）→ 忽略，回落为信号周期", _dtf)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "trigger/direction config load failed (keeping last good): %s", exc)
+            return
+        if c != getattr(self, "_trigger_cfg_sig", None):
+            self._trigger_cfg_sig = dict(c)
+            logger.info("触发器/方向参数已加载：%s", c)
+        self._trigger_cfg = c
 
     async def _config_reload_loop(self) -> None:
         """Periodically re-load runtime parameters so config edits take effect

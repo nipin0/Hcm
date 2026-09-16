@@ -434,13 +434,25 @@ class RedisClient:
             logger.error("Redis GET %s failed: %s", key, exc)
             return None
 
-    async def set(self, key: str, value: str, ex: Optional[int] = None) -> bool:
-        """Set a key with optional TTL."""
+    async def set(self, key: str, value: str, ex: Optional[int] = None,
+                  nx: bool = False) -> bool:
+        """Set a key with optional TTL；`nx=True` 时**仅当键不存在才写入**。
+
+        【2026-09-16 补齐 `nx`】此前本封装只透传 `ex`，而 redis-py 的 `set` 本身支持
+        `nx`。缺这个能力会让调用方（如 `scheduler._publish_fsm_intent` 的"同一 bar
+        只发布一次"）在**校验通过后静默走 fail-open** —— 本仓库反复出现的
+        "守卫看起来装了、实际没生效"事故模式。故在此补齐透传。
+
+        Returns:
+            `nx=False`：恒 True（写入已提交）。
+            `nx=True`：**True = 本次认领成功**（键原先不存在）；False = 键已存在（未认领）。
+                （redis-py 的 NX 未命中返回 None，此处归一成 False，调用方只判真假。）
+        """
         if self._client is None:
             raise RuntimeError("RedisClient not initialized")
         try:
-            await self._client.set(key, value, ex=ex)
-            return True
+            _r = await self._client.set(key, value, ex=ex, nx=nx)
+            return bool(_r) if nx else True
         except Exception as exc:
             logger.error("Redis SET %s failed: %s", key, exc)
             return False

@@ -58,6 +58,11 @@ from _monitor_common import (load_baseline, compute_psi_batch,
                              load_live_baseline, save_live_baseline, LIVE_BASELINE_PATH)
 ARTIFACTS = os.path.join(TOOLS_DIR, "_artifacts")
 MODELS_DIR = os.path.join(TOOLS_DIR, "models")
+# 【P4-a 2026-09-11 版本四态治理】候选模型 staging 目录：训练产物先落此处，
+# **验收(judge adopt)通过才 promote 到 MODELS_DIR 并占用正式版本号**。
+# next_model_version() 用 os.listdir(MODELS_DIR) 非递归扫描（:173-181）
+# → staging 子目录天然不计入版本号 → 治"拒收也占号"（实测 30 天 35 版）。
+MODEL_STAGING_DIR = os.path.join(MODELS_DIR, "_staging")
 os.makedirs(ARTIFACTS, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 
@@ -83,6 +88,10 @@ FAIL_STREAK_KEY = "hcm:ai:retrain:fail_streak"
 FAIL_STREAK_ALERT = int(os.environ.get("RETRAIN_FAIL_ALERT", "3"))
 # 决策 6：模型版本保留最近 N 版，更老的连同配套三头文件一并清理。
 KEEP_MODEL_VERSIONS = int(os.environ.get("RETRAIN_KEEP_VERSIONS", "3"))
+# 【P4-b 2026-09-11 版本四态治理】PSI 硬触发的去抖冷却窗（小时）。同一漂移段内
+# 只保留一轮重训，治"PSI 持续高位 → 每轮都触发 → 版本堆积"（实测 30 天 35 版）。
+# 0 = 关闭去抖（恢复旧的每轮触发行为）。
+RETRAIN_TRIGGER_COOLDOWN_H = float(os.environ.get("RETRAIN_TRIGGER_COOLDOWN_H", "24"))
 # 样本量下限：少于此数训练结果不可靠，仅产模型不切（避免用噪声数据覆盖好模型）
 # 支持环境变量 RETRAIN_MIN_SAMPLES 覆盖（验证时可临时调大，避免误切线上模型）
 MIN_SAMPLES_FOR_SWITCH = int(os.environ.get("RETRAIN_MIN_SAMPLES", "200"))
@@ -259,6 +268,103 @@ def _bump_fail_streak(r, ok: bool) -> int:
         return n
     except Exception:
         return 0
+
+
+def _cleanup_staging(keep: int = 3) -> None:
+    """【P4-a 2026-09-11】清理 staging 里的旧候选（保留最近 keep 个版本）。
+
+    被拒候选不占版本号 → 下一轮会复用同一 v 覆盖同名文件（不膨胀）；但若长期
+    不采纳，仍可能残留多个候选版本，故每轮清理一次。**只动 MODEL_STAGING_DIR，
+    绝不动 MODELS_DIR**（正式模型，由 cleanup_old_versions 负责）。
+    """
+    import re as _re
+    try:
+        if not os.path.isdir(MODEL_STAGING_DIR):
+            return
+        vers = set()
+        for fn in os.listdir(MODEL_STAGING_DIR):
+            m = _re.match(r"lgbm_quality_v(\d+)\.txt$", fn)
+            if m:
+                vers.add(int(m.group(1)))
+        drop = sorted(vers)[:-keep] if keep > 0 else sorted(vers)
+        for vv in drop:
+            for pat in (f"lgbm_quality_v{vv}.txt", f"calib_v{vv}.pkl",
+                        f"lgbm_direction_v{vv}.txt", f"calib_dir_np_v{vv}.pkl",
+                        f"lgbm_entry_v{vv}.txt", f"calib_entry_np_v{vv}.pkl"):
+                p = os.path.join(MODEL_STAGING_DIR, pat)
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:  # noqa: BLE001
+                    pass
+        if drop:
+            log(f"[cleanup] staging dropped versions {drop} (keep={keep})")
+    except Exception as e:  # noqa: BLE001
+        log(f"[cleanup] staging cleanup failed (non-fatal): {e}")
+
+
+def _auto_promote_enabled() -> bool:
+    """【P4-b 2026-09-11 版本四态治理】是否允许自动 promote（改线上配置）。
+
+    仅当信号级评审管线启用（ai.review.enabled=true）且 ai.review.auto_promote=false
+    时返回 False → 验收通过的候选**不占号、不切换**，只落"待人工批准"，由人工执行
+    `python auto_retrain.py --promote-v N` 完成 ACCEPT+ACTIVE。
+
+    默认（评审管线未启用，或 auto_promote=true）→ True，**保持既有自动切换行为不变**。
+    fail-open：配置读取失败一律 True（绝不因治理机制故障而卡住模型更新）。
+    """
+    try:
+        import redis as _r
+        _rc = _r.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=3,
+                       decode_responses=True)
+
+        def _b(k: str, dflt: str) -> bool:
+            return str(_rc.hget("hcm:config:v2", k) or dflt).strip().lower() in ("true", "1")
+
+        if not _b("ai.review.enabled", "false"):
+            return True                      # 评审管线未启用 → 维持自动
+        return _b("ai.review.auto_promote", "true")
+    except Exception as e:  # noqa: BLE001
+        log(f"[promote-gate] config read failed({e}) → fail-open auto promote")
+        return True
+
+
+def _save_pending_promote(v: int, model_out: str, calib_out: str, shadow) -> None:
+    """落"待人工批准"候选（Redis），供 --promote-v 使用与前端/人工查阅。"""
+    try:
+        import redis as _r
+        _rc = _r.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=3,
+                       decode_responses=True)
+        blob = json.dumps({"version": int(v), "model": model_out, "calib": calib_out,
+                           "shadow": shadow,
+                           "at": datetime.now(timezone.utc).isoformat()},
+                          ensure_ascii=False, default=str)
+        _rc.set("hcm:ai:retrain:pending_promote", blob)
+        log(f"[promote-gate] pending_promote saved: v{v}")
+    except Exception as e:  # noqa: BLE001
+        log(f"[promote-gate] save pending failed (non-fatal): {e}")
+
+
+def _promote_manually(v: int) -> None:
+    """--promote-v N：人工批准 → ACCEPT（staging→models 占号）+ ACTIVE（切换配置）。"""
+    if not _promote_candidate(v):
+        log(f"[promote-manual] v{v} promote 未完成（缺文件），放弃切换")
+        return
+    ok = switch_model(os.path.join(MODELS_DIR, f"lgbm_quality_v{v}.txt"),
+                      os.path.join(MODELS_DIR, f"calib_v{v}.pkl"))
+    log(f"[promote-manual] v{v} switch {'OK' if ok else 'FAILED'}")
+    if ok:
+        try:
+            build_live_baseline()
+            log("[promote-manual] live-baseline re-pinned")
+        except Exception as e:  # noqa: BLE001
+            log(f"[promote-manual] baseline re-pin failed (non-fatal): {e}")
+        try:
+            import redis as _r
+            _r.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=3,
+                     decode_responses=True).delete("hcm:ai:retrain:pending_promote")
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _protected_model_files() -> set:
@@ -502,6 +608,73 @@ def deepseek_judge(api_base: str, api_key: str, payload: dict, timeout: int = 60
 
 
 # ── 模型切换（双写 PG+Redis）─────────────────────────────────────────────
+def _sibling_head_pairs(model_path: str) -> list:
+    """【2026-09-11 三头同步】由质量头路径推导方向头/买点头四键。
+
+    根因：train_signal_quality.py 每次训练同时产出**同版本号**六件套
+    （lgbm_quality_vN / calib_vN / lgbm_direction_vN / calib_dir_np_vN /
+      lgbm_entry_vN / calib_entry_np_vN），但 switch_model 只写
+    model_path/calib_path，从不更新 dir/entry 四键 → 三头配置长期漂移
+    （实测 quality=v103 而 dir/entry=v104），且清理逻辑按各自版本保留，
+    配置一旦僵死在旧版本号即被连带删除 → 该头「未启用」（见 :321-326 事故复盘）。
+
+    本函数按同名规则推导四路径，**四个文件全部存在才**返回；
+    任一缺失即返回空列表（保持原行为）——绝不让配置指向不存在的文件
+    （那是 2026-09-03 方向头「未启用」事故的直接成因，见 :267-271）。
+    """
+    import re
+    m = re.search(r"_v(\d+)\.txt$", os.path.basename(model_path or ""))
+    if not m:
+        return []
+    v = m.group(1)
+    d = os.path.dirname(model_path)
+    cand = [
+        ("ai.lm.dir_path", os.path.join(d, "lgbm_direction_v" + v + ".txt")),
+        ("ai.lm.dir_calib_path", os.path.join(d, "calib_dir_np_v" + v + ".pkl")),
+        ("ai.lm.entry_path", os.path.join(d, "lgbm_entry_v" + v + ".txt")),
+        ("ai.lm.entry_calib_path", os.path.join(d, "calib_entry_np_v" + v + ".pkl")),
+    ]
+    missing = [k for k, p in cand if not os.path.exists(p)]
+    if missing:
+        log("[switch] 三头同步跳过：v" + v + " 文件不齐 " + str(missing))
+        return []
+    log("[switch] 三头同步：quality/dir/entry 均指向 v" + v)
+    return cand
+
+
+def _promote_candidate(v: int) -> bool:
+    """【P4-a 2026-09-11 版本四态治理】候选六件套 staging → MODELS_DIR（此刻才占号）。
+
+    四态：TRAIN（随时可跑，产物落 staging，**不占版本号**）→ ACCEPT（本函数：验收通过
+    才分配正式版本号并 promote）→ SHADOW/CANARY/ACTIVE（由 ai.review.mode 控制）。
+
+    任一文件在 staging 缺失且目标也不存在 → 返回 False（调用方据此不改配置，
+    避免配置指向悬空文件——2026-09-03 方向头"未启用"事故的直接成因）。
+    同盘用 os.replace（原子），无需 shutil。
+    """
+    names = [f"lgbm_quality_v{v}.txt", f"calib_v{v}.pkl",
+             f"lgbm_direction_v{v}.txt", f"calib_dir_np_v{v}.pkl",
+             f"lgbm_entry_v{v}.txt", f"calib_entry_np_v{v}.pkl"]
+    ok = True
+    moved = 0
+    for n in names:
+        src = os.path.join(MODEL_STAGING_DIR, n)
+        dst = os.path.join(MODELS_DIR, n)
+        if os.path.exists(src):
+            try:
+                os.replace(src, dst)
+                moved += 1
+            except Exception as e:  # noqa: BLE001
+                log(f"[promote] move {n} failed: {e}")
+                ok = False
+        elif not os.path.exists(dst):
+            log(f"[promote] candidate file missing: {n}（staging 与 models 均无）")
+            ok = False
+    log(f"[promote] v{v} staging→models moved={moved}/{len(names)} "
+        f"{'OK' if ok else 'INCOMPLETE'}")
+    return ok
+
+
 def switch_model(model_path: str, calib_path: str) -> bool:
     """把新模型路径写 ai.lm.model_path / ai.lm.calib_path（PG+Redis 双写+PUB）。
 
@@ -525,8 +698,12 @@ def switch_model(model_path: str, calib_path: str) -> bool:
         # 1) PG 直写（hcm_config.metadata 真源）—— 失败即整体失败，Redis 保持原样
         conn = psycopg2.connect(DB_URL_DEFAULT, connect_timeout=5)
         try:
+            # 【2026-09-11 三头同步】质量头 + 同版本号的方向头/买点头一并写，
+            # 消除三头版本漂移（见 _sibling_head_pairs）；文件不齐时只写质量头两键。
+            pairs = [("ai.lm.model_path", model_path), ("ai.lm.calib_path", calib_path)]
+            pairs += _sibling_head_pairs(model_path)
             with conn.cursor() as cur:
-                for key, val in (("ai.lm.model_path", model_path), ("ai.lm.calib_path", calib_path)):
+                for key, val in pairs:
                     # default_value 是 NOT NULL 列：INSERT 时与 current_value 同值；
                     # 已存在则仅更新 current_value（default_value 保持不变）。
                     cur.execute(
@@ -542,10 +719,10 @@ def switch_model(model_path: str, calib_path: str) -> bool:
             conn.close()
 
         # 2) Redis 直写 + PUB（仅在 PG 提交成功后执行）
-        r.hset("hcm:config:v2", "ai.lm.model_path", model_path)
-        r.hset("hcm:config:v2", "ai.lm.calib_path", calib_path)
-        r.publish("hcm:config:invalidate", "ai.lm.model_path")
-        r.publish("hcm:config:invalidate", "ai.lm.calib_path")
+        for key, val in pairs:
+            r.hset("hcm:config:v2", key, val)
+        for key, _ in pairs:
+            r.publish("hcm:config:invalidate", key)
         log("[switch] Redis hcm:config:v2 updated + PUB")
         return True
     except Exception as e:
@@ -556,10 +733,10 @@ def switch_model(model_path: str, calib_path: str) -> bool:
 def record_retrain_run(payload: dict):
     """记录重训历史到 Redis 键 hcm:ai:retrain:last（JSON）+ 保留最近 50 条列表。
 
-    设计取舍：不写入 hcm_ai.calibration_daily（该表是 reconcile_labels 的产出表，
-    列结构 win_rate/trades 等与本脚本的模型版本语义不同，擅自入侵列=铁律禁止的
-    schema 改动）。改用 Redis 单一真源记录，零 schema 风险，面板/诊断可经
+    设计取舍：不用 PG 表记录（列语义与本脚本的模型版本语义不同，擅自入侵列=铁律
+    禁止的 schema 改动）。改用 Redis 单一真源记录，零 schema 风险，面板/诊断可经
     hcm:ai:retrain:last 查最新、hcm:ai:retrain:history 查近 50 轮。
+    （注：原注释引用的 hcm_ai.calibration_daily 已于 2026-09-11 随「校准时序」死链删除。）
     """
     try:
         import redis
@@ -934,6 +1111,24 @@ def monitor_and_trigger(use_deepseek: bool = True) -> bool:
                 f"{RETRAIN_FAIL_STREAK_HALT} → 本轮**不重训**（避免空转 churn），"
                 f"仅告警。待新模型通过影子验收或人工重置 fail_streak 后自动恢复。")
             return triggered
+        if RETRAIN_TRIGGER_COOLDOWN_H > 0:
+            _cd_key = "hcm:ai:retrain:trigger_cooldown"
+            _now = time.time()
+            try:
+                import redis as _rlib2
+                _rc2 = _rlib2.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=3,
+                                    decode_responses=True)
+                _last = _rc2.get(_cd_key)
+                if _last is not None and _now < float(_last):
+                    _left = (float(_last) - _now) / 3600.0
+                    log(f"[debounce] PSI 触发已去抖：冷却剩余 {_left:.1f}h "
+                        f"(窗口 {RETRAIN_TRIGGER_COOLDOWN_H}h) → 本轮不重训")
+                    return triggered
+                _rc2.set(_cd_key, str(_now + RETRAIN_TRIGGER_COOLDOWN_H * 3600),
+                         ex=int(RETRAIN_TRIGGER_COOLDOWN_H * 3600) + 60)
+            except Exception as _ce:  # noqa: BLE001
+                log(f"[debounce] 冷却键读写失败({_ce}) → 放行"
+                    f"（fail-open：绝不因去抖机制故障而阻塞重训）")
         log("[trigger] condition met -> launching retrain_once()")
         retrain_once(use_deepseek=use_deepseek)
     return triggered
@@ -1089,7 +1284,10 @@ def _run_shadow_eval():
     """--shadow-eval：最新候选 vN vs 现役 champion 影子对比，不切换（安全验证 P3-C）。"""
     champ = _current_model_path()
     v = next_model_version() - 1
-    cand = os.path.join(MODELS_DIR, f"lgbm_quality_v{v}.txt")
+    # 【P4-a 2026-09-11】候选现落 staging；优先取 staging，回退 MODELS_DIR（兼容旧布局）
+    cand = os.path.join(MODEL_STAGING_DIR, f"lgbm_quality_v{v}.txt")
+    if not os.path.exists(cand):
+        cand = os.path.join(MODELS_DIR, f"lgbm_quality_v{v}.txt")
     if not champ or not os.path.exists(cand):
         log(f"[shadow-eval] champion={champ} candidate(v{v})={cand} missing"); return
     ai, feats, passed = fetch_recent(24.0)
@@ -1134,8 +1332,12 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
                 f"→ 跳过本轮重训（空转防护）；人工强制请加 --force")
             return {"ok": False, "stage": "fail_streak_halt", "fail_streak": _streak}
     v = next_model_version()
-    model_out = os.path.join(MODELS_DIR, f"lgbm_quality_v{v}.txt")
-    calib_out = os.path.join(MODELS_DIR, f"calib_v{v}.pkl")
+    # 【P4-a 2026-09-11】候选先落 staging（**不占版本号**）；验收通过后由
+    # _promote_candidate(v) 移入 MODELS_DIR 才真正占用 v。方向头/买点头由
+    # train_signal_quality 写到 --model 同目录，故一并落在 staging。
+    os.makedirs(MODEL_STAGING_DIR, exist_ok=True)
+    model_out = os.path.join(MODEL_STAGING_DIR, f"lgbm_quality_v{v}.txt")
+    calib_out = os.path.join(MODEL_STAGING_DIR, f"calib_v{v}.pkl")
     labels_csv = os.path.join(ARTIFACTS, "labels.csv")
     features_csv = os.path.join(ARTIFACTS, "features.csv")
 
@@ -1322,9 +1524,24 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
                 if se.get("available") and not se.get("adopt"):
                     log("[shadow] challenger 未优于 champion -> 不切换")
                     decided_adopt = False
+        if decided_adopt and not _auto_promote_enabled():
+            # 【P4-b 2026-09-11】人工确认门：候选**不占号、不切换**，只落待批准记录。
+            _save_pending_promote(v, model_out, calib_out, payload.get("shadow"))
+            log(f"[promote-gate] v{v} 已通过验收，但 ai.review.auto_promote=false "
+                f"→ 待人工批准：`python auto_retrain.py --promote-v {v}`")
+            decided_adopt = False
+            payload["pending_promote"] = True
         if decided_adopt:
-            switched = switch_model(model_out, calib_out)
-            log(f"[switch] {'OK' if switched else 'FAILED'} -> {model_out}")
+            # 【P4-a 2026-09-11】先 promote（staging → MODELS_DIR，此刻才占号），
+            # 再切换配置指向**正式目录**路径；否则配置会指向 staging → 清理/回切失效。
+            if _promote_candidate(v):
+                switched = switch_model(
+                    os.path.join(MODELS_DIR, f"lgbm_quality_v{v}.txt"),
+                    os.path.join(MODELS_DIR, f"calib_v{v}.pkl"))
+                log(f"[switch] {'OK' if switched else 'FAILED'} -> v{v}")
+            else:
+                switched = False
+                log("[switch] skipped (promote incomplete → 配置未改，避免指向悬空文件)")
         else:
             log("[switch] skipped (shadow gate blocked)")
 
@@ -1355,6 +1572,8 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
             f"judge={judge.get('decision')} reason={str(judge.get('reason'))[:160]}")
     if switched:
         cleanup_old_versions()
+    # 【P4-a 2026-09-11】staging 清理（每轮无条件执行；只动 staging，不碰正式模型）
+    _cleanup_staging()
 
     record_retrain_run(payload)
     log(f"=== round done: adopted={decided_adopt} switched={switched} "
@@ -1391,6 +1610,9 @@ def main():
                     help="最新候选 vN vs 现役 champion 影子对比，不切换（安全验证 P3-C）")
     ap.add_argument("--build-live-baseline", action="store_true",
                     help="从 inference_log 重建 live 群体 PSI 基线(写 models/live_baseline.json)，不重训")
+    ap.add_argument("--promote-v", type=int, default=None, metavar="N",
+                    help="【P4-b 版本四态治理】人工批准 vN：staging→models 占号 + 切换配置"
+                         "（配合 ai.review.auto_promote=false 的人工确认模式）")
     ap.add_argument("--link-hexp", action="store_true",
                     help="单次执行 HEXP 参数变更链动检测（变更→re-pin live baseline，O7）")
     ap.add_argument("--force-repin", action="store_true",
@@ -1415,6 +1637,9 @@ def main():
         return
     if args.build_live_baseline:
         build_live_baseline()
+        return
+    if args.promote_v is not None:
+        _promote_manually(int(args.promote_v))
         return
     if args.link_hexp:
         # O7：单次链动检测（变更→re-pin baseline）；--force-repin 强制重 pin

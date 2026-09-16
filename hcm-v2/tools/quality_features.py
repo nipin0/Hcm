@@ -57,12 +57,41 @@ MM_PERIOD = 5
 MISSING_HEXP = ["hp_score", "hp_strength", "dir_sum", "k"]
 
 
-def load_signals(conn, mode: str) -> pd.DataFrame:
+def load_signals(conn, mode: str, require_ds_align: bool = True,
+                 ds_align_sec: int = 1800) -> pd.DataFrame:
+    """加载信号。
+
+    【2026-09-11 覆盖率开关】`require_ds_align`：
+      · True（**默认**，质量头管线口径完全不变）→ 保留「DS 票 ±ds_align_sec 对齐」EXISTS 过滤；
+      · False → **不过滤**，覆盖全部信号。
+
+    动机（实测）：该过滤砍掉 1522/3872 ≈ **39%** 信号（features 2355 vs labels 3872），
+    使信号级评审管线样本不足以过方案 §6.2 闸门（训练 ≥2000 / OOF 正样本 ≥200）。
+    评审侧 ds_* 缺失与推理侧**同式**（quality_scorer 缺失亦填 0），故不引入 train/serve skew。
+    默认 True 是为了不改变质量头既有 `ds_nonzero_ratio` 口径（auto_retrain 有该硬护栏）。
+    """
     # 【2026-08-31 扩样本】mode 支持逗号分隔多模式(OR)，单模式行为完全不变(向后兼容)。
     # 与 build_labels.py 同批改造：HEXP 信号历史仅约 3 周、有效样本不足，
     # 并入同期的 live_override（indicator_values 口径已验证一致）以扩充训练样本。
     modes = [m.strip() for m in (mode or "").split(",") if m.strip()] or ["HEXP:%"]
     _mode_clause = " OR ".join(["s.signal_mode LIKE %s"] * len(modes))
+    # 【2026-08-25 训练集时间窗对齐】仅保留能与 DeepSeek 落库票
+    # (hcm_ai.ds_output) 在 ±ds_align_sec 同 symbol 近邻匹配上的信号，
+    # 窗口与下游 _nearest_ds() 严格一致（通过 EXISTS ⟺ 三特征非 0）。
+    # 根治：此前训练窗(8/10 起)远早于 ds_output 落库起点(8/14)，
+    # 且 8/21·8/22 断天，致约83pct样本三特征全0 → 模型无从学习
+    # DeepSeek 语义(ds_nonzero_ratio≈0.16)。对齐后仅训练"有 DS 上下文"
+    # 的样本，ds_nonzero_ratio→~1.0，模型开始真正吸收 DS 语义。
+    _ds_clause = ""
+    _params: tuple = tuple(modes)
+    if require_ds_align:
+        _ds_clause = (
+            " AND EXISTS ("
+            "   SELECT 1 FROM hcm_ai.ds_output d"
+            "   WHERE d.symbol = s.symbol"
+            "     AND abs(extract(epoch from (s.created_at - d.created_at))) <= %s)"
+        )
+        _params = tuple(modes) + (int(ds_align_sec),)
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -72,22 +101,10 @@ def load_signals(conn, mode: str) -> pd.DataFrame:
             FROM hcm_signal.signals s
             WHERE ({_mode_clause})
               AND s.signal_dir IN ('BUY','SELL')
-              AND s.entry_price IS NOT NULL AND s.entry_price > 0
-              -- 【2026-08-25 训练集时间窗对齐】仅保留能与 DeepSeek 落库票
-              -- (hcm_ai.ds_output) 在 ±1800s 同 symbol 近邻匹配上的信号，
-              -- 窗口与下游 _nearest_ds() 严格一致（通过 EXISTS ⟺ 三特征非 0）。
-              -- 根治：此前训练窗(8/10 起)远早于 ds_output 落库起点(8/14)，
-              -- 且 8/21·8/22 断天，致约83pct样本三特征全0 → 模型无从学习
-              -- DeepSeek 语义(ds_nonzero_ratio≈0.16)。对齐后仅训练"有 DS 上下文"
-              -- 的样本，ds_nonzero_ratio→~1.0，模型开始真正吸收 DS 语义。
-              AND EXISTS (
-                SELECT 1 FROM hcm_ai.ds_output d
-                WHERE d.symbol = s.symbol
-                  AND abs(extract(epoch from (s.created_at - d.created_at))) <= 1800
-              )
+              AND s.entry_price IS NOT NULL AND s.entry_price > 0{_ds_clause}
             ORDER BY s.created_at
             """,
-            tuple(modes),
+            _params,
         )
         cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
@@ -630,6 +647,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="features.csv")
     ap.add_argument("--mode", default="HEXP:%")
+    # 【2026-09-11 覆盖率开关】默认保持既有口径（要求 DS 对齐）；
+    # 评审管线传 --no-ds-align 以覆盖全部信号（见 load_signals 注释）。
+    ap.add_argument("--no-ds-align", action="store_true",
+                    help="不要求与 DeepSeek 票 ±ds-align-sec 对齐（覆盖全部信号）。"
+                         "评审管线用；质量头管线勿用——其 ds_nonzero_ratio 护栏依赖该对齐。")
+    ap.add_argument("--ds-align-sec", type=int, default=1800)
     ap.add_argument("--db-url", default=os.environ.get("DB_URL", DB_URL_DEFAULT))
     ap.add_argument("--period-align", default="none", choices=["none", "m5"],
                     help="none=legacy(读 indicator_values 的 H1 h1_adx/h1_trend_strength); "
@@ -640,7 +663,9 @@ def main():
 
     conn = psycopg2.connect(args.db_url)
     try:
-        signals = load_signals(conn, args.mode)
+        signals = load_signals(conn, args.mode,
+                               require_ds_align=not args.no_ds_align,
+                               ds_align_sec=args.ds_align_sec)
         if signals.empty:
             print("[warn] no signals", file=sys.stderr)
             return

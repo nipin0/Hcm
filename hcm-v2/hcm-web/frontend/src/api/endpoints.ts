@@ -115,6 +115,16 @@ export const ENDPOINTS = {
     signal: '/api/v1/hexp/signal',
     ai: '/api/v1/hexp/ai',
   },
+  // [2026-09-15] FSM 行情状态机监控（只读）。后端 web/api/state.py。
+  // 注：五态历史表 market_state_log 无 signal_id / signal_mode 列，
+  // 故信号类型与风控结果两项无数据源，前端按「无数据源」呈现，不臆造。
+  state: {
+    live: (symbol: string) => `/api/v1/state/live/${symbol}` as const,
+    logs: (symbol: string) => `/api/v1/state/logs/${symbol}` as const,
+    proba: (symbol: string) => `/api/v1/state/proba/${symbol}` as const,
+    kline: (symbol: string) => `/api/v1/state/kline/${symbol}` as const,
+    risk: (symbol: string) => `/api/v1/state/risk/${symbol}` as const,
+  },
 } as const;
 
 export type EndpointRegistry = typeof ENDPOINTS;

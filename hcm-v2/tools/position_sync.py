@@ -825,6 +825,218 @@ _CLOSE_REASON_BY_DEAL = {
 }
 
 
+# ── 2026-09-15：FSM 震荡风控计数器回写（方案 §37.5 / §18.4）──────────────
+# 背景：`hcm:state:osc_atr_loss` / `hcm:state:osc_loss_count` 此前**只被读、无人写**
+#   → 「4ATR 防爆仓」与「梯度手数」双双失效（S1 风控闭环整条断开）。
+# 本处是这两个键的**唯一写入点**（唯一的例外是 FSM 清锁/人工复位时自行归零）。
+# **推进语义不在此实现**：规则在 `signal_tower.state_machine.apply_osc_close`（纯函数），
+# 本处只负责"取数 → 调用 → 落库"，避免同一语义两份实现（本仓库红线）。
+_FSM_MOD_CACHE: dict = {}
+# 止损 ATR 倍数兜底：仅当无法还原开仓时 ATR（缺 K 线）时使用。
+# 取值 2.0 = 会话 SL 系数的典型值；**宁可高估**（更早锁止）也不低估 ——
+# 低估会让 4ATR 防爆仓失效（安全机制失效 > 略微偏保守）。
+_SL_ATR_FALLBACK = 2.0
+
+
+def _load_fsm_modules(logger=None):
+    """按文件路径加载信号塔模块（tools 侧既有加载方式，避免包依赖）。
+
+    `state_machine.py` 的导入全为 stdlib，故按路径加载安全。
+    Returns: (state_machine 模块, state_features 模块)；失败返回 (None, None)
+    """
+    if "sm" in _FSM_MOD_CACHE:
+        return _FSM_MOD_CACHE["sm"], _FSM_MOD_CACHE.get("sf")
+    import importlib.util
+    import os as _os
+    import sys as _sys
+
+    tower = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                          "..", "hcm-signal-tower", "signal_tower")
+
+    def _load(mod_name: str, fname: str):
+        path = _os.path.join(tower, fname)
+        if not _os.path.isfile(path):
+            return None
+        spec = importlib.util.spec_from_file_location(mod_name, path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # 【必须注册进 sys.modules，否则 @dataclass 会崩】2026-09-15 上线前验证实测：
+        # 不注册时 `state_machine.py`（含 `@dataclass FSMState`）抛
+        # `'NoneType' object has no attribute '__dict__'` —— dataclass 会用
+        # `sys.modules[cls.__module__]` 取模块 __dict__ 解析 annotations。
+        # （`state_features.py` 无 dataclass，故同样的写法此前一直没暴露。）
+        # 若此处失败，回写会**静默降级**为"永不做任何事"，属本项目反复踩的坑，
+        # 故同时提供 tools/verify_position_sync_hook.py 做上线前验证。
+        _sys.modules[mod_name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    sm = sf = None
+    try:
+        sm = _load("stw_state_machine", "state_machine.py")
+        sf = _load("stw_state_features", "state_features.py")
+    except Exception as e:  # noqa: BLE001
+        if logger:
+            logger.warning("FSM 模块加载失败（震荡计数器回写将跳过）：%s", e)
+    _FSM_MOD_CACHE["sm"], _FSM_MOD_CACHE["sf"] = sm, sf
+    return sm, sf
+
+
+async def _fsm_osc_counter_writeback(conn, redis_conn, log, row, signal_id,
+                                     close_reason, tf: str = "M5") -> None:
+    """FSM 模式下按平仓归因推进震荡风控双计数器。
+
+    **幂等**：调用点被放在 `UPDATE ... WHERE close_time IS NULL RETURNING order_id`
+    成功之后（`_oid` 非空），故同一个 ticket 只会推进一次（重复对账时 UPDATE 不再命中）。
+
+    Args:
+        row: 持仓对账行（需 symbol / open_price / sl / open_time / mt5_ticket）。
+        signal_id: 该笔订单的 signal_id（用于判定是否 FSM 模式）。
+        close_reason: `_infer_close_reason` 的结果（sl / tp / be / manual / ...）。
+        tf: 计算"开仓时 ATR"所用周期（默认 M5 = 首期主周期，见方案 Q2）。
+    """
+    if conn is None or redis_conn is None:
+        return
+    symbol = str(row["symbol"])
+    ticket = row["mt5_ticket"]
+    sm, sf = _load_fsm_modules(log)
+    if sm is None or sf is None:
+        return
+
+    # 1) 只处理 **震荡子模式** 的订单。
+    # 【为什么必须按子模式过滤（2026-09-15 自查发现的缺陷）】规格 9.4 是"累计**震荡**止损
+    # 达 4×ATR → S5 锁止"——预算是**震荡态专用**的。而**趋势单被移动止损打掉同样是
+    # `deal.reason=4` → close_reason="sl"**，若一并计入，会把趋势的亏损记到震荡的风控预算上
+    # → 无端触发 S5、禁掉震荡开仓。故必须按 signal_mode 的**子模式**区分
+    # （方案 §12-4 计划的就是 `state_osc` / `state_trend` 两个子模式）。
+    mode = ""
+    try:
+        if signal_id:
+            mode = str(await conn.fetchval(
+                "SELECT signal_mode FROM hcm_signal.signals WHERE signal_id=$1",
+                signal_id) or "")
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"FSM 计数器：读 signal_mode 失败 #{ticket}: {e}")
+        return
+    _m = mode.strip().lower()
+    if "osc" not in _m:
+        if _m.startswith("state"):
+            # 裸 `state_fsm`（未分子模式）→ **跳过并告警**，而不是"计入"：
+            # 计入会把趋势亏损算进震荡预算；静默跳过又会让锁止无声失效 ——
+            # 故显式告警，把"需要打子模式标签"这件事暴露出来。
+            log.warning(f"FSM 计数器 #{ticket} {symbol}: signal_mode={mode!r} 无震荡/趋势"
+                        f"子模式 → 跳过（无法判定是否属震荡风控预算）。"
+                        f"需按方案 §12-4 下发 state_osc / state_trend")
+        return
+
+    # ── 【2026-09-16 修 be-不解冻缺口：显式「轮次结束」事件】────────────────────
+    # 为什么必须与两个计数器**分开**：`apply_osc_close` 对 `be`/`manual`/`expert`/
+    #   `stop_out` **原样返回（不计入）** —— 对「止损预算」这是对的（保本没亏损）；
+    #   但策略侧判「本轮是否结束」（决定**冻结箱体是否解冻**）若也只看这两个数，
+    #   那么**一轮的平仓全是保本/人工/桥移动止损时，计数器不变 ⇒ 判不出轮次结束
+    #   ⇒ 冻结箱体永久不解**，此后每根 bar 都拿过期 mid 当 TP 锚点。
+    #   规格 §7.1：「止盈 / 止损 / 状态切换**任一**即结束本轮」⇒ 归因不该参与该判定。
+    # 修法：**无论归因**都 INCR 一次（值必然变化；策略只关心「是否变化」）。
+    #   ⇒「是否计入预算」与「轮次是否结束」两种语义各用各自的真值，不再混用。
+    # 幂等：本函数在 `_oid` 分支内被调用（每 ticket 一次）⇒ 一轮可能 +N，
+    #   但 N 不影响「变化」这一判定，故无需额外去重（与上面 BUG-1 的幂等目的不同）。
+    # 失败 fail-open：写不进去只告警 ⇒ 策略侧读到 -1 会**回退旧判据**（= 修复前行为），
+    #   不会让解冻逻辑彻底失效。
+    try:
+        redis_conn.incr(f"hcm:state:osc_round_seq:{symbol}")
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"FSM 轮次标记写入失败 #{ticket} {symbol}"
+                    f"（策略侧将回退到「计数器变化」判据）: {e}")
+
+    # ── 【2026-09-16 修复 BUG-1/2/3：**轮次级幂等**】──────────────────────────
+    # 问题：本函数是**品种级**计数器（`hcm:state:osc_loss_count:{symbol}` /
+    #   `hcm:state:osc_atr_loss:{symbol}`）的**唯一写入点**，却在**逐 ticket** 的平仓
+    #   分支被调用（上方 `_oid` 分支内）。而一个 FSM 信号会**扇出 master + follower
+    #   多笔 ticket**（实测每轮 2 笔：acct 6 + acct 9）⇒ 每轮 `sl` 把 count/atr_loss
+    #   各推进 **N 次**。
+    # 实测后果（2026-09-15 复盘）：
+    #   · `state_strategy.py:1050` 取档 `idx=min(count, len(ladder)-1)` ⇒ count 只在
+    #     **偶数**上取值 0→2→4 ⇒ **`ladder[1]`=1.0 档（0.02 手）结构性不可达**
+    #     （用户观测："0.01 直接跳 0.03"，12 次入场 0.02 一次未出现）；
+    #   · 同一函数还驱动 `osc_atr_loss` ⇒ **4ATR 锁止预算双倍消耗**（实测 ctx
+    #     `frozen_atr_loss=6.705`，远超 `state.osc_atr_loss_limit=4.0`，S5 于 ~15:40
+    #     提前锁止并 `osc_lock_cleared`）⇒ 震荡交易被无端中断。
+    # 修法：以 **`signal_id` = "轮次"** 做幂等 —— 同一轮的 `sl` **只计一次**。
+    #   **只对 `sl` 占名额**：`tp` 归零天然幂等（0,0 → 0,0），`be/manual/expert/stop_out`
+    #   本就不计入（见 `apply_osc_close` 语义表）⇒ 它们不消耗轮次名额，
+    #   从而顺带修掉 **BUG-3**：同轮两笔归因不同（实测 12:57 master=`sl` /
+    #   follower=`expert`）时，**由 `sl` 那笔决定**，与对账先后顺序无关 ⇒ 结果可复现。
+    # 为什么**不**在策略侧写 `count // N`：那会把"扇出 N 笔"这一**部署细节**硬编码进
+    #   策略层，账户数一变（增/减 follower）就再次错位 —— 违反单一真值原则。
+    #   必须在**写入侧**按轮次归一。
+    # TTL 7 天：足以覆盖重复对账/补跑，且不会永久占键。
+    _is_sl = (str(close_reason or "").strip().lower() == "sl")
+    if _is_sl and signal_id:
+        _rkey = f"hcm:state:osc_counted_sig:{signal_id}"
+        try:
+            if not redis_conn.set(_rkey, str(ticket), nx=True, ex=604800):
+                log.info(f"FSM 计数器 #{ticket} {symbol}: signal_id={signal_id} 本轮已计入 "
+                         f"→ 跳过（轮次级幂等，防 master/follower 双计）")
+                return
+        except Exception as e:  # noqa: BLE001
+            # fail-open：幂等键写失败时**继续计数**（宁可高估，避免锁止失效），
+            # 与下方 ATR 兜底 `_SL_ATR_FALLBACK` 的既有取向一致。
+            log.warning(f"FSM 计数器：轮次幂等键写入失败 #{ticket} "
+                        f"（继续计数，避免锁止失效）: {e}")
+
+    # 2) 本次止损用掉多少倍 ATR（**复用特征契约**，不写第二份 ATR 实现）
+    sl_atr = 0.0
+    try:
+        import numpy as _np
+
+        entry = float(row["open_price"] or 0.0)
+        sl = float(row["sl"] or 0.0)
+        if entry > 0 and sl > 0:
+            n = int(sf.min_bars(None)) + 5
+            rows = await conn.fetch(
+                """SELECT open_time, high, low, close FROM hcm_market.klines
+                   WHERE symbol=$1 AND time_frame=$2 AND open_time <= $3
+                   ORDER BY open_time DESC LIMIT $4""",
+                symbol, tf, row["open_time"], n)
+            if rows:
+                rs = list(reversed(rows))
+                h = _np.asarray([float(x["high"]) for x in rs], dtype=float)
+                l = _np.asarray([float(x["low"]) for x in rs], dtype=float)
+                c = _np.asarray([float(x["close"]) for x in rs], dtype=float)
+                atr = float(sf.compute_indicators(h, l, c, None)["atr"][-1])
+                if atr > 0.0:
+                    sl_atr = abs(entry - sl) / atr
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"FSM 计数器：开仓 ATR 还原失败 #{ticket}（将用兜底 {_SL_ATR_FALLBACK}）：{e}")
+
+    if str(close_reason).lower() == "sl" and sl_atr <= 0.0:
+        sl_atr = _SL_ATR_FALLBACK
+        log.warning(f"FSM 计数器 #{ticket} {symbol}: 无法还原开仓 ATR → "
+                    f"止损按兜底 {_SL_ATR_FALLBACK}×ATR 计入（宁可高估，避免锁止失效）")
+
+    # 3) 推进（语义在纯函数里）+ 落 Redis
+    key_a = f"hcm:state:osc_atr_loss:{symbol}"
+    key_c = f"hcm:state:osc_loss_count:{symbol}"
+    try:
+        cur_a = float(redis_conn.get(key_a) or 0.0)
+        cur_c = int(float(redis_conn.get(key_c) or 0))
+    except (TypeError, ValueError):
+        cur_a, cur_c = 0.0, 0
+    new_a, new_c = sm.apply_osc_close(close_reason, sl_atr, cur_a, cur_c)
+    if (new_a, new_c) == (cur_a, cur_c):
+        log.info(f"FSM 计数器 #{ticket} {symbol}: reason={close_reason} → 不计入"
+                 f"（累计 {cur_a:.3f}ATR / 连续 {cur_c} 次）")
+        return
+    try:
+        redis_conn.set(key_a, f"{new_a:.6f}")
+        redis_conn.set(key_c, str(new_c))
+        log.info(f"FSM 计数器 #{ticket} {symbol}: reason={close_reason} "
+                 f"sl_atr={sl_atr:.3f} → 累计 {new_a:.3f}ATR / 连续 {new_c} 次")
+    except Exception as e:  # noqa: BLE001
+        log.error(f"FSM 计数器写入失败 #{ticket} {symbol}: {e}")
+
+
 def _infer_close_reason(mt5, ticket: int, open_price, logger=None) -> tuple:
     """从 MT5 成交历史推断真实平仓原因 + 成交价 + 已实现盈亏。
 
@@ -951,6 +1163,11 @@ async def _close_stale_positions(pool, account_id: int, live_tickets: set[int], 
                         log.info(
                             f"P2-1 orders close-backfill #{tid}: profit={_profit} "
                             f"close={_close_px} reason={_close_reason} (updated open row)")
+                        # 【2026-09-15 §37.5】FSM 震荡风控计数器回写。
+                        # 放在 `_oid` 非空分支内 = **每个 ticket 只推进一次**（幂等）：
+                        # 重复对账时 UPDATE 因 close_time 非空不再命中 → _oid 为 None。
+                        await _fsm_osc_counter_writeback(
+                            conn, redis_conn, log, r, _sid, _close_reason)
                     else:
                         # ──【2026-09-09 幂等修复·根因】──────────────────────────
                         # 兜底 INSERT 原为【无条件写入】：只要持仓仍被判为 open，

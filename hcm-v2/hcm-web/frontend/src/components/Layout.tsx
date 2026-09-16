@@ -47,6 +47,8 @@ const navGroups: NavGroup[] = [
       { label: '仓位与盈亏', path: '/dashboard/positions' },
       { label: '系统健康', path: '/dashboard/health' },
       { label: '外部因子', path: '/dashboard/factors' },
+      // [2026-09-15] FSM 行情状态机监控看板（S1~S4 状态 + 概率 + 箱体 + 持仓风控，只读）。
+      { label: '状态机看板', path: '/dashboard/fsm' },
       // 【2026-08-28】移除「品种对比」(/dashboard/compare) 菜单项（页面已下线）。
       // 【2026-08-29】AI 中枢监控（LightGBM 三头 + DeepSeek 效果，只读）。
       //   注：菜单按用户要求挂在本组，但路由前缀为 /engine，故访问时分组高亮

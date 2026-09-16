@@ -334,6 +334,89 @@ const FIELDS: Record<string, ConfigField[]> = {
       description: '是否把主执行周期(M5)的方向切换也计为反转。默认关：M5 切换过于频繁，开启会让减仓常驻（等价于直接砍半仓位）。',
       suggested: '关闭' },
   ],
+  // ── 【P1b 2026-09-11 审计纳管】入场闸门 (Entry Gate) ──
+  // 本组键由 micro_state / precision_entry 读取、此前未登记面板（只能直写配置中心）。
+  // 注：其 load_config 目前每进程仅调用一次，热改需重启信号塔（P1c 已修）。
+  entry: [
+    { key: 'hexp.entry_gate_enabled', label: '入场闸门总开关', type: 'switch', defaultValue: true,
+      description: 'true=入场闸门参与裁决（θ 门槛 + 精确入场打分）；false=跳过（θ 仅影子观测）。',
+      suggested: 'true' },
+    { key: 'hexp.entry_gate_force_pass', label: '入场闸门强制放行', type: 'switch', defaultValue: false,
+      description: 'true=恒放行（调试/影子验证用，投产勿开）。', suggested: 'false' },
+    { key: 'hexp.entry.theta.TREND_PULLBACK', label: 'θ·趋势回踩', type: 'number', defaultValue: 0.30, min: 0.15, max: 0.85, step: 0.05,
+      description: '趋势回踩态入场门槛（最低，鼓励）。', suggested: '0.30' },
+    { key: 'hexp.entry.theta.TREND_ACCEL', label: 'θ·趋势加速', type: 'number', defaultValue: 0.45, min: 0.15, max: 0.85, step: 0.05,
+      description: '趋势加速态门槛（不建议追）。', suggested: '0.45' },
+    { key: 'hexp.entry.theta.TREND_EXHAUST', label: 'θ·趋势衰竭', type: 'number', defaultValue: 0.55, min: 0.15, max: 0.85, step: 0.05,
+      description: '趋势衰竭态门槛（最高，最谨慎）。', suggested: '0.55' },
+    { key: 'hexp.entry.theta.RANGE', label: 'θ·震荡', type: 'number', defaultValue: 0.45, min: 0.15, max: 0.85, step: 0.05,
+      description: '震荡态门槛（边界均值回归）。', suggested: '0.45' },
+    { key: 'hexp.entry.theta.REVERSAL', label: 'θ·反转', type: 'number', defaultValue: 0.50, min: 0.15, max: 0.85, step: 0.05,
+      description: '反转态门槛（新趋势起点）。', suggested: '0.50' },
+    { key: 'hexp.entry.pullback_atr_min', label: '回踩区间下限 (ATR)', type: 'number', defaultValue: 0.5, min: 0, max: 3, step: 0.1,
+      description: '回踩深度黄金区间下限（ATR 归一化）。', suggested: '0.5' },
+    { key: 'hexp.entry.pullback_atr_max', label: '回踩区间上限 (ATR)', type: 'number', defaultValue: 1.5, min: 0.5, max: 5, step: 0.1,
+      description: '回踩深度黄金区间上限（ATR 归一化）。', suggested: '1.5' },
+    { key: 'hexp.entry.accel_strict_enabled', label: '加速严格判定', type: 'switch', defaultValue: true,
+      description: 'true=用效率比+净位移防横盘误判 TREND_ACCEL（防每根 M5 棒下单）。', suggested: 'true' },
+    { key: 'hexp.entry.accel_lookback', label: '加速判定窗口 (根)', type: 'number', defaultValue: 12, min: 3, max: 60, step: 1,
+      description: '效率比/净位移的判定窗口（M5 根数）。', suggested: '12' },
+    { key: 'hexp.entry.accel_er_min', label: '加速·效率比下限', type: 'number', defaultValue: 0.35, min: 0, max: 1, step: 0.05,
+      description: '效率比 ≥ 此值才算真加速。', suggested: '0.35' },
+    { key: 'hexp.entry.accel_disp_atr_min', label: '加速·净位移下限 (ATR)', type: 'number', defaultValue: 1.0, min: 0, max: 5, step: 0.1,
+      description: '窗口净位移 ≥ 此值才算真加速。', suggested: '1.0' },
+    { key: 'hexp.entry.weight.align', label: '入场分权重·方向对齐', type: 'number', defaultValue: 0.40, min: 0, max: 1, step: 0.05,
+      description: '精确入场加权：方向对齐分量权重。', suggested: '0.40' },
+    { key: 'hexp.entry.weight.structure', label: '入场分权重·结构', type: 'number', defaultValue: 0.40, min: 0, max: 1, step: 0.05,
+      description: '精确入场加权：结构分量权重。', suggested: '0.40' },
+    { key: 'hexp.entry.weight.rr', label: '入场分权重·R:R', type: 'number', defaultValue: 0.20, min: 0, max: 1, step: 0.05,
+      description: '精确入场加权：风险回报分量权重。', suggested: '0.20' },
+    { key: 'hexp.entry.min_rr', label: '入场最低 R:R', type: 'number', defaultValue: 1.2, min: 0.5, max: 3, step: 0.1,
+      description: 'R:R < 此值 → 入场分降权（把桥 R:R guard 上移到信号层）。', suggested: '1.2' },
+  ],
+  // ── 【A/B/C 2026-09-11 趋势优先治理】治「上涨趋势中发 SELL」的架构性缺陷 ──
+  trend: [
+    { key: 'hexp.resonance.counter_block_threshold', label: 'A·强共振逆风硬拦阈值', type: 'number',
+      defaultValue: 0.5, min: 0, max: 1, step: 0.05,
+      description: '方向与 MTF 加权共识相反且 |verdict|≥此值 → 硬拦 NO_TRADE。'
+        + '原 0.55 叠加 min_periods=2 的单周期置信折半 → 单周期强趋势逆势单漏拦；'
+        + '2026-09-11 调为 0.40。置 0 = 关闭硬拦（退回纯降分）。',
+      suggested: '0.40' },
+    { key: 'hexp.trend_priority_mode', label: 'C·趋势优先模式', type: 'select', defaultValue: 'shadow',
+      options: [ { label: 'off（不启用）', value: 'off' },
+                 { label: 'shadow（只观测）', value: 'shadow' },
+                 { label: 'on（确认趋势态禁逆势开单）', value: 'on' } ],
+      description: '主周期状态机确认 TREND_UP/DOWN 时，禁止与该趋势相反的开单。'
+        + '建议先 shadow 观测 would_block 统计再切 on。',
+      suggested: 'shadow' },
+    { key: 'hexp.trend_rsi_mode', label: 'B1·趋势态 RSI 语义', type: 'select', defaultValue: 'shadow',
+      options: [ { label: 'off（旧：超买推空）', value: 'off' },
+                 { label: 'shadow（只观测）', value: 'shadow' },
+                 { label: 'on（趋势态超买不再推空）', value: 'on' } ],
+      description: '旧语义 RSI>70 → f_rsi=-1（超买推空），在趋势中会逆势做空；'
+        + 'on 时确认趋势态下超买不再推空。仅影响方向裁决，不影响 HP 强度。',
+      suggested: 'shadow' },
+    { key: 'hexp.anti_cancel.trend_guard', label: 'B2·趋势态禁抗抵消', type: 'switch', defaultValue: false,
+      description: 'true = 主周期确认趋势时跳过 anti_cancel 均值回归调制（不在趋势里做反转加权）。',
+      suggested: 'false' },
+    { key: 'hexp.anti_cancel.enabled', label: '抗抵消调制总开关', type: 'switch', defaultValue: true,
+      description: 'NEUTRAL/RANGE + hurst<0.5 时按位置调制方向权重（降 ma、升 rsi/hurst/mm）。',
+      suggested: 'true' },
+    { key: 'hexp.anti_cancel.curve', label: '抗抵消·位置调制强度', type: 'number', defaultValue: 1.0,
+      min: 0, max: 3, step: 0.1,
+      description: '指数：越大则越极端位置的反向加权越强。', suggested: '1.0' },
+    { key: 'hexp.anti_cancel.ma_floor', label: '抗抵消·ma 底权', type: 'number', defaultValue: 0.35,
+      min: 0, max: 1, step: 0.05,
+      description: '趋势因子 ma 的权重下限（防趋势因子被彻底压制）。', suggested: '0.35' },
+    { key: 'hexp.direction_hysteresis_ttl_bars', label: 'B4·方向迟滞 TTL(根)', type: 'number', defaultValue: 0,
+      min: 0, max: 200, step: 1,
+      description: '连续「保守维持」超过该根数即允许翻向，治方向长期粘滞；0=关闭。',
+      suggested: '0' },
+    { key: 'hexp.pos_factor.trend_scale', label: '位置因子·趋势态降权系数', type: 'number', defaultValue: 0.25,
+      min: 0, max: 1, step: 0.05,
+      description: '趋势/反转态下位置因子权重乘此值（0 = 趋势态完全停用位置因子）。',
+      suggested: '0.25' },
+  ],
 };
 
 const GROUP_SUMMARY: Record<string, string> = {
@@ -347,9 +430,11 @@ const GROUP_SUMMARY: Record<string, string> = {
   scorecard: '6 维评分卡 + S/A/B/C/红灯分级',
   extreme: '极值闸门（Donchian 分位封顺势追单 + 动量感知 + 回踩支撑 + 极值反转护栏）',
   exec: '执行参数（SL×ATR / R:R / 分级仓位系数 + 转换态·反转态减仓，桥消费）',
+  entry: '入场闸门（状态门槛 θ + 回踩区间 + 加速严格判定 + 精确入场加权，micro_state/precision_entry 消费）',
+  trend: '趋势优先治理（强共振逆风硬拦 + 趋势态 RSI 语义 + 禁抗抵消 + 迟滞 TTL + 趋势优先禁逆势开单；治「上涨趋势中发 SELL」）',
 };
 
-const GROUP_ORDER = ['core', 'k', 'factor', 'param', 'state', 'mm', 'mtf', 'scorecard', 'extreme', 'exec'];
+const GROUP_ORDER = ['core', 'k', 'factor', 'param', 'state', 'mm', 'mtf', 'scorecard', 'extreme', 'exec', 'entry', 'trend'];
 
 const GROUP_TITLES: Record<string, string> = {
   core: 'C 总开关与周期 (Core)',
@@ -362,6 +447,8 @@ const GROUP_TITLES: Record<string, string> = {
   scorecard: 'G 评分卡 (Grade)',
   extreme: 'X 极值闸门 (Extreme)',
   exec: 'E 执行参数 (Execution)',
+  entry: 'θ 入场闸门 (Entry Gate)',
+  trend: 'T 趋势优先治理 (Trend Governance)',
 };
 
 const GROUP_COLORS: Record<string, string> = {
@@ -375,6 +462,8 @@ const GROUP_COLORS: Record<string, string> = {
   scorecard: '#c084fc',
   extreme: '#fb7185',
   exec: '#60a5fa',
+  entry: '#10b981',
+  trend: '#f87171',
 };
 
 const buildHexpFields = (): ConfigField[] => {

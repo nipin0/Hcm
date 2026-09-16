@@ -41,13 +41,14 @@ CFG_FALLBACK = {
     "ai.lm.label_r_loss": 1.0,
     "ai.lm.label_horizon_bars": 12,
     "ai.lm.label_sl_atr_fallback": 2.0,
-    # 【2026-08-28·质量头治本·标签口径统一】质量标签的 R（风险距离）来源。
-    # 根因：引擎在 AI 未生效时故意不写 sl_price（scheduler.py:2377-2378，桥依赖 0=回退会话 SL），
-    # 导致历史信号 sl_price=0 → 标签走 atr×2.0 fallback；而近期 AI 生效的信号 sl_price>0 →
-    # 标签走真实 SL 距离 R=|entry-sl|。同一训练集混了两种语义的 R → 质量头 AUC≈0.5 不可学。
-    #   atr_fallback(默认·向后兼容): 全部用 atr×label_sl_atr_fallback，标签口径统一
-    #   real(推荐): 仅保留 sl_price>0 的信号（R=真实 SL 距离），标签口径统一且与入场质量挂钩
-    "ai.lm.label_sl_source": "atr_fallback",
+    # 【2026-09-11 §4.2.2 统一 R 口径】标签 R（风险距离）来源。
+    # 历史根因：质量头曾用 atr_fallback（忽略真实 SL）、买点头用真实 SL 优先 ——
+    # 同一信号两头学不同的 R，量纲不一致 → 整合分无意义（方案 §4.2.2）。
+    # 现两头共用 derive_r()，默认口径统一为「真实 SL 优先，ATR 兜底」。
+    #   prefer_real(默认·推荐): sl_price 有效 → R=|entry-sl|；否则 R=atr×mult（保留全样本）
+    #   atr_fallback(旧·向后兼容): 全部用 atr×label_sl_atr_fallback，忽略真实 SL
+    #   real(旧·向后兼容): 仅保留 sl_price>0 的信号（剔除其余）
+    "ai.lm.label_sl_source": "prefer_real",
     # 【阶段 0·方向头/买点头标签】独立于 hexp 方向，由未来 K 线方向驱动。
     "ai.lm.dir_atr_mult": 0.8,        # 方向幅度阈值(ATR 倍数)：未来 N 根 close 相对 entry 涨/跌 ≥ ±0.8·ATR → 有方向
     "ai.lm.dir_horizon_bars": 24,     # 方向展望期(根 M5)，长于质量头 12 以稳方向
@@ -56,6 +57,16 @@ CFG_FALLBACK = {
     #   （根治"buy 趋势行情判 SELL、被 flip 成逆势空单"系统性背离）。
     "ai.lm.dir_trend_align": "true",  # 开关：false 则完全退回旧双向(纯未来收益)语义
     "ai.lm.dir_trend_tf": "H1",       # 趋势基准周期（当前实现仅 H1；扩展需另加载对应 tf）
+    # 【P1' 2026-09-11·买点头差异化标签】此前 entry_label 与质量头 label 逐值相同
+    # （两侧 R 都回退 atr×2.0、horizon/r_loss 共用同一配置键）→ 买点头是质量头复制品，
+    # 零增量信息（实测两头 AUC 逐位相同）。现给买点头独立的【更即时 + 更严】口径：
+    #   entry_label_r_loss=0.5（质量头 1.0）：进场后先被套 0.5R 即判"差点位"
+    #   entry_label_horizon_bars=6（质量头 12）：只考察即时确认，不奖励慢热
+    # 语义="该点位是否精确到不需要忍回撤"，与质量头（方向/胜率）正交。
+    # 【默认值经敏感性对照标定】r_loss 0.5/h6 → AUC 0.578、单调性 −0.014（非单调）；
+    #   0.7/h8 → AUC 0.628、单调性 +0.726、校准档位 11 → 取 0.7/8。
+    "ai.lm.entry_label_r_loss": 0.7,
+    "ai.lm.entry_label_horizon_bars": 8,
 }
 
 
@@ -142,32 +153,53 @@ def load_klines(conn, symbols: list[str]) -> dict[str, pd.DataFrame]:
     return out
 
 
+def derive_r(sig_row, cfg: dict) -> tuple:
+    """【2026-09-11 §4.2.2 统一 R 口径】质量头 / 买点头 / 方向头**共用**的 R 推导。
+
+    设计方案 §4.2.2：「统一为：真实 SL 优先，ATR 兜底，两头一致」。
+    此前质量头（原 :164-178，默认 atr_fallback，**忽略**真实 SL）与买点头
+    （原 :335-341，**真实 SL 优先**）各写一份且语义相反 —— 同一信号两头学不同的 R，
+    量纲不一致使整合分无意义。现收敛为**单一函数**，两头调用同式，结构上无法再漂移。
+
+    返回 (R | None, reason)。
+    """
+    entry = float(sig_row["entry_price"])
+    sl_price = sig_row.get("sl_price")
+    atr = sig_row.get("atr_14")
+    ai_sl_mult = sig_row.get("ai_sl_mult")
+    _src = str(cfg.get("ai.lm.label_sl_source", "prefer_real") or "prefer_real").lower()
+    _has_real = (sl_price is not None and float(sl_price) > 0
+                 and abs(float(sl_price) - entry) > 1e-9)
+    _mult = (float(ai_sl_mult) if ai_sl_mult and float(ai_sl_mult) > 0
+             else float(cfg.get("ai.lm.label_sl_atr_fallback", 2.0)))
+    if _src == "atr_fallback":          # 旧口径：一律 atr×mult，忽略真实 SL
+        if not (atr and float(atr) > 0):
+            return None, "no_sl_atr"
+        return _mult * float(atr), "atr_fallback"
+    if _src == "real":                  # 旧口径：仅真实 SL，其余剔除
+        if not _has_real:
+            return None, "no_real_sl"
+        return abs(entry - float(sl_price)), "real"
+    # prefer_real（默认）：真实 SL 优先，ATR 兜底
+    if _has_real:
+        return abs(entry - float(sl_price)), "real"
+    if atr and float(atr) > 0:
+        return _mult * float(atr), "atr_fallback"
+    return None, "no_real_sl_no_atr"
+
+
 def label_one(sig_row, kl: pd.DataFrame, cfg: dict, events=None):
     """对单条信号构造标签。返回 (label|None, reason, R, hit_idx)。"""
     direction = sig_row["signal_dir"]
     entry = float(sig_row["entry_price"])
 
-    # ── 推导 R（风险距离）──
-    sl_price = sig_row.get("sl_price")
-    atr = sig_row.get("atr_14")
-    ai_sl_mult = sig_row.get("ai_sl_mult")
-    # 【2026-08-28·标签口径统一】按 ai.lm.label_sl_source 决定 R 来源，杜绝同集混语义。
-    _sl_source = str(cfg.get("ai.lm.label_sl_source", "atr_fallback") or "atr_fallback").lower()
-    if _sl_source == "real":
-        # 真实 SL 口径：无有效 sl_price 的信号直接排除（保证全库标签=真实 SL 距离 R，
-        # 与入场质量挂钩，使入场质量特征对标签有预测力）。
-        if sl_price is None or not (float(sl_price) > 0) or abs(float(sl_price) - entry) <= 1e-9:
-            return None, "no_real_sl", 0.0, None
-        R = abs(entry - float(sl_price))
-    else:
-        # 统一 ATR fallback 口径：忽略 sl_price（即便有真实 SL 也不用），全库 R=atr×mult。
-        # 保证标签口径一致（修复历史与近期混用两种 R 定义导致质量头不可学）。
-        if not (atr and float(atr) > 0):
-            return None, "no_sl_atr", 0.0, None
-        mult = float(ai_sl_mult) if ai_sl_mult and float(ai_sl_mult) > 0 else cfg["ai.lm.label_sl_atr_fallback"]
-        R = mult * float(atr)
+    # ── 推导 R（风险距离）──【§4.2.2 2026-09-11】与买点头共用 derive_r，结构上杜绝漂移
+    R, _r_reason = derive_r(sig_row, cfg)
+    if R is None:
+        return None, _r_reason, 0.0, None
     if R <= 0:
         return None, "zero_R", 0.0, None
+    atr = sig_row.get("atr_14")     # 下方跳空剔除仍需 atr
 
     r_win = cfg["ai.lm.label_r_win"] * R
     r_loss = cfg["ai.lm.label_r_loss"] * R
@@ -319,21 +351,16 @@ def entry_label_one(sig_row, kl: pd.DataFrame, cfg: dict, dir_val, events=None):
     if dir_val is None or dir_val == 0:
         return None
     entry = float(sig_row["entry_price"])
-    sl_price = sig_row.get("sl_price")
-    atr = sig_row.get("atr_14")
-    ai_sl_mult = sig_row.get("ai_sl_mult")
-    if sl_price is not None and float(sl_price) > 0 and abs(float(sl_price) - entry) > 1e-9:
-        R = abs(entry - float(sl_price))
-    elif atr and float(atr) > 0:
-        mult = float(ai_sl_mult) if ai_sl_mult and float(ai_sl_mult) > 0 else cfg["ai.lm.label_sl_atr_fallback"]
-        R = mult * float(atr)
-    else:
+    atr = sig_row.get("atr_14")     # 下方跳空剔除仍需 atr
+    # 【§4.2.2 2026-09-11】与质量头共用 derive_r —— 两头 R 口径由结构保证一致
+    R, _ = derive_r(sig_row, cfg)
+    if R is None or R <= 0:
         return None
-    if R <= 0:
-        return None
+    # 【P1' 2026-09-11 买点头差异化标签】改用买点头专属口径（见 CFG_FALLBACK 注释）：
+    # 更严的逆行阈值 + 更短的考察窗口，使其与质量头标签正交、真正衡量"精确买点"。
     r_win = cfg["ai.lm.label_r_win"] * R
-    r_loss = cfg["ai.lm.label_r_loss"] * R
-    horizon = int(cfg["ai.lm.label_horizon_bars"])
+    r_loss = float(cfg.get("ai.lm.entry_label_r_loss", 0.5)) * R
+    horizon = int(cfg.get("ai.lm.entry_label_horizon_bars", 6))
     created = sig_row["created_at"]
     if pd.isna(created) or kl is None or kl.empty:
         return None
@@ -464,7 +491,7 @@ def main():
     ap.add_argument("--horizon", type=int, default=None, help="覆盖 ai.lm.label_horizon_bars")
     ap.add_argument("--ds-calibrate", action="store_true",
                     help="设计文档 1.3：用 DeepSeek 票为样本加权 ds_calib_weight（不改 label）")
-    ap.add_argument("--sl-source", choices=["real", "atr_fallback"], default=None,
+    ap.add_argument("--sl-source", choices=["prefer_real", "real", "atr_fallback"], default=None,
                     help="【2026-08-28 标签口径统一】R(风险距离)来源：real=仅保留真实 sl_price 的信号"
                          "（标签与入场质量挂钩）；atr_fallback=统一用 atr×倍数（默认，向后兼容）")
     args = ap.parse_args()

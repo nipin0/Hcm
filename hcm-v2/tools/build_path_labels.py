@@ -8,13 +8,21 @@
 
 方法：
   1) H1 趋势世界 direction（close vs EMA60 与 DI 同向 + ADX 分段，同 quality_features）。
-  2) 空头世界段镜像（-price）拼成"顺向伪序列"，全序列统一按顺向做多研究。
+  2) 空头世界段构造"顺向伪序列"：**差分链式仿射镜像**（段内 ≡ −price+常数，跨段连续），
+     全序列统一按顺向做多研究。见 value_pipeline.build_pseudo_ohlc。
   3) 每根已收盘 M5 bar（世界≠0）为候选：
        risk = clamp(entry − 前20根low, 0.3×ATR, 3×ATR)；SL=entry−risk；TP=entry+1.6×risk；
        向前 90 根 M5：先触 TP → R=+1.6；先触 SL → R=−1；双触同根 → 剔除；
        到期未触 → R=(close_last−entry)/risk。label = 实现 R（连续，扣成本见 train 参数）。
-  4) 特征：伪序列上 quality_features 全指标/结构因子 + rise_atr + donchian_q +
-     H1-EMA60 乖离 + world + 时段。纪律：一切特征只用 ≤ 当前收盘 bar 的历史值。
+  4) 特征：**统一由 value_pipeline.build_features 产出**（训练/推理同一实现）——
+     quality_features 全指标/结构因子 + risk/rise_atr + dist_h1e_atr + world + 时段。
+     纪律：一切特征只用 ≤ 当前收盘 bar 的历史值。
+
+【2026-09-12 修复】本文件原自带一份"镜像 + enrich + H1 乖离"实现，与推理侧
+value_features.py 并不一致，且含两处真 bug（均已迁出并修复，详见 value_pipeline 文档）：
+  · Bug-A：`w.reindex(h1.index)` 索引错配（DatetimeIndex vs RangeIndex）→ H1 镜像静默失效
+           → world=−1 的 dist_h1e_atr 变成 (−4300−4300)/ATR ≈ −733 的量纲垃圾。
+  · Bug-B：逐 bar 取反【价格水平】使 world 切换处 +4400→−4400 跳变 → ATR 被放大 10~100 倍。
 
 用法:
   DB_URL=postgresql://hcm:hcm_dev_pwd@localhost:5432/hcm_v2 \
@@ -31,17 +39,18 @@ import pandas as pd
 import psycopg2
 
 try:
-    import quality_features as QF  # noqa: E402  同目录复用指标管线
+    import value_pipeline as VP  # noqa: E402  训练/推理【唯一共用】特征管线
 except Exception as _e:  # pragma: no cover
-    print(f"[fatal] quality_features import failed: {_e}", file=sys.stderr)
+    print(f"[fatal] value_pipeline import failed: {_e}", file=sys.stderr)
     sys.exit(1)
 
 DB_URL_DEFAULT = "postgresql://hcm:hcm_dev_pwd@localhost:5432/hcm_v2"
 
 HORIZON = 90       # 持仓展望（根 M5 ≈ 7.5h）
+POST_MARGIN = 100  # 坏棒后屏蔽余量（根 M5 ≈ 8.3h；ATR-EWM(1/14) 恢复期）
 TP_MULT = 1.6      # 目标倍数
-SWING = 20         # 顺向低位窗口
-ENTER_TS = 60.0    # 与 quality_features MTF_ENTER_TS 对齐
+SWING = VP.SWING       # 口径常量统一由 value_pipeline 提供（防两侧漂移）
+ENTER_TS = VP.ENTER_TS
 
 
 def load_kl(tf: str, conn) -> pd.DataFrame:
@@ -52,38 +61,11 @@ def load_kl(tf: str, conn) -> pd.DataFrame:
     return df
 
 
-def h1_world_dir(h1: pd.DataFrame) -> pd.Series:
-    """每根 H1 收盘后的世界方向 +1/-1/0（index = close_time）。"""
-    cl = h1["close"].astype(float)
-    hi, lo = h1["high"].astype(float), h1["low"].astype(float)
-    ema60 = cl.ewm(span=60, adjust=False).mean()
-    atr = QF.atr if hasattr(QF, "atr") else None  # 使用本地重算
-    if atr is None:
-        pc = cl.shift(1)
-        tr = pd.concat([hi - lo, (hi - pc).abs(), (lo - pc).abs()], axis=1).max(axis=1)
-        atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
-    up, dn = hi.diff(), -lo.diff()
-    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
-    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
-    pdi = 100 * pd.Series(plus_dm, index=h1.index).ewm(alpha=1 / 14, adjust=False).mean() / atr.replace(0, np.nan)
-    mdi = 100 * pd.Series(minus_dm, index=h1.index).ewm(alpha=1 / 14, adjust=False).mean() / atr.replace(0, np.nan)
-    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-    adx = dx.ewm(alpha=1 / 14, adjust=False).mean()
-    dirs = np.where(pdi >= mdi, 1, -1)
-    ma_dir = np.where(cl > ema60, 1, np.where(cl < ema60, -1, 0))
-    pdir = np.where((ma_dir == 0) | (ma_dir == dirs), dirs, 0)
-    ts = np.where(adx >= 50, 85.0, np.where(adx >= 25, 60.0, np.where(adx >= 15, 45.0, 20.0)))
-    w = np.where((pdir != 0) & (ts >= ENTER_TS), pdir, 0)
-    return pd.Series(w, index=h1["open_time"] + pd.Timedelta(hours=1)).sort_index()
-
-
-def mirror_where(df: pd.DataFrame, world: pd.Series) -> pd.DataFrame:
-    """world==-1 的 bar 做价格镜像（空头世界 → 顺向多头视角）。返回副本。"""
-    out = df.copy()
-    d = world.reindex(df.index).fillna(0)
-    for col in ("open", "high", "low", "close"):
-        out[col] = np.where(d == -1, -out[col], out[col])
-    return out
+# 2026-09-12 重构：原 h1_world_dir / mirror_where 已删除，统一由 value_pipeline 提供。
+#   · h1_world_dir  → VP.h1_world_dir（唯一实现）
+#   · mirror_where  → 由 VP.build_pseudo_ohlc 取代（差分链式仿射镜像，修 Bug-B 跳变）
+#   · H1 镜像       → 彻底删除（修 Bug-A 索引错配）；H1 乖离改 sign 口径
+# 这两处曾是"训练/推理口径漂移"与 dist_h1e_atr 垃圾值的根源。
 
 
 def simulate_forward(close, high, low, risk, horizon=90, tp_mult=1.6):
@@ -130,36 +112,15 @@ def main():
         conn.close()
     print(f"[data] M5={len(m5)} H1={len(h1)}")
 
-    w = h1_world_dir(h1).rename("world")
-    m5 = m5.merge(w, how="left", left_on="open_time", right_index=True)
-    m5["world"] = m5["world"].ffill().fillna(0).astype(int)
-
-    # 顺向伪序列（含特征镜像段）：指标在伪序列上统一按"顺向"语义
-    m5m = mirror_where(m5, m5["world"])
-    try:
-        kl = QF.enrich_klines(m5m.reset_index(drop=True))
-        kl = kl.assign(open_time=m5m["open_time"].reset_index(drop=True),
-                       world=m5m["world"].reset_index(drop=True))
-    except Exception as e:
-        print(f"[fatal] enrich_klines failed: {e}", file=sys.stderr)
-        raise
-
-    # 位置/风险（伪序列，只用历史）
-    atr = kl["atr"]
-    lo20 = kl["low"].rolling(SWING).min()
-    kl["risk"] = (kl["close"] - lo20.shift(1)).clip(lower=0.3 * atr, upper=3.0 * atr)
-    kl["rise_atr"] = (kl["close"] - lo20) / atr.replace(0, np.nan)
-    # H1 EMA60 乖离（顺向上方偏离，×M5 ATR）
-    h1m = mirror_where(h1, w.reindex(h1.index).fillna(0))
-    h1e60 = h1m["close"].astype(float).ewm(span=60, adjust=False).mean()
-    h1e60 = pd.Series(h1e60.to_numpy(),
-                      index=h1["open_time"] + pd.Timedelta(hours=1)).sort_index()
-    kl = kl.merge(h1e60.rename("h1e60"), how="left", left_on="open_time", right_index=True)
-    kl["h1e60"] = kl["h1e60"].ffill()
-    kl["dist_h1e_atr"] = (kl["close"] - kl["h1e60"]) / atr.replace(0, np.nan)
-
-    # 时段 one-hot
-    kl = kl.join(kl["open_time"].apply(lambda t: pd.Series(QF.session_onehot(t))))
+    # 特征：训练/推理【唯一共用】的 value_pipeline.build_features
+    #   · Bug-B 修复：build_pseudo_ohlc 用差分链式仿射镜像替代逐 bar 取反价格水平
+    #   · Bug-A 修复：H1 不做镜像，dist_h1e_atr 统一 sign 口径（与推理完全一致）
+    kl = VP.build_features(m5, h1)
+    print(f"[feat] ATR mean={kl['atr'].mean():.2f} max={kl['atr'].max():.2f} | "
+          f"risk/ATR mean={(kl['risk'] / kl['atr']).mean():.3f} | "
+          f"dist_h1e_atr by world: " +
+          " ".join(f"{w}={kl.loc[kl['world'] == w, 'dist_h1e_atr'].mean():+.2f}"
+                   for w in (-1, 1) if (kl['world'] == w).any()))
 
     # 标签
     close = kl["close"].to_numpy()
@@ -169,16 +130,40 @@ def main():
     R = simulate_forward(close, high, low, risk, horizon=args.horizon, tp_mult=args.tp_mult)
     kl["label"] = R
 
+    # ── 坏棒隔离（2026-09-12）────────────────────────────────────────────
+    # ① 坏棒自身（open/low 为坏值）② 坏棒后 POST_MARGIN 根（ATR-EWM 恢复期）
+    # ③ 候选的向前 horizon 窗口一旦触及 ①/②（否则 SL/TP 三触判定会被坏 low 伪造）
+    # ⇒ 一律置 label=NaN。修复只做有界收敛（low=open=close），不反演真值。
+    anom = kl["anomaly"].to_numpy()
+    blocked = anom.copy()
+    for _i in np.where(anom)[0]:
+        blocked[_i + 1:_i + 1 + POST_MARGIN] = True
+    nxt = np.full(len(blocked), len(blocked), dtype=int)
+    _run = len(blocked)
+    for _i in range(len(blocked) - 1, -1, -1):
+        _run = _i if blocked[_i] else _run
+        nxt[_i] = _run
+    _t = np.arange(len(blocked))
+    _ws = np.minimum(_t + 1, len(blocked) - 1)
+    _we = np.minimum(_t + args.horizon, len(blocked) - 1)
+    touch = (nxt[_ws] <= _we) | blocked
+    kl.loc[touch, "label"] = np.nan
+    print(f"[anom] 坏棒={int(anom.sum())} 根；隔离(含 POST_MARGIN={POST_MARGIN} 与前向窗口) "
+          f"= {int(touch.sum())} 根 ({touch.mean():.1%} of 全序列)")
+
     out = kl[kl["world"] != 0].copy()
     out = out[out["label"].notna()].reset_index(drop=True)
     out["symbol"] = "XAUUSD"
     print(f"[labels] 有效顺向候选={len(out)}  E[label]={out['label'].mean():+.4f}  "
           f"胜率(>0)={np.mean(out['label'] > 0):.3f}")
     cols = ["symbol", "open_time", "world", "label"] + \
-        [c for c in out.columns if c not in ("symbol", "open_time", "world", "label",
-                                             "open", "high", "low", "spread", "h1e60")]
+        [c for c in out.columns
+         if c not in ("symbol", "open_time", "world", "label", "anomaly",
+                      "open", "high", "low", "spread", "h1e60")
+         and c not in VP.NON_STATIONARY_FEATURES]
     out[cols].to_csv(args.out, index=False)
-    print(f"[out] {args.out}  rows={len(out)} cols={len(cols)}")
+    print(f"[out] {args.out}  rows={len(out)} cols={len(cols)}  "
+          f"已剔除非平稳特征={list(VP.NON_STATIONARY_FEATURES)}")
 
 
 if __name__ == "__main__":

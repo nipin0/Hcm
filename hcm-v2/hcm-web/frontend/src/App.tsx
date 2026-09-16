@@ -32,6 +32,8 @@ import HexpDashboard from './pages/hexp/HexpDashboard';
 import Positions from './pages/dashboard/Positions';
 import Health from './pages/dashboard/Health';
 import Factors from './pages/dashboard/Factors';
+// [2026-09-15] FSM 行情状态机监控看板（只读）
+import FsmDashboard from './pages/state/FsmDashboard';
 
 const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const { isAuthenticated, isLoading } = useAuth();
@@ -102,6 +104,8 @@ const App: React.FC = () => {
       <Route path="/dashboard/positions" element={<ProtectedRoute><Positions /></ProtectedRoute>} />
       <Route path="/dashboard/health" element={<ProtectedRoute><Health /></ProtectedRoute>} />
       <Route path="/dashboard/factors" element={<ProtectedRoute><Factors /></ProtectedRoute>} />
+      {/* [2026-09-15] FSM 行情状态机监控看板（只读） */}
+      <Route path="/dashboard/fsm" element={<ProtectedRoute><FsmDashboard /></ProtectedRoute>} />
       {/* 【2026-08-28】移除 /dashboard/compare 路由（品种对比页已下线）。 */}
       <Route path="/dashboard/funnel" element={<ProtectedRoute><SignalFunnel /></ProtectedRoute>} />
 

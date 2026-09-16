@@ -22,7 +22,6 @@ logger = logging.getLogger(__name__)
 # ── Config keys (close prefix) with defaults ────
 
 CLOSE_CONFIG_DEFAULTS: dict[str, Any] = {
-    "close_method": "auto",
     "trailing_stop_enabled": False,
     "trailing_stop_distance": 0.0,
     "break_even_enabled": False,
@@ -30,7 +29,6 @@ CLOSE_CONFIG_DEFAULTS: dict[str, Any] = {
     "break_even_protect": 0,
     "partial_close_enabled": False,
     "partial_close_ratio": 0.0,
-    "close_timeout": 0,
     "breakeven_atr_mult": 0.0,
     "breakeven_tp_ratio": 0.5,  # 保本门槛占 TP 距比例上限（bridge 实际读取）
     # ── 方案乙生效字段（bridge 实际读取，必须进白名单否则 GET 读不回）──

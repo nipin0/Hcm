@@ -1,0 +1,150 @@
+{
+  "accepted": false,
+  "feature_contract": [
+    "adx_14",
+    "rsi_14",
+    "macd",
+    "atr_14",
+    "plus_di",
+    "minus_di",
+    "er",
+    "bbw",
+    "bbw_pct",
+    "hurst",
+    "mm",
+    "ema20_dist_atr",
+    "body_ratio",
+    "pullback_depth",
+    "atr_pct",
+    "spread_num",
+    "spread_atr",
+    "donchian_q",
+    "dev_z_ema20",
+    "dev_z_ema60",
+    "macd_slope3",
+    "body_wick_ratio",
+    "extreme_reversal",
+    "di_ratio",
+    "di_net",
+    "close_mom_atr",
+    "trend_aligned",
+    "session_eu",
+    "session_us",
+    "macro_risk_score",
+    "sentiment_risk_score",
+    "ds_fake_prob",
+    "ds_sl_coeff",
+    "ds_continuity",
+    "verdict",
+    "h1_trend_dir",
+    "dir_sign"
+  ],
+  "n_features": 37,
+  "rows": 2920,
+  "heads": {
+    "quality": {
+      "n": 2920,
+      "n_train": 2044,
+      "n_calib": 292,
+      "n_test": 584,
+      "test_pos": 248,
+      "cal_levels": 100,
+      "auc": 0.6222758256528418,
+      "base_rate": 0.4246575342465753,
+      "ece": 0.07795567004696449,
+      "monotonicity": 0.7120459108880416
+    },
+    "entry": {
+      "n": 2769,
+      "n_train": 1938,
+      "n_calib": 277,
+      "n_test": 554,
+      "test_pos": 176,
+      "cal_levels": 100,
+      "auc": 0.6225799663299664,
+      "base_rate": 0.3176895306859206,
+      "ece": 0.0821862592017189,
+      "monotonicity": 0.8840812610561009
+    },
+    "direction": {
+      "n": 2920,
+      "n_train": 2044,
+      "n_calib": 292,
+      "n_test": 584,
+      "test_pos": 245,
+      "cal_levels": 100,
+      "dir_hit": 0.4,
+      "n_dir": 245,
+      "base_rate": 0.4195205479452055,
+      "ece": 0.16824107476415204,
+      "monotonicity": -0.49679688246379694
+    }
+  },
+  "checks": {
+    "min_train_samples": {
+      "value": 2044,
+      "threshold": 2000,
+      "ok": true
+    },
+    "quality_auc": {
+      "value": 0.6222758256528418,
+      "threshold": 0.55,
+      "ok": true
+    },
+    "quality_ece": {
+      "value": 0.07795567004696449,
+      "threshold": 0.05,
+      "ok": false
+    },
+    "quality_monotonic": {
+      "value": 0.7120459108880416,
+      "threshold": 0.0,
+      "ok": true
+    },
+    "quality_calib_levels": {
+      "value": 100,
+      "threshold": 8,
+      "ok": true
+    },
+    "quality_oof_pos": {
+      "value": 248,
+      "threshold": 200,
+      "ok": true
+    },
+    "entry_auc": {
+      "value": 0.6225799663299664,
+      "threshold": 0.55,
+      "ok": true
+    },
+    "entry_ece": {
+      "value": 0.0821862592017189,
+      "threshold": 0.05,
+      "ok": false
+    },
+    "entry_monotonic": {
+      "value": 0.8840812610561009,
+      "threshold": 0.0,
+      "ok": true
+    },
+    "entry_calib_levels": {
+      "value": 100,
+      "threshold": 8,
+      "ok": true
+    },
+    "entry_oof_pos": {
+      "value": 176,
+      "threshold": 200,
+      "ok": false
+    },
+    "direction_dir_hit": {
+      "value": 0.4,
+      "threshold": 0.55,
+      "ok": false
+    },
+    "direction_monotonic": {
+      "value": -0.49679688246379694,
+      "threshold": 0.0,
+      "ok": false
+    }
+  }
+}

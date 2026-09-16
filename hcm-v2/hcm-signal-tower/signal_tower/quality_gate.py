@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import json
 from typing import Any, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 # 等级梯（低→高）。降级=向左一格，升级=向右一格，两端 clamp。
 GRADE_ORDER = ["RED", "C", "B", "A", "S"]
@@ -28,13 +31,9 @@ GRADE_ORDER = ["RED", "C", "B", "A", "S"]
 CFG_FALLBACK: dict[str, Any] = {
     "ai.enabled": False,
     "ai.mode": "decoupled",          # decoupled / coupled
-    "ai.lm.pass_threshold": 0.50,
     "ai.lm.down_threshold": 0.60,
     "ai.lm.up_threshold": 0.70,
     "ai.lm.veto_floor": 0.30,        # c_ai/100 低于此才否决；否则 HOLD 放行（避免中等分全杀）
-    "ai.lm.veto_quantile": 0.50,     # 分位重锚（备用）
-    "ai.lm.down_quantile": 0.70,
-    "ai.lm.up_quantile": 0.85,
     # 2026-08-17 方案⑤：sidecar 断流兜底新鲜度窗口（秒）。
     # hcm:live:hexp:ai:{symbol} 的 ts 距 now 超过此值 → 视为过期 → lm_score 置 None
     # → 融合 source="none" → 透传纯 HEXP（不误杀）。默认 60s（sidecar 每 ~5s 刷新，
@@ -192,37 +191,24 @@ def coupling_total(hp_score: float, c_ai: float, k: float, cfg: dict) -> float:
     return w * hp_score + (1.0 - w) * c_ai
 
 
-def lot_tier_for(total: float, cfg: dict, prefix: str = "tier") -> str:
+def lot_tier_for(total: float, cfg: dict) -> str:
     """综合分 → 手数分档（low/mid/high/none）。
 
-    **0–100 口径**。prefix 选择阈值键集：
-      - "tier"（默认/唯一在用）：ai.cpl.tier_high/mid/low（65/55/45），用于【解耦 / HEXP 独立】
-        模式，基准=scorecard_total（HEXP 6 维综合分，旧规则）。
+    **0–100 口径**，基准=scorecard_total（HEXP 6 维综合分），阈值键
+    ai.cpl.tier_high/mid/low（65/55/45），用于【解耦 / HEXP 独立】模式。
 
-    【2026-08-31 纠偏】耦合模式【不再】经本函数预选档位、也【不】新增任何配置键。
-    耦合路径在 decide() 中固定返回 lot_tier="none"，由 scheduler 把耦合分 total 透传为
-    信号 confidence，最终交【既有】风控面板 risk.score_tier_{low,mid,high} 规则裁决
-    （下单分<80→low / 80≤≤95→mid / >95→high，倍率 risk.lot_multiplier_*）。故 "lot_tier"
-    前缀分支已废弃、不再被调用。
-    返回的是「档位语义」而非固定倍率——实际倍率由风控面板的动态手数
-    配置（risk.lot_multiplier_{low|mid|high} = 0.5/1.0/1.5）决定，
-    实现「AI 只选档、风控定准确下单值」的链动设计（2026-08-14 需求）。
+    【2026-08-31 纠偏】耦合模式【不再】经本函数预选档位、也【不】新增任何配置键：
+    耦合路径在 decide() 固定返回 lot_tier="none"，由 scheduler 把耦合分 total 透传为
+    信号 confidence，交风控面板 risk.score_tier_{low,mid,high} + risk.lot_multiplier_* 裁决。
+    返回「档位语义」而非固定倍率（AI 只选档、风控定准确下单值，2026-08-14 需求）。
     """
-    hk = f"ai.cpl.{prefix}_high"
-    mk = f"ai.cpl.{prefix}_mid"
-    lk = f"ai.cpl.{prefix}_low"
-    if total >= _g(cfg, hk):
+    if total >= _g(cfg, "ai.cpl.tier_high"):
         return "high"
-    if total >= _g(cfg, mk):
+    if total >= _g(cfg, "ai.cpl.tier_mid"):
         return "mid"
-    if total >= _g(cfg, lk):
+    if total >= _g(cfg, "ai.cpl.tier_low"):
         return "low"
     return "none"
-
-
-def cpl_enabled(cfg: dict) -> bool:
-    """耦合手数分档是否启用（供 caller 区分 'none=未启用' 与 'none=极弱压制'）。"""
-    return bool(_g(cfg, "ai.cpl.enabled"))
 
 
 def adjust_grade(p: float, grade: str, cfg: dict, passed: bool = True):
@@ -307,7 +293,7 @@ def decide(
         _lot_tier = ("none", False)
         if _hexp_lot_enabled:
             # 手数链动用 6 维综合分（scorecard_total），不用强度单维 hp_score
-            _tier = lot_tier_for(scorecard_total, cfg, "tier")
+            _tier = lot_tier_for(scorecard_total, cfg)
             _lot_tier = (_tier, bool(_tier != "none"))
         else:
             _lot_tier = ("none", False)
@@ -318,7 +304,6 @@ def decide(
             "total_score": round(hp_score, 2),
             "c_ai": None,
             "s_hp": hp_score,
-            "ai_opened": False,
             "coupling_pass": True,   # hexp 独立：无耦合，兜底放行
             "cpl_enabled": _lot_tier[1],  # 仅当 hexp 独立选档真正产出非 none 时才非"极弱压制"
             "c_ai_meta": meta,
@@ -373,7 +358,7 @@ def decide(
         if _pbc_abs > 0 and (
                 (direction == "SELL" and ai_mm >= _pbc_abs) or
                 (direction == "BUY" and ai_mm <= -_pbc_abs)):
-            action, final_grade, lot_tier = "VETO", grade, "none"
+            action, final_grade = "VETO", grade
             pullback_chase = "veto_pullback_chase"
 
     # 【阶段 1·方向共振】dir_lm(方向头) × dir_hexp(HEXP 方向)：
@@ -387,7 +372,7 @@ def decide(
         if dir_hexp in ("BUY", "SELL"):
             if ai_direction == _opp.get(dir_hexp) and (ai_dir_prob or 0.0) >= _p_veto:
                 # 反向否决：dir_lm 高置信反向 → 否决该信号（仅拒绝，不改方向，铁律友好）
-                action, final_grade, lot_tier = "VETO", grade, "none"
+                action, final_grade = "VETO", grade
                 dir_resonance = "veto_reverse"
             elif ai_direction == dir_hexp:
                 # 同向增强：hexp 已放行(passed)的已开信号升级一级增强置信；
@@ -407,7 +392,7 @@ def decide(
         _e_veto = _g(cfg, "ai.lm.entry_veto_prob")
         if ai_entry <= _e_veto:
             # 否决差买点：点位质量差 → 否决该信号（仅拒绝入场时机，不改方向）。
-            action, final_grade, lot_tier = "VETO", grade, "none"
+            action, final_grade = "VETO", grade
             entry_resonance = "veto_bad_entry"
         elif ai_entry >= _e_boost:
             # 增强好买点：hexp 已放行(passed)的已开信号升级一级增强入场质量置信；
@@ -427,14 +412,9 @@ def decide(
     #      倍率由 risk.lot_multiplier_{low|mid|high}(0.5/1.0/1.5) 决定（均风控面板既有参数）。
     #    故此处固定返回 lot_tier="none"，交风控按 confidence 现算档位（零新增键）。
     #    none 表示"档位交由风控"；实际倍率由风控面板动态手数决定（链动需求）。
+    # 【P2 清理 2026-09-11】原各 VETO 分支写 lot_tier="none" 被本行无条件覆盖（死赋值），
+    # 已删除；VETO 走本行 "none" 语义等价。
     lot_tier = "none"
-
-    # 否决 → 手数分档置 none（不发信号）
-    if action == "VETO":
-        lot_tier = "none"
-    # 【阶段 1·纪律修正】原 ai_opened（AI 打开 hexp 未放行信号）已永久删除：
-    # 铁律要求 AI 绝不独立开出 HEXP 没给的方向，故恒为 False（保留字段兼容 scheduler）。
-    ai_opened = False
 
     # 2026-08-17 方案甲：HEXP 已过闸信号的「耦合二次放行门槛」。
     # 仅在 coupled + c_ai 有效路径（即已走到此处）计算；total 低于门槛 → coupling_pass=False，
@@ -449,7 +429,6 @@ def decide(
         "total_score": round(total, 2),
         "c_ai": round(c_ai, 2),
         "s_hp": hp_score,
-        "ai_opened": ai_opened,
         "dir_resonance": dir_resonance,  # 阶段 1·方向共振诊断: none/boost_same/veto_reverse
         "entry_resonance": entry_resonance,  # 阶段 2·买点共振诊断: none/boost_good_entry/veto_bad_entry
         "pullback_chase": pullback_chase,  # 杠杆1·追单抑制诊断: none / veto_pullback_chase
@@ -474,13 +453,23 @@ def _regime_of(k: float, cfg: dict) -> str:
     return "NEUTRAL"
 
 
+
+# [F3 2026-09-16] gate_decision failure counter (break fail-silent):
+# original db_pool=None / exception both silent; 09-11 freeze went unnoticed.
+_GATE_DECISION_FAILURES = 0
+
 async def log_gate_decision(db_pool, signal_id, symbol: str, snapshot: dict, decision: dict, cfg=None):
     """落库闸门决策到 hcm_ai.gate_decision（纯观测，供报表②信号分层统计）。
 
     可选落库 helper：不改变 decide() 的纯函数性质；db_pool 为 None 时静默跳过。
     调用方（scheduler 接入点）在 decide() 后调用一次；失败不抛出。
     """
+    global _GATE_DECISION_FAILURES
     if db_pool is None:
+        _GATE_DECISION_FAILURES += 1
+        logger.warning(
+            "[gate_decision] db_pool is None - decision for %s/%s dropped (failures=%d)",
+            symbol, decision.get("action"), _GATE_DECISION_FAILURES)
         return
     try:
         cfg = cfg or CFG_FALLBACK
@@ -507,8 +496,11 @@ async def log_gate_decision(db_pool, signal_id, symbol: str, snapshot: dict, dec
             bool(snapshot.get("passed", False)),
             json.dumps(decision.get("c_ai_meta")) if decision.get("c_ai_meta") else None,
         )
-    except Exception:
-        pass
+    except Exception as _e:  # noqa: BLE001
+        _GATE_DECISION_FAILURES += 1
+        logger.error(
+            "[gate_decision] insert failed for %s/%s: %s (failures=%d)",
+            symbol, decision.get("action"), _e, _GATE_DECISION_FAILURES)
 
 
 if __name__ == "__main__":
@@ -531,13 +523,10 @@ if __name__ == "__main__":
               f"lot_tier={d['lot_tier']} total={d['total_score']} "
               f"c_ai_meta.src={(d.get('c_ai_meta') or {}).get('source')}")
 
-    # 引擎未放行 + AI 高分 → UPGRADE 并标记 ai_opened（2026-08-14 双信号融合赋能设计：
-    # hexp 拦了但给了明确方向时，AI 强票可"打开"该信号；scheduler 据 ai_opened
-    # 覆盖 threshold_passed）。若 hexp 连方向都没有（NO_TRADE），上游直接透传不裁决。
+    # 引擎未放行 + AI 高分 → 仍 HOLD（铁律：AI 绝不越 HEXP 闸门独立开仓，无 UPGRADE/打开）。
     snap_block = dict(snap_pass, passed=False)
     d = decide(snap_block, 90.0, cfg)
-    print(f"blocked+high c_ai → action={d['action']} lot_tier={d['lot_tier']} "
-          f"ai_opened={d.get('ai_opened')}（AI 赋能打开）")
+    print(f"blocked+high c_ai → action={d['action']} lot_tier={d['lot_tier']}（AI 不打开）")
 
     # 引擎未放行 + AI 极低分 → VETO（不得开仓）
     d = decide(snap_block, 20.0, cfg)

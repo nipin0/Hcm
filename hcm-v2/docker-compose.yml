@@ -166,6 +166,10 @@ services:
       - ./hcm-signal-tower/signal_tower/ai_async_client.py:/app/signal_tower/ai_async_client.py
       # [2026-09-04] 反转头每日绩效聚合（新文件非镜像烘焙，缺则 ModuleNotFoundError 崩溃）：绑定挂载跨 recreate 持久
       - ./hcm-signal-tower/signal_tower/rev_daily.py:/app/signal_tower/rev_daily.py
+      # [P2 2026-09-11] 信号级评审器（新文件非镜像烘焙，缺则 scheduler import 崩溃）：只读挂载
+      - ./hcm-signal-tower/signal_tower/reviewer.py:/app/signal_tower/reviewer.py
+      # [P2 2026-09-11] 评审模型目录（只读）：reviewer 默认从 /app/review_models/review_staging 加载
+      - ./tools/models:/app/review_models:ro
       # [2026-09-09] RANGE 均值回归策略（新文件非镜像烘焙，缺则 scheduler 的
       # `from signal_tower import range_strategy` 触发 ModuleNotFoundError 崩溃）：
       # 单仓不加仓（实证：对称1:1胜率70~81%；递增摊平需66.7%而实测50~65%→负期望）。
@@ -183,6 +187,24 @@ services:
       # 兜底）：根治「和乘幂配置保存刷新又复原」。shared 包镜像内置，须单文件挂载才进容器，
       # 否则 hexp_engine/web 的 get_current 调用抛 AttributeError → 回退默认、读不到用户调优值。
       - ./shared/config_provider.py:/app/shared/config_provider.py
+      # [2026-09-14 Phase B] 行情状态机：特征契约(单一真值) + 进程内推理 + FSM/防抖。
+      # 三个均为新增文件（非镜像烘焙）；scheduler 顶部 `from signal_tower.state_infer
+      # / state_machine import ...`，缺任一即 import 崩溃 → 必须挂载且跨 recreate 持久。
+      - ./hcm-signal-tower/signal_tower/state_features.py:/app/signal_tower/state_features.py
+      - ./hcm-signal-tower/signal_tower/state_infer.py:/app/signal_tower/state_infer.py
+      - ./hcm-signal-tower/signal_tower/state_machine.py:/app/signal_tower/state_machine.py
+      - ./hcm-signal-tower/signal_tower/state_strategy.py:/app/signal_tower/state_strategy.py
+      # 【2026-09-15 修复·挂载遗漏】方向模块 + 起点触发器（三件套的后两件）。
+      # **此前漏挂载** → 容器内 `from signal_tower.trend_direction import latest_direction`
+      # 抛 ModuleNotFoundError，被 scheduler 那段 try 的 except（**DEBUG 级**日志）吞掉 →
+      #   ① 方向恒 ""  ⇒ 策略层 resolve_trend_dir 退化为 `slope_fallback`（斜率符号），
+      #      而 M5 斜率符号**实测反向**（方案 §20/§51）⇒ 趋势态意图的方向源是坏的；
+      #   ② trigger_reason 恒 "disabled" ⇒ §30 实测远优的触发器（漏检 0.4% / 中位**提前 −1.0 根**）
+      #      完全没运行，趋势态入口退化为模型 argmax 推导（漏检 20% / 中位**滞后 +3.5 根**）
+      #      —— 即"最差的那条路径"在跑，且**无声**（日志只说"方向/触发器不可用"在 DEBUG 级）。
+      # 教训同 state_* 系列：新增模块必须同步本清单，否则容器内 import 静默失败。
+      - ./hcm-signal-tower/signal_tower/trend_direction.py:/app/signal_tower/trend_direction.py
+      - ./hcm-signal-tower/signal_tower/trend_trigger.py:/app/signal_tower/trend_trigger.py
 
   hcm-market-intel:
     build:
@@ -382,6 +404,11 @@ services:
       - ./hcm-web/web/api/ai_report.py:/app/web/api/ai_report.py
       # [2026-08-29] AI 中枢监控 API（三头实时运作+DeepSeek 效果，只读，新文件非镜像烘焙）：绑定挂载跨 recreate 持久
       - ./hcm-web/web/api/ai_ops.py:/app/web/api/ai_ops.py
+      # [2026-09-15] FSM 行情状态机监控 API（5 个只读端点：live/logs/proba/kline/risk）。
+      # ⚠️ 本行必须与 main.py 的 `from web.api.state import create_state_router` 同时生效：
+      #    缺本行则容器 restart 后 main.py 在该 import 处 ImportError → hcm-web **整体起不来**
+      #    （不是"新接口 404"这么轻），故新增 web/api/*.py 一律要在此处补挂载。
+      - ./hcm-web/web/api/state.py:/app/web/api/state.py
       # [2026-08-08] hcm-web 主入口：注册 hexp 等新增路由；绑定挂载使路由注册跨 recreate 持久（否则容器重建回退镜像版丢失 hexp 路由）
       - ./hcm-web/main.py:/app/main.py
       # 仪表盘 API：新增 live-score 端点（暴露信号塔实时评分快照：评分 vs 自适应门槛 vs 能否下单）；绑定挂载跨 recreate 持久

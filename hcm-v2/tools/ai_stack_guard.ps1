@@ -53,6 +53,13 @@ $LIGHTGBM = @{
 $TIMESFM = @{
     Name      = 'timesfm'
     Display   = 'TimesFM scheduler'
+    # 【2026-09-11 政策变更·停用】TimesFM 的 13 维 tmf_* 已于 2026-09-10 从模型契约
+    # 下线（_model_feature_cols.py:119-127，AUC 消融 dAUC=-0.0205），其抽取产物已无
+    # 任何消费方 = 纯空转。故置 Enabled=$false：守护不再拉起/守护该调度器，也不参与
+    # 2b/2c 的存活判定；仅写一条 action=disabled 状态供健康页识别"已停用"而非"故障"。
+    # 恢复：改回 Enabled=$true + 启用计划任务 HCM_TimesFMDailyGuard + 跑
+    # timesfm_daily_boot.ps1 拉起即可（脚本/特征表/检索库均未删）。
+    Enabled   = $false
     Pattern   = 'timesfm_daily_scheduler.py'
     Py        = 'D:\.venv_timesfm\Scripts\pythonw.exe'
     Launcher  = Join-Path $TOOLS 'timesfm_daily_launcher.py'
@@ -177,6 +184,20 @@ if ($Snapshot) {
 # --- 2) per component: liveness / dedup / heal / status ------------------
 foreach ($c in $COMPONENTS) {
     $name = $c.Name
+
+    # Disabled components: never spawn/kill; publish an explicit action=disabled status
+    # so the health page shows intent ("已停用") rather than a fault. See $TIMESFM.Enabled.
+    if ($c.ContainsKey('Enabled') -and -not $c.Enabled) {
+        if (-not $Dry) {
+            $dstat = ('name=' + $c.Display +
+                      '|pid=0|running=False|beat_age_s=-1|readable=False|alive=False' +
+                      '|action=disabled|healed=False|dry=False' +
+                      '|ts=' + [int][double]::Parse((Get-Date -UFormat %s)))
+            Invoke-Redis @('SET', ('hcm:ai:' + $name + ':status'), $dstat, 'EX', '180') | Out-Null
+        }
+        Write-Output ('[' + $name + '] DISABLED (skipped)')
+        continue
+    }
 
     $sigKey = 'ai:heal:request:' + $name
     $sig = Invoke-Redis @('GET', $sigKey)

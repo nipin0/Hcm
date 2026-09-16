@@ -24,3 +24,41 @@ class NumpyCalibrator:
         idx = np.searchsorted(self.x_fit, X, side="right") - 1
         idx = np.clip(idx, 0, len(self.x_fit) - 1)
         return np.clip(self.y_fit[idx], self.y_min, self.y_max)
+
+    def level_count(self) -> int:
+        """映射的输出档位数（阶梯数）—— 退化判据（见 reviewer._cal_levels）。"""
+        return int(len(np.unique(np.round(self.y_fit, 4))))
+
+
+class PlattCalibrator:
+    """参数化（sigmoid）概率校准器 —— 纯 numpy，生产容器可加载。
+
+    【2026-09-11 B 方案】NumpyCalibrator(isotonic) 是**阶梯函数**，其分辨率受校准
+    样本量硬约束：实测校准集 292 样本时仅产出 5~9 档，撞上生产门槛「档位 ≥ 8」。
+    Platt scaling 只有 2 个参数 (a, b)，小样本下更稳，且输出**连续**、无档位限制。
+
+    形式：p_cal = sigmoid(a · logit(p_raw) + b)
+      · logit(p) = ln(p / (1−p))，p 先截断到 [eps, 1−eps] 防 log(0)；
+      · a > 0 保持单调；a ≈ 0 ⇒ 输出近乎常数 ⇒ 视为**退化**（见 level_count）。
+    """
+
+    def __init__(self, a: float, b: float, eps: float = 1e-6):
+        self.a = float(a)
+        self.b = float(b)
+        self.eps = float(eps)
+
+    def predict(self, X):
+        X = np.asarray(X, float).ravel()
+        p = np.clip(X, self.eps, 1.0 - self.eps)
+        z = np.log(p / (1.0 - p))
+        t = np.clip(self.a * z + self.b, -30.0, 30.0)   # 防 exp 溢出
+        return 1.0 / (1.0 + np.exp(-t))
+
+    def level_count(self, n: int = 100) -> int:
+        """与 isotonic 语义对齐的「分辨率」判据：在 [0,1] 网格上的输出档位数。
+
+        阶梯函数用阶梯数；连续函数用同一网格上的量化分辨率 —— 两者都表达
+        「校准映射是否退化（近乎常数）」。a≈0 时输出恒定 → 返回 1（判退化）。
+        """
+        grid = np.linspace(0.0, 1.0, n)
+        return int(len(np.unique(np.round(self.predict(grid), 4))))

@@ -3,6 +3,9 @@ FROM python:3.11-slim
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    # 【P2 2026-09-11】LightGBM 的 OpenMP 运行时（slim 基础镜像缺失 → import 报
+    # OSError: libgomp.so.1；评审器进程内推理必需）。lightgbm 包本身见 requirements.txt。
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY shared /app/shared

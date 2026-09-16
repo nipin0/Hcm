@@ -503,8 +503,26 @@ def _calib_is_degenerate(iso, min_levels: int | None = None) -> bool:
         yf = getattr(iso, "y_fit", None)
         if yf is not None:
             levels = {round(float(v), 4) for v in yf}
-            return len(levels) < _min
-        return False
+            if len(levels) < _min:
+                return True
+            # 【2026-09-12 P3-B 校准修复】增补「宽输入→常数输出」退化判定：
+            # 方向头 BUY 校准器 y_fit 恰 8 档(卡阈值边缘)漏判，但决策区 raw∈[0.1,0.9]
+            # 恒压同一常数→无分辨力。改以输出网格唯一值数+输出跨度双判，使此类伪
+            # 非退化校准器正确回退 raw，恢复 ai_dir_prob 分辨力（自愈覆盖三头）。
+            _pred = getattr(iso, "predict", None)
+            if _pred is not None:
+                try:
+                    import numpy as _np
+                    _grid = _np.linspace(0.1, 0.9, 17)
+                    _outs = [round(float(_pred([_g])[0]), 4) for _g in _grid]
+                    _oset = set(_outs)
+                    if len(_oset) < _min:
+                        return True
+                    if (max(_outs) - min(_outs)) < 0.10:
+                        return True
+                except Exception:
+                    pass
+            return False
     except Exception:
         return False
 
@@ -931,6 +949,10 @@ def score_one(model, iso, feats: dict, state_model=None, state_classes=None,
     【阶段 1·方向头】dir_model 加载时额外推断 ai_direction(BUY/SELL/HOLD)+ ai_dir_prob。
     方向头仅作"同向增强/反向否决"输入（永不独立开方向，红线），灰度默认 None。
     """
+    # 【B 项·2026-09-11】原始模型输出捕获（供三头落库 ai_pred_raw 滚动校准）。
+    # 校准器输入(raw)与输出(cal)分离记录：recalibrate_quality.py 用 raw 重拟合校准器。
+    _dir_raw_p = None
+    _entry_raw_p = None
     try:
         names = model.feature_name()
         row = {k: feats.get(k) for k in names}
@@ -1002,6 +1024,8 @@ def score_one(model, iso, feats: dict, state_model=None, state_classes=None,
                 ai_direction = ("BUY" if _classes[_best] == 1
                                 else "SELL" if _classes[_best] == -1 else "HOLD")
                 ai_dir_prob = float(_proba[_best])
+                # 【B 项·2026-09-11】捕获方向头原始模型输出(raw，校准前)，供落库滚动校准。
+                _dir_raw_p = float(_raw_proba[0][_best])
                 # ── 2026-09-01 dir_head 防抖：概率 EMA + 间隙带 ──
                 # 背景（实测）：三分类 BUY/SELL 概率长期接近（探针 gap=0.077），argmax
                 # 随 M5 实时特征噪声瞬间跳转；isotonic 校准分段常数使概率档位跳变
@@ -1047,6 +1071,8 @@ def score_one(model, iso, feats: dict, state_model=None, state_classes=None,
                 for c in edf.columns:
                     edf[c] = pd.to_numeric(edf[c], errors="coerce").fillna(0.0)
                 _e_raw = float(entry_model.predict(edf)[0])
+                # 【B 项·2026-09-11】捕获买点头原始模型输出(raw，校准前)，供落库滚动校准。
+                _entry_raw_p = _e_raw
                 if entry_calib is not None:
                     _ep = float(entry_calib.predict([_e_raw])[0])
                     # 【阶段 1·校准裁决】校准器退化 → 与 raw 混合恢复分辨率
@@ -1059,7 +1085,9 @@ def score_one(model, iso, feats: dict, state_model=None, state_classes=None,
                 print(f"[warn] entry head predict failed: {exc}", file=sys.stderr)
                 ai_entry = None
         return (float(max(0.0, min(1.0, p))), predicted_state, ai_direction,
-                ai_dir_prob, ai_entry, _DIR_STATE.get("raw"))
+                ai_dir_prob, ai_entry, _DIR_STATE.get("raw"),
+                float(max(0.0, min(1.0, p_raw))) if "p_raw" in dir() else None,
+                _dir_raw_p, _entry_raw_p)
     except Exception as exc:
         print(f"[warn] score failed (feature mismatch?): {exc}", file=sys.stderr)
         return (None, None)
@@ -1112,6 +1140,47 @@ def _persist(conn, out, feats, snap):
         conn.commit()
     except Exception as exc:
         print(f"[warn] persist failed: {exc}", file=sys.stderr)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+# 【B 项·2026-09-11】三头原始分落库（质量头滚动校准闭环数据源）
+# 纪律：只写不参与交易决策；任何异常仅告警(fail-open)，绝不阻塞 AI 评分主链路。
+# 同 (head, t_time, symbol) 运行内去重防爆表（跨重启最坏重复一条，无害）。
+_RAW_WRITTEN: set = set()
+_RAW_WRITTEN_MAX = 50000
+
+
+def _record_raw(conn, symbol, t_time, head, model_version, raw_proba, cal_p, pred_class):
+    """写 hcm_ai.ai_pred_raw 一行（三头每 M5 棒各一条）。
+
+    raw_proba = 模型原始输出(校准前)；cal_p = 当前校准概率(观测)。
+    方向头 pred_class ∈ {-1,0,1}；质量/买点头为 NULL。
+    """
+    if raw_proba is None:
+        return
+    try:
+        if hasattr(t_time, "to_pydatetime"):
+            t_time = t_time.to_pydatetime()
+        _k = (head, t_time, symbol)
+        if _k in _RAW_WRITTEN:
+            return
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO hcm_ai.ai_pred_raw "
+                "(t_time, head, model_version, symbol, raw_proba, cal_p, pred_class, extra) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (t_time, head, model_version, symbol,
+                 float(raw_proba), (None if cal_p is None else float(cal_p)),
+                 pred_class, json.dumps({})),
+            )
+        conn.commit()
+        if len(_RAW_WRITTEN) < _RAW_WRITTEN_MAX:
+            _RAW_WRITTEN.add(_k)
+    except Exception as exc:
+        print(f"[warn] ai_pred_raw record failed: {exc}", file=sys.stderr)
         try:
             conn.rollback()
         except Exception:
@@ -1359,6 +1428,8 @@ def main():
         # 【2026-09-09 P1】inference_log 落库心跳间隔(秒)：值稳定时也按此间隔补写，
         # 0 = 关闭心跳(恢复旧行为：仅值变化才写)。配置键 ai.lm.persist_heartbeat_sec。
         _persist_hb = 60.0
+        # 【B 项·2026-09-11】三头原始分落库开关（默认开）。
+        _raw_record = True
         # 【阶段 1·方向头】main 作用域变量，供 _reload_cfg 内 nonlocal 绑定。
         dir_model = None
         dir_calibs = None
@@ -1416,6 +1487,7 @@ def main():
             nonlocal state_model, state_classes, _raw_fallback
             nonlocal dir_model, dir_calibs, entry_model, entry_calib
             nonlocal _score_zscore, _score_smooth, _min_valid, _ds_window_sec, _persist_hb
+            nonlocal _raw_record
             now = time.time()
             if not force and (now - _cfg_reloaded_at) < _cfg_reload_sec:
                 return False
@@ -1454,6 +1526,8 @@ def main():
             _TMF_ASOF = _bool(cfg, "ai.lm.tmf_asof_enabled", _TMF_ASOF)
             _TMF_MAX_AGE_MIN = _cfg_float(cfg, "ai.lm.tmf_max_age_min", _TMF_MAX_AGE_MIN)
             _persist_hb = max(0.0, _cfg_float(cfg, "ai.lm.persist_heartbeat_sec", 60.0))
+            # 【B 项·2026-09-11】三头原始分落库开关（校准闭环数据源）。默认开；关=不写 ai_pred_raw。
+            _raw_record = _bool(cfg, "ai.lm.raw_record_enabled", True)
             _new_model = args.model or (cfg.get("ai.lm.model_path") or "").strip() or None
             _new_calib = args.calib or (cfg.get("ai.lm.calib_path") or "").strip() or None
             # 多任务状态头模型：与质量模型同目录的 lgbm_state.pkl（灰度切换时一并切换）
@@ -1542,7 +1616,7 @@ def main():
                     _model_status = "ready"
                     try:
                         _probe = {c: 0.0 for c in (model.feature_name() if hasattr(model, "feature_name") else FEATURE_COLS)}
-                        _p, _ps, _pd, _pdp, _pe, _pr = score_one(
+                        _p, _ps, _pd, _pdp, _pe, _pr, *_ = score_one(
                             model, iso, _probe, state_model, state_classes,
                             dir_model, dir_calibs, entry_model, entry_calib, _probe=True)
                         if _p is None or not (float("-inf") < float(_p) < float("inf")):
@@ -1636,7 +1710,8 @@ def main():
                         _tmf_out = _load_tmf_for_bar(conn, args.symbol.upper(), _bar_time)
                         feats = build_features(snap, kl, _h1f, _envf, align_m5=_align_m5,
                                                audit=_feature_audit, ds_out=_ds_out, tmf_out=_tmf_out)
-                        _raw, _pred_state, _ai_dir, _ai_dir_prob, _ai_entry, _ai_dir_raw = score_one(
+                        _raw, _pred_state, _ai_dir, _ai_dir_prob, _ai_entry, _ai_dir_raw, \
+                            _q_raw, _d_raw_p, _e_raw_p = score_one(
                             model, iso, feats, state_model, state_classes, dir_model, dir_calibs,
                             entry_model, entry_calib)
                         ai_score = None
@@ -1796,6 +1871,18 @@ def main():
                             out["value_reason"] = _vv.get("reason")
                     except Exception as _vv_err:
                         print(f"[warn] value head poll failed: {_vv_err}", file=sys.stderr)
+                    # 【B 项·2026-09-11】三头原始分落库（校准闭环数据源）；失败安全不阻塞主链路。
+                    if _raw_record:
+                        _mv = os.path.basename(_model_path) if _model_path else None
+                        _record_raw(conn, args.symbol.upper(), _bar_time, "quality", _mv,
+                                    _q_raw, _raw, None)
+                        if _ai_dir is not None:
+                            _record_raw(conn, args.symbol.upper(), _bar_time, "direction", _mv,
+                                        _d_raw_p, _ai_dir_prob,
+                                        {"BUY": 1, "SELL": -1, "HOLD": 0}.get(_ai_dir))
+                        if _ai_entry is not None:
+                            _record_raw(conn, args.symbol.upper(), _bar_time, "entry", _mv,
+                                        _e_raw_p, _ai_entry, None)
                     r.set(f"hcm:live:hexp:ai:{args.symbol.upper()}", json.dumps(out), ex=15)
                     try:
                         r.set("ai.lm.health_check", json.dumps({

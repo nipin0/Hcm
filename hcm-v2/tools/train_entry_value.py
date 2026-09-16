@@ -57,7 +57,12 @@ def run_roll(df, feats, y, args):
         ytr, yte = y.iloc[tr_idx], y.iloc[te_idx]
         if len(Xtr) < 1000 or len(Xte) < 200:
             continue
-        m, p = _fit_and_score(Xtr, ytr, Xte, yte, args.seed)
+        # 【防泄漏 2026-09-12】原实现把【测试段】当 early_stopping 验证集（模型选择看答案）。
+        # 改为从训练段末段再切一份时间序验证集，测试段全程不参与任何选择。
+        _cv = int(len(Xtr) * (1 - args.val_ratio))
+        m, _ = _fit_and_score(Xtr.iloc[:_cv], ytr.iloc[:_cv],
+                              Xtr.iloc[_cv:], ytr.iloc[_cv:], args.seed)
+        p = m.predict(Xte)      # 预测在【未参与任何选择的测试段】上
         tail = df.iloc[te_idx].reset_index(drop=True)
         allm = yte.to_numpy()
         top = p >= np.quantile(p, 0.8)
@@ -90,7 +95,11 @@ def main():
     ap.add_argument("--labels", default="_artifacts/labels_path.csv")
     ap.add_argument("--model", default="_artifacts/lgbm_value_v1.txt")
     ap.add_argument("--test-ratio", type=float, default=0.30)
+    ap.add_argument("--val-ratio", type=float, default=0.20,
+                    help="训练段内再切出多少比例作 early_stopping 验证集（时间序末段，防泄漏）")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--leak-compare", action="store_true",
+                    help="额外跑一遍旧(有泄漏)过程做对照，量化泄漏规模")
     ap.add_argument("--roll", action="store_true", help="滚动多窗口 walk-forward 稳健性")
     ap.add_argument("--roll-k", type=int, default=5)
     args = ap.parse_args()
@@ -105,25 +114,32 @@ def main():
         run_roll(df, feats, y, args)
         return
 
-    X = df[feats].copy()
-    for c in X.columns:
-        X[c] = pd.to_numeric(X[c], errors="coerce")
-    X = X.fillna(X.median())
-
+    # ──【防泄漏 2026-09-12】原实现有两处泄漏，使测试窗指标偏乐观 ────────────────
+    #  ① `X.fillna(X.median())` 的中位数取自【全量】(含测试窗) → 测试信息渗入训练
+    #  ② `eval_set=[(Xte, yte)]` 用【测试窗】做 early_stopping → 模型选择直接看答案
+    # 修法：训练段内再切出时间序末段作验证集；中位数只用训练段；测试窗全程不参与任何选择。
+    Xn = df[feats].apply(pd.to_numeric, errors="coerce")
     n = len(df)
     cut = int(n * (1 - args.test_ratio))
-    Xtr, Xte, ytr, yte = X.iloc[:cut], X.iloc[cut:], y.iloc[:cut], y.iloc[cut:]
-    print(f"[split] train={len(Xtr)}  test={len(Xte)}  "
-          f"(test 窗 {df['open_time'].iloc[cut]:%m-%d} ~ {df['open_time'].iloc[-1]:%m-%d})")
+    cut_val = int(cut * (1 - args.val_ratio))
+    med = Xn.iloc[:cut_val].median()                     # 仅训练段中位数
+    Xtr = Xn.iloc[:cut_val].fillna(med)
+    Xva = Xn.iloc[cut_val:cut].fillna(med)
+    Xte = Xn.iloc[cut:].fillna(med)
+    ytr, yva, yte = y.iloc[:cut_val], y.iloc[cut_val:cut], y.iloc[cut:]
+    print(f"[split] train={len(Xtr)}  val={len(Xva)}  test={len(Xte)}  "
+          f"(val 窗 {df['open_time'].iloc[cut_val]:%m-%d}~{df['open_time'].iloc[cut - 1]:%m-%d}; "
+          f"test 窗 {df['open_time'].iloc[cut]:%m-%d} ~ {df['open_time'].iloc[-1]:%m-%d})")
 
     m = lgb.LGBMRegressor(
         objective="huber", n_estimators=600, learning_rate=0.05,
         num_leaves=15, min_child_samples=40, subsample=0.8, colsample_bytree=0.8,
         random_state=args.seed, verbose=-1,
     )
-    m.fit(Xtr, ytr, eval_set=[(Xte, yte)],
+    m.fit(Xtr, ytr, eval_set=[(Xva, yva)],
           callbacks=[lgb.early_stopping(80, verbose=False)])
     p = m.predict(Xte)
+    print(f"[early_stop] best_iteration={m.best_iteration_}（验证集=训练段末段，非测试窗）")
 
     # 预测分位单调性（测试集）
     te = pd.DataFrame({"pred": p, "act": yte.to_numpy()})
@@ -157,6 +173,38 @@ def main():
             continue
         print(f"{name:22s} n={len(sub):5d}  E[R]={sub.mean():+.4f}  "
               f"wr={np.mean(sub > 0):.3f}  med={np.median(sub):+.3f}")
+
+    # ── 泄漏量化：旧过程(双泄漏) vs 新过程(无泄漏)，同一测试窗 ──
+    if args.leak_compare:
+        print("\n" + "=" * 88)
+        print("== 泄漏量化：旧过程(early_stopping 用测试集 + 全量中位数) vs 新过程(无泄漏) ==")
+        print("=" * 88)
+        Xl = df[feats].apply(pd.to_numeric, errors="coerce")
+        Xl = Xl.fillna(Xl.median())          # 旧：全量中位数（含测试窗）
+        mL = lgb.LGBMRegressor(
+            objective="huber", n_estimators=600, learning_rate=0.05,
+            num_leaves=15, min_child_samples=40, subsample=0.8, colsample_bytree=0.8,
+            random_state=args.seed, verbose=-1)
+        mL.fit(Xl.iloc[:cut], y.iloc[:cut], eval_set=[(Xl.iloc[cut:], y.iloc[cut:])],
+               callbacks=[lgb.early_stopping(80, verbose=False)])
+        pL = mL.predict(Xl.iloc[cut:])
+        rows = []
+        for tag, pp, bi in (("旧(有泄漏)", pL, mL.best_iteration_),
+                            ("新(无泄漏)", p, m.best_iteration_)):
+            d0 = pd.DataFrame({"pred": pp, "act": yte.to_numpy()})
+            d0["b"] = pd.qcut(d0["pred"], 5, labels=["Q1", "Q2", "Q3", "Q4", "Q5"])
+            gm = d0.groupby("b", observed=True)["act"].mean()
+            r0, pv0 = _sps.spearmanr(d0["pred"], d0["act"])
+            t20 = d0["pred"] >= np.quantile(d0["pred"], 0.8)
+            rows.append({"过程": tag, "best_iter": bi, "spearman": round(float(r0), 4),
+                         "p值": f"{pv0:.1e}",
+                         "Q1": round(float(gm.iloc[0]), 3), "Q2": round(float(gm.iloc[1]), 3),
+                         "Q3": round(float(gm.iloc[2]), 3), "Q4": round(float(gm.iloc[3]), 3),
+                         "Q5": round(float(gm.iloc[4]), 3),
+                         "top20%_E[R]": round(float(d0.loc[t20, "act"].mean()), 4),
+                         "top20%_wr": round(float(np.mean(d0.loc[t20, "act"] > 0)), 3)})
+        print(pd.DataFrame(rows).to_string(index=False))
+        print("\n  注：两行用同一测试窗与同一 y；差异即「泄漏带来的乐观量」本身。")
 
     imp = pd.Series(m.feature_importances_, index=feats).sort_values(ascending=False)
     print("\n== 特征重要性 top15 ==")

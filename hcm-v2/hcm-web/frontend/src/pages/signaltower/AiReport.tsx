@@ -381,10 +381,10 @@ interface DailyRow {
   lm_inferences: number; ds_calls: number; ds_success: number; ds_fail: number; ds_timeout: number;
   cache_hits: number; fuse_events: number; degrade_events: number;
   hp_candidates: number; ai_passed: number; ai_vetoed: number; ai_upgraded: number;
-  ai_downdgraded: number; ai_opened: number;
+  ai_downdgraded: number;
   total_orders: number; total_pnl: number; win_orders: number; loss_orders: number;
   ai_enhanced_orders: number; ai_enhanced_pnl: number; non_ai_pnl: number; ai_contrib_ratio: number;
-  fused_orders: number; lm_only_orders: number; ds_only_orders: number;
+  lm_only_orders: number;
 }
 interface DailyData { days: number; rows: DailyRow[]; }
 
@@ -445,7 +445,6 @@ function DailyKpiReport() {
           <KpiCard title="AI 贡献占比" value={latest.ai_contrib_ratio > 0 ? `${fmt(latest.ai_contrib_ratio * 100, 1)}%` : '—'} color="#8b5cf6" subtitle="AI 赋能单盈亏 / 总盈亏" />
           <KpiCard title="LM 推理" value={latest.lm_inferences} color="#3b82f6" subtitle="sidecar 推理次数" />
           <KpiCard title="AI 否决" value={latest.ai_vetoed} color="#ef4444" subtitle="VETO 信号数" />
-          <KpiCard title="AI 赋能打开" value={latest.ai_opened} color="#22c55e" subtitle="hexp 未放行 → AI 打开" />
         </Stack>
       )}
       <Box sx={{ mt: 2, height: 300 }}>
@@ -462,7 +461,7 @@ function DailyKpiReport() {
       <TableContainer component={Paper} elevation={0} sx={{ backgroundColor: '#111118', border: '1px solid #2a2a3a' }}>
         <Table size="small">
           <TableHead><TableRow>
-            {['日期', '总单', '总盈亏', 'AI单', 'AI盈亏', 'AI占比', 'LM推理', '否决', '赋能打开', '融合'].map((h) => (
+            {['日期', '总单', '总盈亏', 'AI单', 'AI盈亏', 'AI占比', 'LM推理', '否决', '来源'].map((h) => (
               <TableCell key={h} sx={{ color: '#94a3b8' }}>{h}</TableCell>
             ))}
           </TableRow></TableHead>
@@ -477,11 +476,10 @@ function DailyKpiReport() {
                 <TableCell sx={{ color: '#8b5cf6' }}>{r.ai_contrib_ratio > 0 ? `${fmt(r.ai_contrib_ratio * 100, 1)}%` : '—'}</TableCell>
                 <TableCell sx={{ color: '#e2e8f0' }}>{r.lm_inferences}</TableCell>
                 <TableCell sx={{ color: '#ef4444' }}>{r.ai_vetoed}</TableCell>
-                <TableCell sx={{ color: '#22c55e' }}>{r.ai_opened}</TableCell>
-                <TableCell sx={{ color: '#94a3b8' }}>f{r.fused_orders}/lm{r.lm_only_orders}/ds{r.ds_only_orders}</TableCell>
+                <TableCell sx={{ color: '#94a3b8' }}>lm{r.lm_only_orders}</TableCell>
               </TableRow>
             ))}
-            {rows.length === 0 && <TableRow><TableCell colSpan={10} sx={{ color: '#64748b' }}>暂无数据（后台聚合任务运行后积累，或历史回溯窗口内无成交）</TableCell></TableRow>}
+            {rows.length === 0 && <TableRow><TableCell colSpan={9} sx={{ color: '#64748b' }}>暂无数据（后台聚合任务运行后积累，或历史回溯窗口内无成交）</TableCell></TableRow>}
           </TableBody>
         </Table>
       </TableContainer>

@@ -115,6 +115,12 @@ class RiskStreamConsumer:
             if str(signal_data.get("signal_mode", "")) == "manual_mirror":
                 return
 
+            # 【2026-09-15 FSM】行情状态机信号：**跳过 confidence 分档，改用 FSM 自有倍率**。
+            # 见下方 base 解析之后的处理块（为什么必须跳过：FSM 的 `confidence` 是
+            # 模型决策边际 top1−top2（典型 0.1~0.4，≤1.0 不触发本函数的归一化）→
+            # 会被当"低置信"落到最小档 ⇒ 手数恒为 base×0.5、梯度失效）。
+            # 处理必须放在 **base 解析之后**（要复用同一 base 真源）。
+
             async def get(key: str, default: float) -> float:
                 try:
                     v = await self._redis.hget("hcm:config:v2", key)
@@ -130,6 +136,37 @@ class RiskStreamConsumer:
                 tower_lot = await get(f"symbol.{symbol}.tower.lot_size", None)
                 if tower_lot and (max_lot <= 0 or tower_lot <= max_lot):
                     base = tower_lot
+            # ── 【2026-09-15 FSM】状态机信号：base × FSM 倍率，**不参与 confidence 分档** ──
+            # 为什么在这里算而不是在桥算：**基础手数的真源就在本函数**（上一段解析出的
+            # `base` = symbol.{sym}.tower.lot_size 或 risk.lot_base）。让桥再解析一次
+            # 就是第二份 base 真源（本仓库红线）。倍率由塔给出（顶层流字段，与
+            # `ai_sl_mult` 等同一约定），乘算在本处完成 → 桥只需用 `lot`（与其它 mode 一致）。
+            # 为什么不能用 confidence 分档：FSM 的 confidence 是**模型决策边际**
+            # （top1−top2，典型 0.1~0.4）；该值 ≤1.0 不触发下方归一化 → 被判"低置信"
+            # → 落最小档 mult_low ⇒ 手数恒 base×0.5、S1 梯度与趋势 base_lot 全失效。
+            # 用 ai_lot_tier 也救不了：本函数只有 low/mid/high **3 档**，表达不了 S1 的 4 档。
+            if str(signal_data.get("signal_mode", "")).strip().lower().startswith("state"):
+                try:
+                    fsm_mult = float(signal_data.get("fsm_lot_multiplier", 1.0) or 1.0)
+                except (TypeError, ValueError):
+                    fsm_mult = 1.0
+                if fsm_mult <= 0:
+                    fsm_mult = 1.0          # 非法倍率 → 回退 base（不放大、不清零）
+                raw_lot = base * fsm_mult
+                raw_lot = min(raw_lot, max_lot) if (max_lot and max_lot > 0) else raw_lot
+                new_lot = round(raw_lot, 4) if raw_lot > 0 else 0.0
+                if new_lot != float(signal_data.get("lot", 0.0)):
+                    logger.info(
+                        "FSM lot: signal_id=%s mode=%s base=%.4f fsm_mult=%.2f → lot=%.4f "
+                        "(max_lot=%.4f)",
+                        signal_data.get("signal_id", 0), signal_data.get("signal_mode", ""),
+                        base, fsm_mult, new_lot, max_lot,
+                    )
+                    signal_data["lot"] = new_lot
+                # 【必须 return】否则继续往下走信心分档，`signal_data["lot"]` 会被
+                # `base × tier_mult` **覆盖**掉本处算好的值（本脚本第一版就是这样，
+                # 实测三种倍率全部被覆盖成 base×0.5）。
+                return
             # 共源 G3 / AI 动态手数倍率：scheduler 已将 co_exec_lot_mult 与 suggested_lot_ratio 合并进此字段
             co_ai_mult = float(signal_data.get("suggested_lot_ratio", 1.0) or 1.0)
             score = float(signal_data.get("confidence", 0.0))
@@ -566,6 +603,14 @@ class RiskStreamConsumer:
             "suggested_lot_ratio": float(signal_data.get("suggested_lot_ratio", 1.0) or 1.0),
             # AI 手数分档（low/mid/high/none）→ 桥端跟单/观测用（链动风控动态手数）
             "ai_lot_tier": str(signal_data.get("ai_lot_tier", "none") or "none"),
+            # ── 【2026-09-15 §43】FSM 字段透传 ──
+            # `fsm_state` / `fsm_lot_multiplier`：风控动态手数 + 诊断用，**必须**透传。
+            # 【2026-09-16 冲突③修复】`trail_mult` / `exit_ready` / `trail_lookback` 不再经
+            # 信号字段透传 —— 它们由塔**每 bar**刷新的 `hcm:state:directive:{symbol}` 承载
+            # （桥 FSM 移动止损分支的**唯一真值源**），信号字段那份是开仓时的冻结快照、
+            # 且桥从不消费信号字段里的 fsm_*（全仓核实）。留两份真值会误导且易失同步，故删除。
+            "fsm_state": str(signal_data.get("fsm_state", "") or ""),
+            "fsm_lot_multiplier": float(signal_data.get("fsm_lot_multiplier", 1.0) or 1.0),
             "co_exec_fb": int(signal_data.get("co_exec_fb", 0) or 0),  # 盲点兜底单：桥端 zone 到期不市价追
             # 2026-08-26 反向单标记：momentum_flip 封 NO_TRADE 后覆写方向产出的接刀单，
             # 风控 _check_reverse_order 消费；透传供桥端诊断/日志识别。

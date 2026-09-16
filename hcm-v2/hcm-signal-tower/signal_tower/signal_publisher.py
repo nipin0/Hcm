@@ -17,15 +17,9 @@ import asyncio
 import json
 import logging
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
-
-from shared.llm_client import DeepSeekClient, parse_json_block
-
-from signal_tower.co_source import _CALIB_KEYS
-from signal_tower.regime_classifier import Regime
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +31,6 @@ DEFAULT_RETRY_MAX = 3
 DEFAULT_RETRY_DELAY = 0.5
 STREAM_MAXLEN = 10000
 
-# 自动写回校准因子的总开关（经 ConfigProvider.set 可热关，调试/人工接管时用）
-CALIB_AUTO_APPLY_KEY = "co.calib.auto_apply"
-
 # ── 订单状态枚举（hcm_trading.orders.order_status）────────────────────────
 # 铁律 4.6：禁止在 SQL/代码里裸写 1/2 等状态字面量（历史上裸写 order_status=1
 # 曾导致 1015 笔订单假 open、风控冷却全面失效，见铁律 10.1）。
@@ -48,19 +39,6 @@ CALIB_AUTO_APPLY_KEY = "co.calib.auto_apply"
 #   CLOSED(2)→ 1157 行，close_time 全部非空。
 ORDER_STATUS_OPEN = 1
 ORDER_STATUS_CLOSED = 2
-
-
-def _regime_to_calib_key(regime_str: str) -> Optional[str]:
-    """把 DB 的 m5_regime 字符串映射到 co.calib.* 配置键（复用 co_source._CALIB_KEYS）。
-
-    DB 中 m5_regime 可能以 Regime 的 value 或 name 形式存储，这里两者都匹配，
-    与 local_calibrator._regime_key 口径一致。
-    """
-    s = (regime_str or "").upper()
-    for reg, key in _CALIB_KEYS.items():
-        if reg.value.upper() == s or reg.name.upper() == s:
-            return key
-    return None
 
 
 # ── 2026-09-08：signal_mode → MT5 magic 逻辑编号 ──
@@ -77,6 +55,13 @@ SIGNAL_MODE_MAGIC = {
     #   故 magic_for_signal_mode 不识别 RANGE，改由 scheduler 依 range_mode 标志
     #   显式覆盖（单一真源仍在此表）。
     "range": 55,
+    # 【2026-09-15 §12-4】行情状态机 FSM 的子模式（方案 §18.3 状态→订单映射）。
+    # 为什么必须有**两个**子模式而不是一个 `state_fsm`：
+    #   `tools/position_sync.py` 的平仓归因要靠它区分"**震荡**止损"与"趋势止损" ——
+    #   规格 9.4 的 4ATR 锁止预算是**震荡态专用**的，若趋势亏损也计入会无端触发 S5。
+    #   故子模式字符串里必须带 "osc" 才能被识别（见 position_sync 的过滤逻辑）。
+    "state_osc": 61,      # S1 箱体逆势单
+    "state_trend": 62,    # S2/S3/S4 顺势单（含加仓）
 }
 
 
@@ -89,6 +74,11 @@ def magic_for_signal_mode(signal_mode: str) -> int:
         return SIGNAL_MODE_MAGIC["live_override"]
     if m == "INDICATOR_SCORING" or m.endswith("_WEIGHTS"):
         return SIGNAL_MODE_MAGIC["scoring"]
+    # FSM 子模式（精确匹配，避免把未来的 state_* 变体误映射）
+    if m == "STATE_OSC":
+        return SIGNAL_MODE_MAGIC["state_osc"]
+    if m == "STATE_TREND":
+        return SIGNAL_MODE_MAGIC["state_trend"]
     return 0
 
 
@@ -117,6 +107,15 @@ class SignalData:
     composite_score: float = 0.0
     signal_mode: str = "indicator_scoring"
     magic: int = 0  # MT5 magic 号（手动跟单时透传主号原 magic，桥侧下单时用此值覆盖默认 123456）
+    # ── 【2026-09-15 §43】行情状态机（FSM）字段：**跨组件消费，故为顶层流字段** ──
+    # 与 `ai_sl_mult` / `sl_locked` / `zone_tp_level` 同一约定。
+    # 为什么不塞进 `indicator_values`：它到下游是 **JSON 字符串**（redis 封装层
+    # `shared/redis_client.py:146` 对 dict/list 做 json.dumps），风控与桥都得先 json.loads；
+    # 而既有跨组件字段一律用顶层。
+    # ⚠ **新增流字段必须同步加进 risk-engine 的 `_publish_risk_passed` 白名单**，
+    #   否则到不了桥 —— 历史事故：`zone_level` 等曾漏传 → 桥侧取 0 → "出信号不下单"。
+    fsm_state: str = ""
+    fsm_lot_multiplier: float = 1.0     # S1 梯度(0.5/1.0/1.5/2.0) / 趋势=1.0，乘在风控 base 上
     indicator_values: dict = field(default_factory=dict)
     macro_snapshot_id: Optional[int] = None
     sentiment_snapshot_id: Optional[int] = None
@@ -346,6 +345,12 @@ class SignalPublisher:
             "confidence": signal.confidence,
             "signal_mode": signal.signal_mode,
             "magic": signal.magic,
+            # ── FSM 字段（跨组件消费；新增流字段必须同步风控白名单，见 SignalData 注释）──
+            "fsm_state": signal.fsm_state,
+            "fsm_lot_multiplier": signal.fsm_lot_multiplier,
+            # 【2026-09-16 冲突③修复】trail_mult/exit_ready/trail_lookback 不再经信号字段透传：
+            # 它们由塔每 bar 刷新的 `hcm:state:directive:{symbol}` 承载（桥 FSM 移动止损分支的
+            # 唯一真值源），信号字段那份是开仓时冻结快照且桥从不消费 → 留双真值易失同步，删除。
             "indicator_values": signal.indicator_values,
             "macro_snapshot_id": signal.macro_snapshot_id or 0,
             "sentiment_snapshot_id": signal.sentiment_snapshot_id or 0,
@@ -769,320 +774,6 @@ class SignalPublisher:
         except Exception as exc:  # noqa: BLE001
             logger.error("reconcile_labels failed: %s", exc)
             return 0
-
-    # ── 每日校准快照（P1：AI 自我发展的「日历」）────────
-    # 与 local_calibrator 完全一致的校准数学：
-    #   calib = clamp(1.0 + (win_rate - 0.5), CALIB_CLAMP_MIN, CALIB_CLAMP_MAX)
-    #   win_rate 偏离基准 0.5 越多，因子越偏离 1.0（>1 放大可信信号，<1 压制弱信号）。
-    CALIB_ALPHA = 1.0
-    CALIB_CLAMP_MIN = 0.6
-    CALIB_CLAMP_MAX = 1.4
-    CALIB_MIN_SAMPLES = 20   # 单态最小累计样本（不足→冷启动 1.0）
-    CALIB_MIN_DAYS = 7       # 最小样本日（不足→冷启动 1.0）
-
-    CALIB_DAILY_UPSERT_SQL = """
-        INSERT INTO hcm_ai.calibration_daily
-            (report_date, m5_regime, trades, wins, losses, win_rate,
-             calib_factor, sample_days, cold_start, computed_at)
-        SELECT
-            rd,
-            m5_regime,
-            trades,
-            wins,
-            trades - wins AS losses,
-            CASE WHEN trades > 0 THEN wins::numeric / trades ELSE 0 END,
-            CASE
-                WHEN cum_trades >= $1 AND sample_days >= $2 AND cum_trades > 0
-                    THEN LEAST($3, GREATEST($4,
-                              1.0 + (cum_wins::numeric / cum_trades - 0.5)))
-                ELSE 1.0
-            END,
-            sample_days,
-            (cum_trades < $5 OR sample_days < $6),
-            now()
-        FROM (
-            SELECT
-                rd, m5_regime, trades, wins,
-                SUM(trades) OVER w AS cum_trades,
-                SUM(wins)  OVER w AS cum_wins,
-                COUNT(*)   OVER (PARTITION BY m5_regime) AS sample_days
-            FROM (
-                SELECT
-                    date(bar_time) AS rd,
-                    m5_regime,
-                    COUNT(*) AS trades,
-                    SUM((label = 'win')::int) AS wins
-                FROM hcm_ai.labeled_samples
-                WHERE label IN ('win', 'loss')
-                  AND m5_regime <> ''
-                GROUP BY date(bar_time), m5_regime
-            ) daily
-            WINDOW w AS (
-                PARTITION BY m5_regime
-                ORDER BY rd
-                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-            )
-        ) agg
-        ON CONFLICT (report_date, m5_regime) DO UPDATE SET
-            trades      = EXCLUDED.trades,
-            wins        = EXCLUDED.wins,
-            losses      = EXCLUDED.losses,
-            win_rate    = EXCLUDED.win_rate,
-            calib_factor = EXCLUDED.calib_factor,
-            sample_days = EXCLUDED.sample_days,
-            cold_start  = EXCLUDED.cold_start,
-            computed_at = EXCLUDED.computed_at;
-        """
-
-    async def reconcile_calibration_daily(self) -> int:
-        """P1：把「截至每日的累计胜率→校准因子」算成时序快照写进 calibration_daily。
-
-        每个标注样本归属的交易日(date(bar_time))，按 M5 体制做「累计」胜率→校准因子
-        （窗口函数 cum 累计到当日），存为 (report_date, m5_regime) 一行。这样前端
-        「校准时序」页可按时序回放各体制校准因子/胜率的演化——AI 自我发展的历史轨迹。
-
-        仅在有新标注样本时才重算（computed_at 早于最新标注时间即跳过），省 PG 负载；
-        首次运行（表为空）会全量回填历史。
-
-        注意：本函数只落库，不标记 applied。applied 字段仅当校准因子经
-        mark_calibration_applied（在自动写回 co.calib.* 成功后）标记，
-        避免"落库即当前生效"的虚假状态。
-
-        返回当前快照总行数，供日志观测。
-        """
-        if self._db is None or not getattr(self._db, "is_initialized", False):
-            return 0
-        try:
-            last = await self._db.fetchval(
-                "SELECT MAX(computed_at) FROM hcm_ai.calibration_daily"
-            )
-            newest = await self._db.fetchval(
-                "SELECT MAX(created_at) FROM hcm_ai.labeled_samples "
-                "WHERE label IN ('win', 'loss')"
-            )
-            if last is not None and newest is not None and last >= newest:
-                return 0  # 无新标注，跳过
-            await self._db.execute(
-                self.CALIB_DAILY_UPSERT_SQL,
-                self.CALIB_MIN_SAMPLES, self.CALIB_MIN_DAYS,
-                self.CALIB_CLAMP_MAX, self.CALIB_CLAMP_MIN,
-                self.CALIB_MIN_SAMPLES, self.CALIB_MIN_DAYS,
-            )
-            n = await self._db.fetchval("SELECT COUNT(*) FROM hcm_ai.calibration_daily")
-            return int(n) if n is not None else 0
-        except Exception as exc:  # noqa: BLE001
-            logger.error("reconcile_calibration_daily failed: %s", exc)
-            return 0
-
-    async def compute_latest_calib_factors(self) -> Optional[dict]:
-        """读最新校准快照，返回非冷启动且偏离 1.0 的体制校准因子(co.calib.* 键→值)。
-
-        返回 None 表示所有体制仍在冷启动或因子恰为 1.0（无需/不应写回配置，
-        以免把人工调优的因子覆盖成 1.0）。
-        """
-        if self._db is None or not getattr(self._db, "is_initialized", False):
-            return None
-        try:
-            latest_date = await self._db.fetchval(
-                "SELECT MAX(report_date) FROM hcm_ai.calibration_daily"
-            )
-            if latest_date is None:
-                return None
-            rows = await self._db.fetch(
-                "SELECT m5_regime, calib_factor, cold_start "
-                "FROM hcm_ai.calibration_daily WHERE report_date = $1",
-                latest_date,
-            )
-            factors: dict = {}
-            for r in rows:
-                calib = float(r["calib_factor"])
-                if bool(r["cold_start"]) or calib == 1.0:
-                    continue  # 冷启动或未调整：不写回，避免覆盖人工配置
-                key = _regime_to_calib_key(r["m5_regime"])
-                if key:
-                    factors[key] = round(calib, 4)
-            return factors or None
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("compute_latest_calib_factors failed: %s", exc)
-            return None
-
-    async def mark_calibration_applied(self) -> None:
-        """把最新 report_date 的快照行标记为 applied=TRUE。
-
-        调用方必须已在之前成功把因子写回 co.calib.*，否则 applied 会产生
-        "已生效"的虚假状态。本函数幂等，多次调用无害。
-        """
-        if self._db is None or not getattr(self._db, "is_initialized", False):
-            return
-        try:
-            await self._db.execute(
-                "UPDATE hcm_ai.calibration_daily SET applied = TRUE "
-                "WHERE report_date = (SELECT MAX(report_date) "
-                "FROM hcm_ai.calibration_daily)"
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("mark_calibration_applied failed: %s", exc)
-            return
-
-    async def generate_calibration_diagnosis(self, trend_days: int = 14) -> Optional[dict]:
-        """P1：用 DeepSeek 把最新校准快照 + 近期趋势生成「自然语言诊断」。
-
-        前期 AiScorer 的提示词是「宏观/情绪/事件因子打分」(输出 score 0-30/bias/summary)，
-        用途是给市场因子赋分，**不直接适配校准诊断**——它强制数值分、评估宏观风险，
-        而非对各体制胜率/校准因子的趋势研判与调参建议。此处以其「system=分析师 + 仅回
-        JSON」的结构骨架为基础，精确改写为「校准诊断分析师」角色：输入各体制 win_rate /
-        calib_factor / 样本日 / 近期趋势，输出 narrative(中文自然语言诊断) +
-        recommendations(具体调参建议，如 co.gate.<regime>.trend) + needs_human_review +
-        confidence。
-
-        无 DeepSeek 配置或调用失败时返回 None，由 web 端点回退到确定性诊断（离线可渲染）。
-        """
-        if self._db is None or not getattr(self._db, "is_initialized", False):
-            return None
-        try:
-            # 1) 读 DeepSeek 配置（PG hcm_config.metadata 真源，缺则回退环境变量）
-            async def _cfg(key: str) -> Optional[str]:
-                return await self._db.fetchval(
-                    "SELECT current_value FROM hcm_config.metadata WHERE config_key=$1", key
-                )
-
-            api_key = await _cfg("deepseek.api_key")
-            base_url = await _cfg("deepseek.api_base")
-            model = await _cfg("deepseek.model")
-            client = DeepSeekClient(api_key, base_url, model)
-            if not client.is_available:
-                logger.info("Calibration diagnosis skipped: DeepSeek API key not configured")
-                return None
-
-            # 2) 读最新日快照 + 近期趋势
-            latest_date = await self._db.fetchval(
-                "SELECT MAX(report_date) FROM hcm_ai.calibration_daily"
-            )
-            if latest_date is None:
-                return None
-            rows = await self._db.fetch(
-                "SELECT report_date, m5_regime, trades, wins, win_rate, "
-                "calib_factor, sample_days, cold_start FROM hcm_ai.calibration_daily "
-                "ORDER BY report_date, m5_regime"
-            )
-            per_regime: dict = {}
-            total_trades = 0
-            latest_rows = [r for r in rows if r["report_date"] == latest_date]
-            for r in latest_rows:
-                per_regime[r["m5_regime"]] = {
-                    "win_rate": float(r["win_rate"]),
-                    "calib_factor": float(r["calib_factor"]),
-                    "trades": int(r["trades"]),
-                    "cold_start": bool(r["cold_start"]),
-                }
-                total_trades += int(r["trades"])
-            total_days = max((int(r["sample_days"]) for r in latest_rows), default=0)
-
-            # 近期趋势（每体制 calib 序列）
-            trend: dict = defaultdict(list)
-            for r in rows:
-                if (latest_date - r["report_date"]).days <= trend_days:
-                    trend[r["m5_regime"]].append(
-                        (r["report_date"].isoformat(), round(float(r["calib_factor"]), 3))
-                    )
-
-            # 3) 组装「精确适配校准诊断」的提示词（结构沿用 AiScorer 的 system=分析师+仅回JSON）
-            per_lines = []
-            for reg, d in sorted(per_regime.items()):
-                cs = "（冷启动·样本不足）" if d["cold_start"] else ""
-                per_lines.append(
-                    f"- {reg}: 胜率={d['win_rate'] * 100:.1f}%，校准因子={d['calib_factor']:.2f}"
-                    f"，样本={d['trades']}笔 {cs}"
-                )
-            trend_lines = []
-            for reg, seq in sorted(trend.items()):
-                s = " → ".join(f"{d}:{c}" for d, c in seq)
-                trend_lines.append(f"- {reg}: {s}")
-            per_block = "\n".join(per_lines) if per_lines else "（无）"
-            trend_block = "\n".join(trend_lines) if trend_lines else "（无）"
-
-            system_prompt = (
-                "你是一名量化交易策略校准诊断分析师，服务于黄金(XAUUSD) M5 自动交易系统。"
-                "你依据各 M5 市况体制的胜率与校准因子历史，给出中文自然语言诊断与具体调参建议。"
-                "必须且只能输出一个 JSON 对象，不要包含 markdown 代码块或任何额外文字。"
-            )
-            user_prompt = (
-                "你是黄金(XAUUSD) M5 自动交易策略的「校准诊断分析师」。\n"
-                "策略按 M5 市况体制(M5_regime)分别统计胜率，并用校准因子 calib_factor 缩放各体制"
-                "信号评分(raw_score × calib)：calib>1 放大可信体制、calib<1 压缩不可信体制；"
-                "基准胜率 0.5 对应 calib=1.0，calib 区间固定[0.6, 1.4]。\n\n"
-                f"【最新校准快照】(report_date={latest_date}，累计 {total_days} 样本日 / {total_trades} 笔)\n"
-                f"{per_block}\n\n"
-                f"【近 {trend_days} 日各体制校准因子趋势】(用于判断改善/恶化)\n"
-                f"{trend_block}\n\n"
-                "【研判口径】\n"
-                "- 胜率<0.40 视为弱体制(长期亏损)，>0.55 视为强体制。\n"
-                "- 冷启动(cold_start)表示样本不足，calib 锁定 1.0，不可据此调参。\n"
-                # 【2026-08-28 co_source 清除】原引导引用 co.gate.strong/weak/shock.trend
-                # （双源自适应门槛键）已随双源引擎下线全部删除，继续引用会让 AI 产出
-                # 指向不存在键的无效建议。改为引用 HEXP 链路真实生效的门槛键。
-                "- 和乘幂(hexp)链路真实生效的门槛键：scoring.min_score_threshold（全局评分底，"
-                "0-1 尺度，越大越难下单）、co.gate.direction_min_score（方向裁定门槛）、"
-                "hexp.entry.theta.<状态>（入场闸门阈值，状态为 TREND_PULLBACK/TREND_ACCEL/"
-                "TREND_EXHAUST/RANGE/REVERSAL）、hexp.entry.min_rr（最小盈亏比）。\n"
-                "- 校准因子由系统每日自动写回 co.calib.<regime>（如 co.calib.trend / "
-                "co.calib.range），你无需也无法直接修改它们，仅在 narrative 中说明。\n\n"
-                "【请输出JSON】\n"
-                "{\n"
-                '  "narrative": "<2-4段中文自然语言诊断：概括各体制当前胜率与校准因子状态、'
-                '与近期趋势对比、指出最需关注的体制>",\n'
-                '  "recommendations": ["<针对弱体制的具体调参建议，仅可引用真实存在的键，'
-                '如 调高 hexp.entry.theta.RANGE 至 0.50 收紧震荡市入场；'
-                '禁止虚构 co.gate.TREND/RANGE/NEUTRAL / co.gate.strong|weak|shock.trend '
-                '等已下线的双源键>", "..."],\n'
-                '  "needs_human_review": <bool：是否存在胜率持续<0.35 或样本充足但校准因子触及 '
-                '边界 0.6/1.4 等需人工介入的情况>,\n'
-                '  "confidence": "<high|medium|low：基于样本日数量与数据一致性>"\n'
-                "}\n"
-            )
-
-            raw = await client.complete(system_prompt, user_prompt)
-            parsed = parse_json_block(raw)
-            if not parsed or "narrative" not in parsed:
-                # 模型未返回可用 JSON → 把原始文本当作诊断兜底
-                content = (raw or "").strip() or "（AI 返回内容无法解析）"
-                recs: list = []
-                needs = False
-                conf = "low"
-            else:
-                content = str(parsed.get("narrative", "")).strip()
-                recs = [str(x) for x in (parsed.get("recommendations") or [])]
-                needs = bool(parsed.get("needs_human_review", False))
-                conf = str(parsed.get("confidence", "low")).lower()
-                if conf not in ("high", "medium", "low"):
-                    conf = "low"
-
-            # 4) 落库（按 report_date upsert）
-            await self._db.execute(
-                "INSERT INTO hcm_ai.calibration_diagnosis "
-                "(report_date, content, recommendations, needs_review, confidence, model) "
-                "VALUES ($1,$2,$3,$4,$5,$6) "
-                "ON CONFLICT (report_date) DO UPDATE SET "
-                "content=EXCLUDED.content, recommendations=EXCLUDED.recommendations, "
-                "needs_review=EXCLUDED.needs_review, confidence=EXCLUDED.confidence, "
-                "model=EXCLUDED.model, created_at=now()",
-                latest_date, content, recs, needs, conf, client.model,
-            )
-            logger.info(
-                "Calibration AI diagnosis generated for %s (confidence=%s, review=%s)",
-                latest_date, conf, needs,
-            )
-            return {
-                "report_date": latest_date.isoformat() if hasattr(latest_date, "isoformat") else str(latest_date),
-                "content": content,
-                "recommendations": recs,
-                "needs_review": needs,
-                "confidence": conf,
-                "model": client.model,
-            }
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("generate_calibration_diagnosis failed: %s", exc)
-            return None
 
     # ── Consumer Group Setup ────────────────────
 

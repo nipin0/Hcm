@@ -246,9 +246,9 @@ def create_ai_report_router(db_pool: Any = None, auth_handler: Any = None) -> AP
             db_pool,
             "SELECT trade_date, lm_inferences, ds_calls, ds_success, ds_fail, ds_timeout, "
             "cache_hits, fuse_events, degrade_events, hp_candidates, ai_passed, ai_vetoed, "
-            "ai_upgraded, ai_downdgraded, ai_opened, total_orders, total_pnl, win_orders, "
+            "ai_upgraded, ai_downdgraded, total_orders, total_pnl, win_orders, "
             "loss_orders, ai_enhanced_orders, ai_enhanced_pnl, non_ai_pnl, ai_contrib_ratio, "
-            "fused_orders, lm_only_orders, ds_only_orders, updated_at "
+            "lm_only_orders, updated_at "
             "FROM hcm_ai.daily_kpi "
             "WHERE trade_date >= current_date - make_interval(days => $1) "
             "ORDER BY trade_date ASC",

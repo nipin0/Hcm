@@ -31,12 +31,8 @@ AI_KEYS: dict[str, Any] = {
     "ai.lm.model_path": "",
     "ai.lm.calib_path": "",
     "ai.lm.model_version": "v0",
-    "ai.lm.pass_threshold": 0.50,
     "ai.lm.down_threshold": 0.60,
     "ai.lm.up_threshold": 0.70,
-    "ai.lm.veto_quantile": 0.50,
-    "ai.lm.down_quantile": 0.70,
-    "ai.lm.up_quantile": 0.85,
     "ai.lm.min_samples_train": 500,
     "ai.lm.retrain_cron": "0 2 * * 1",
     "ai.lm.label_r_win": 1.0,
@@ -76,9 +72,11 @@ AI_KEYS: dict[str, Any] = {
     "ai.cpl.w_range": 0.5,
     "ai.cpl.k_trend_min": 1.2,
     "ai.cpl.k_range_max": 0.5,
-    "ai.cpl.tier_high": 85.0,
-    "ai.cpl.tier_mid": 70.0,
-    "ai.cpl.tier_low": 60.0,
+    # 【P2 对齐 2026-09-11】此前面板默认 85/70/60 与运行期（CFG_FALLBACK + PG 实值）
+    # 65/55/45 漂移 → "看到的≠生效的"。统一为 65/55/45（与 quality_gate.py:97-99 一致）。
+    "ai.cpl.tier_high": 65.0,
+    "ai.cpl.tier_mid": 55.0,
+    "ai.cpl.tier_low": 45.0,
     "ai.cpl.lot_high": 1.5,
     "ai.cpl.lot_low": 0.5,
 
