@@ -29,14 +29,28 @@ CLOSE_CONFIG_DEFAULTS: dict[str, Any] = {
     "break_even_protect": 0,
     "partial_close_enabled": False,
     "partial_close_ratio": 0.0,
-    "breakeven_atr_mult": 0.0,
+    # 【2026-09-21 对齐 bridge】原为 0.0，与桥侧回退值（mt5_bridge.py:932 = 1.0）不一致
+    #   ⇒ 配置缺失时面板会显示 0.0（会被读成"立即保本"），而桥实际按 1.0 运行。
+    #   统一到**桥侧**（运行真值）；改面板不动桥 ⇒ 零运行影响（当前 DB 有值，仅在键缺失时显现）。
+    "breakeven_atr_mult": 1.0,
     "breakeven_tp_ratio": 0.5,  # 保本门槛占 TP 距比例上限（bridge 实际读取）
     # ── 方案乙生效字段（bridge 实际读取，必须进白名单否则 GET 读不回）──
-    "trail_wide_atr_mult": 0.5,
+    # 【2026-09-21 对齐 bridge】原为 0.5 → 桥侧回退值 0.7（mt5_bridge.py:939）。
+    # ⚠ 本键与 `tp_trail_wide_atr_mult` 是**两个独立键**，勿混：
+    #     本键        = 移动止损线宽（挂 **SL**，桥 :5386/:5596）
+    #     tp_ 前缀那个 = TP 接力缓冲（挂 **TP**，桥 :5411/:5608）
+    #   作用对象不同 ⇒ 取值本就不必相同（europe 实际为 0.8 / 0.6）。
+    "trail_wide_atr_mult": 0.7,
     "breakeven_buffer_atr_mult": 0.15,
     # ── 移动止盈封顶比例：trail_start 被 TP 距 × 此比例封顶（下限 0.3 硬编码不可配）。
     # 调高=赢家跑更远才启动追踪；<1 保证固定 TP 先于追踪接管。必须进白名单否则 GET 读不回。──
-    "trail_start_tp_ratio": 0.8,
+    # 【2026-09-21 对齐 bridge】原为 0.8 → 桥侧回退值 0.5（mt5_bridge.py:950）。
+    # 【2026-09-21 补齐白名单】本键此前**只在本全局表**、**不在 SESSION_SUFFIXES** ⇒
+    #   `close.<session>.trail_start_tp_ratio` 在存储里存在（DB/Redis 三档均 0.8）、
+    #   桥侧也按会话读（mt5_bridge.py:5395），但 `_read_config` 不遍历它 ⇒ **GET 读不回**
+    #   ⇒ 前端只显示自身 defaultValue（恰为 0.8，与真值相同故被**巧合掩盖**）。
+    #   现已补入 SESSION_SUFFIXES + SESSION_DEFAULTS（见下）。
+    "trail_start_tp_ratio": 0.5,
     # tp_atr_multiplier 仍保留，用于显式关闭硬TP（=0）
     "tp_atr_multiplier": 0.0,
     # ── zone SL/TP 偏移（与 bridge place_mt5_order 同读；PG+Redis 同写）──
@@ -45,7 +59,8 @@ CLOSE_CONFIG_DEFAULTS: dict[str, Any] = {
     # ── 面板新增（精准入场 + 移动止盈 + 总仓位）──
     "max_sl_atr_mult": 1.8,
     "tp_min_atr_mult": 1.0,
-    "tp_max_atr_mult": 6.0,
+    # 【2026-09-21 对齐 bridge】原为 6.0 → 桥侧回退值 9.0（mt5_bridge.py:959）
+    "tp_max_atr_mult": 9.0,
     "trail_start_atr_mult": 2.0,
     "total_trail_enabled": False,
     "total_trail_start_amount": 30,
@@ -88,20 +103,28 @@ SESSION_SUFFIXES = [
     "trail_wide_atr_mult",         # 移动止盈线宽 ATR 倍数
     "tp_relay_enabled",            # 移动止盈接力 TP 追利开关
     "tp_trail_wide_atr_mult",      # 承接 TP 追利缓冲 ATR 倍数(TP 跟随现价前移距离)
+    # 【2026-09-21 补齐】桥侧按会话读它（mt5_bridge.py:5395），DB/Redis 也已有三档值(0.8)，
+    # 但此前不在本清单 ⇒ `_read_config` 不遍历它 ⇒ `close.<session>.trail_start_tp_ratio`
+    # **能写入但 GET 读不回** ⇒ 前端只显示自身 defaultValue（恰为 0.8，与存储真值相同，
+    # 故缺陷被**巧合掩盖**）。加入后 `_read_config` 会返回存储真值。
+    "trail_start_tp_ratio",        # 移动止盈启动门槛占 TP 距比例上限
 ]
 SESSION_DEFAULTS = {
     "asia":   {"trailing_stop_distance": 1.5, "tp_atr_multiplier": 1.8, "min_rr": 1.2,
                "breakeven_atr_mult": 0.5, "breakeven_buffer_atr_mult": 0.15,
                "breakeven_tp_ratio": 0.5, "trail_start_atr_mult": 2.5, "trail_wide_atr_mult": 0.7,
-               "tp_relay_enabled": True, "tp_trail_wide_atr_mult": 0.7},
+               "tp_relay_enabled": True, "tp_trail_wide_atr_mult": 0.7,
+               "trail_start_tp_ratio": 0.8},
     "europe": {"trailing_stop_distance": 2.0, "tp_atr_multiplier": 2.4, "min_rr": 1.2,
                "breakeven_atr_mult": 0.5, "breakeven_buffer_atr_mult": 0.15,
                "breakeven_tp_ratio": 0.5, "trail_start_atr_mult": 2.0, "trail_wide_atr_mult": 0.7,
-               "tp_relay_enabled": True, "tp_trail_wide_atr_mult": 0.7},
+               "tp_relay_enabled": True, "tp_trail_wide_atr_mult": 0.7,
+               "trail_start_tp_ratio": 0.8},
     "us":     {"trailing_stop_distance": 2.0, "tp_atr_multiplier": 2.6, "min_rr": 1.3,
                "breakeven_atr_mult": 0.4, "breakeven_buffer_atr_mult": 0.15,
                "breakeven_tp_ratio": 0.5, "trail_start_atr_mult": 1.5, "trail_wide_atr_mult": 0.7,
-               "tp_relay_enabled": True, "tp_trail_wide_atr_mult": 0.7},
+               "tp_relay_enabled": True, "tp_trail_wide_atr_mult": 0.7,
+               "trail_start_tp_ratio": 0.8},
 }
 
 _CLOSE_PREFIX = "close."

@@ -72,6 +72,12 @@ OSC_ROUND_SEQ_KEY_TMPL = "hcm:state:osc_round_seq:{symbol}"
 # 趋势态集合（与 FSM 的 S2/S3/S4 对应）：用于"趋势轮次"生命周期判定
 TREND_STATES = ("S2_TREND_INIT", "S3_TREND_MID", "S4_TREND_FADE")
 
+# 【C4 2026-09-17】震荡止损预算（规格 9.4「4ATR 防爆仓」）"平完即清零"的**作用域**。
+# 为什么含 S5：S5 的本意是"**预算已用尽**"的锁止，而非时间冷却；持仓全平后预算即应
+# 归零、手数梯度回第一档，否则 `osc_atr_loss`/`osc_loss_count` 只增不减、档位长期顶格。
+# 注意：**不含 S2/S3/S4**（趋势态不消费该预算；且趋势态下平仓不应干扰震荡预算语义）。
+OSC_BUDGET_STATES = ("S0_IDLE", "S1_OSC", "S5_OSC_LOCKED")
+
 # ══════════════════════════════════════════════════════════════════════════
 # 【2026-09-15 用户要求】把**触发下单信号的信息**写入 MT5 magic
 #
@@ -107,6 +113,7 @@ _MAGIC_MUL = 100               # 每段的位宽（十进制 2 位/段）
 MAGIC_REASON_CODES: dict = {
     "osc_at_box_lower": 1,
     "osc_at_box_upper": 2,
+    "osc_martingale_sl": 3,     # 【马丁补仓 2026-09-18】止损后同向补下一档
     "init_pullback": 11,
     "init_touch_wait": 12,              # L4 触价入场（S2）
     "mid_initial_entry": 21,
@@ -117,6 +124,10 @@ MAGIC_REASON_OTHER = 99
 
 _STATE_CODES: dict = {
     "S1_OSC": 1, "S2_TREND_INIT": 2, "S3_TREND_MID": 3, "S4_TREND_FADE": 4,
+    # 【2026-09-17 C】S0_IDLE 现在也允许出箱体单（开关 `state.osc_in_idle`）⇒ 给它一个
+    # 明确状态码，便于终端/归因辨识。0 仍表示"未知/其它"（既有语义不变）；本项为**追加**，
+    # 不影响任何历史 magic 的编码含义。
+    "S0_IDLE": 5,
 }
 
 
@@ -201,6 +212,14 @@ DEFAULTS: dict = {
     "state.box.window": 20,
     "state.trend.slope_window": 20,
     "state.trend.pullback_atr": 0.5,
+    # 【2026-09-22 新增】回踩**上界**（ATR 倍数）：距近期极值超过此值 = "深度回撤"
+    #   而非"顺势回踩" → 不算回踩入场（S2 首建 / S3 首建 / S3 加仓共用同一判据）。
+    # 依据（magic62 生产实证 n=44，实盘 orders⊕signals）：`_pullback_entry` 原为**单边**
+    #   判据（仅 ≥pullback_atr），无上界 ⇒ 允许在距近期极值 p90=2.68ATR 处开仓；
+    #   实测 `dist20≥1.5ATR` 的 10 单 avg −6.81 / 胜率 30%（vs 全体 −2.52 / 52.3%），
+    #   即"深度回撤"单贡献 62% 亏损；`dist20≤1.5` 的 34 单 avg −1.25 / 胜率 58.8%。
+    # 取值：**0 = 关闭本闸**（默认，零行为变更，一行回滚）；>0 = 上界（ATR 倍数）。
+    "state.trend.pullback_max_atr": 0.0,
     # 【2026-09-15 §18.7-2】回踩判定的回看根数，**与箱体窗口解耦**。
     # 0 = 跟随 `state.box.window`（保持既有行为，便于灰度对比）。
     # 解耦理由：两者语义无关 —— 箱体窗口是"震荡区间宽度"的参数，
@@ -222,6 +241,25 @@ DEFAULTS: dict = {
     # 取值 1.0 与 tol(0.25) 满足 1.0 > 2×0.25 → 结构性排除该情形。
     # ⚠ 该阈值**尚未经离线标定**（诚实标注：与"摆脱人工阈值"的目标部分相悖，待标定）。
     "state.osc_box_min_width_atr": 1.0,
+    # 【2026-09-23】箱体**宽度上限**（ATR 倍数）：宽于此 ⇒ 视为"假箱体"，不开仓。
+    # 为什么需要（**实测双证据**，非推测 —— 铁律 §15）：
+    #   · 离线矩阵（20,061 根；复用生产同一 `compute_entry_box` + 同一贴边判定，池 n=2289）：
+    #     箱宽 >4ATR 桶 **均值R −0.4755 / 胜率 35.2%**，而 1.0~1.5 桶 **+0.2432 / 90.6%**
+    #     ⇒ 单调递减；
+    #   · 生产实证（`market_state_log` × 实盘 orders，关联 16 单）：>4ATR 的 4 笔
+    #     **合计 −98.54 / 均值 −24.64 / 胜率 0%**（占关联单 25%，贡献约 98% 的合计亏损）。
+    #   机制：箱宽大 ⇒ ① 距中值远 ⇒ TP(`mid`) 难达；② 大箱体本身即"波动放大/趋势"的代理
+    #     ⇒ 逆势单易被突破（正是本文件 `:1499-1502` 记录的 −47 事故的成因）。
+    # 语义：**0.0 = 关闭本闸**（默认，零行为变更，一行回滚、秒级热生效）。
+    "state.osc_box_max_width_atr": 0.0,
+    # 【D2 2026-09-17 治本】震荡止损**预算上限**（ATR 倍数）。与 FSM 共用**同一配置键**
+    #   `state.osc_atr_loss_limit`（真值是 `hcm:state:osc_atr_loss:{symbol}`，由桥写入）。
+    # 为什么本层也要读它：4ATR 锁止原本**只在 FSM 处于 S1_OSC 时**判定
+    #   （state_machine.decide：`if cur == S1_OSC and osc_atr_loss >= limit → S5`），
+    #   而 2026-09-17 起 **S0_IDLE 也允许出箱体单** ⇒ 状态是 S0 时预算用尽**照样开新单**
+    #   ⇒ "4ATR 防爆仓"被绕过（实测当时 `osc_atr_loss=4.814 ≥ 4.0` 仍在开）。
+    #   故在下单路径本身补一道闸（见 decide 内 `osc_atr_locked_no_new_order`）。
+    "state.osc_atr_loss_limit": 4.0,
     # ── 【路线 B · 2026-09-16】箱体「波动扩张闸」阈值 ──────────────────────────
     # 语义：S1 箱体是**逆势**策略，前提是波动收敛；一旦波动开始扩张，边界被有效突破的
     #   概率上升 ⇒ 此时逆势开仓把亏损源放进组合。
@@ -234,6 +272,19 @@ DEFAULTS: dict = {
     #   漏检 91 / 误报 11.6% / 中位 **+0.5**，而"当期波动分位"平凡规则为
     #   漏检 547 / 中位 **+12.0（滞后 12 根）** ⇒ 把滞后确认变成同步预警。
     "state.vol.osc_skip_prob": -1.0,
+    # 【P2 2026-09-19】"仅当 vol 预测**高置信**（conformal 单例）时才拦箱体单"。
+    # 为什么需要：拦箱体是**放弃机会**，误拦的代价随"模型不确定"上升；单例判定给出
+    #   "这个预测本身可信"的分布无关保证 ⇒ 让闸门只在可信时生效（置信度真正接到闸门上）。
+    # 语义：`vol_route_singleton is True` 才允许拦截；`False` 与 **`None`（未知）都不拦**
+    #   （`None` = α≤0 或缺 conformal 产物 ⇒ 不裁决，保持既有行为）。
+    # ⚠ 启用本键**必须同时**把 `state.vol.alpha` 设为 >0（见 `state_infer.DEFAULTS`），
+    #   否则 singleton 恒为 None ⇒ 本闸恒不触发（**fail-safe，不会多拦**）。
+    # 阈值标定基准（`tools/eval_vol_route_gate.py`，OOF n=56995，**校准后**概率分桶）：
+    #   桶0 p≈0.175 → 未来振幅 2.231 ATR（箱体友好）… 桶4 p≈0.466 → 3.578 ATR（最不利）
+    #   ⇒ `osc_skip_prob = 0.30` ≈ 拦截 58.5% / 放行 41.5%（桶0+桶1）。
+    #   ⚠ 该校准值建立在**校准后**尺度上；meta 缺 `calibration` 时 `p_cal` 退回原始概率，
+    #     阈值不再对应上述分位 —— 启用前须确认日志 `calibration=有`。
+    "state.vol.osc_skip_require_singleton": False,
     # 【2026-09-15 L4 实测】追涨过滤：信号 bar 振幅 > 此 ×ATR 视为"追高/追低"，放弃首次入场。
     # 依据（tools/eval_entry_timing.py，同一信号集对比 8 种买点规则）：
     #   A 触发即入          R=−0.336
@@ -288,6 +339,40 @@ DEFAULTS: dict = {
     # 立刻离场。**这是现状完全没有的一条**（原先只有桥的会话 ATR 硬止损）。
     # 默认 0 = **关闭**（不改变既有行为）；规格值 2。
     "osc.break_confirm_bars": 0,
+    # ── 【2026-09-17 A/B/C】S0 箱体入场的三道收口（全部由实测事故驱动）──────────────
+    # 事故（07:15）：`state.osc_in_idle`（今早放宽 S0）⇒ S4 衰竭后当根即开箱体 SELL 0.03
+    #   ⇒ 5 分钟后转 S2 被判"轮次结束" ⇒ TP 锚点丢 + 破界离场永久不下发 ⇒ 孤儿单 -47。
+    # ① `state.osc_in_idle`：S0_IDLE 是否可作为箱体入场态（**显式登记默认值**，
+    #    原为代码内 `get_bool(..., True)` 隐含默认 ⇒ 运维在配置中心看不到它）。
+    "state.osc_in_idle": True,
+    # ② 【A】S0 且**上一状态 ∈ 趋势态**时禁出箱体单：S0 最常见的来源就是 S4_TREND_FADE，
+    #    刚离开趋势态就按箱体逆势入场 = 在趋势里反向开仓。true = 启用本护栏。
+    #    回滚：`set_cfg.py state.osc_idle_block_after_trend false`（秒级）。
+    "state.osc_idle_block_after_trend": True,
+    # ④ 【P1-6 F7 2026-09-18】S0 护栏**窗口长度**（根）：离开趋势态后，S0 连续 N 根禁出
+    #    箱体单。背景（审计 F7）：原护栏只看 `prev_state`（上一根起始态）⇒ 仅拦 S4→S0 那
+    #    1 根，次根 prev=S0 即放行；而模型出趋势本身要 k_exit=2 根 ⇒ 07:15 逆势箱体单(-47)
+    #    的时序模式未被根除。0 = 关闭本窗口（退回原 1 根语义）；默认 3（≈15min）。
+    #    回滚：`set_cfg.py state.osc_idle_block_bars 0`（秒级热生效，无需重启）。
+    "state.osc_idle_block_bars": 3,
+    # ③ 【C】"贴边"判据允许的**越界容忍**（ATR 倍数，双侧判据的上界）。
+    #    0.0 = 必须仍在箱内（**严格**，本次选定）；>0 = 允许越过边界一点仍算贴边。
+    #    ⚠ 原实现无上界（等价 +∞）⇒ 价格突破上沿 8.9 点仍判"贴上沿" ⇒ 突破途中抄顶，
+    #      是本次事故的直接成因之一。
+    "state.osc_edge_max_overshoot_atr": 0.0,
+    # ── 【马丁补仓 2026-09-18 · 用户决策】SL 后「及时」同向补下一档 ──────────────
+    # 需求（用户原话）："0.5 止损后及时下 1.0、不是等行情变化后再接着下阶梯手数"。
+    # 缺陷：SL 后箱体被解冻 + 滚动箱重建 ⇒ 重入场必须等价格回到【新箱体】边缘
+    #   （实测 2026-09-18：09:41 的 0.5 止损 → 10:45 才补 1.0，空 64 分钟）。
+    # 本键开启后：**首单路径完全不变**（仍由箱体边缘触发）；一旦本轮因【止损】结束
+    #   且已平仓 ⇒ 下一根 bar 直接用**本轮入场方向**市价补下一档（`ladder[连亏次数]`），
+    #   不再等箱体重建、不再等 FSM 状态。
+    # 安全边界（**不放宽任何既有刹车**）：① 必须已平仓；② `state.osc_atr_loss_limit`
+    #   （4ATR 预算）为硬刹车，用尽则不补；③ 档位仍由 `state.osc_lot_ladder` 封顶；
+    #   ④ 下游风控（`risk.max_lot_per_trade` / `risk.max_concurrent_signals` / 同向保本
+    #   闸门 / 置信度闸门）**照常生效**，本键不绕过任何风控。
+    # 回滚：`set_cfg.py state.osc_martingale_enabled false`（秒级热生效，无需重启/改码）。
+    "state.osc_martingale_enabled": True,
 }
 
 
@@ -337,6 +422,30 @@ class StrategyContext:
     osc_edge_streak: int = 0            # 贴边连续根数（入场防抖进度）
     osc_break_streak: int = 0           # 破界连续根数（突破止损进度）
     osc_break_side: str = ""            # 破界方向 "below"/"above"；**换向即重置计数**
+    # ── 【P1-7 2026-09-18】上面两个"连续根数"的**同 bar 去重**（bar 身份 = 被评估的
+    #    已收盘 bar，由调用方传入 `decide(bar_id=...)`）。
+    # 缺陷（2026-09-18 实测）：`_run_shadow_state` **同一根 bar 可能被调用两次**
+    #   （`scheduler.py:2079-2086` 原文自述：首行可能早于"策略层就绪"或早于
+    #   "live_override 重入"写入；FSM 用 `last_bar_time` 去重 ⇒ 状态不重复推进，但
+    #   `decide()` 不在那条去重路径里）。而这两个计数**原先按调用次数 +1、不看 bar 身份**
+    #   ⇒ 同一根 bar 评估两次就 **+2** ⇒ `osc.break_confirm_bars=2` 被**1 根**满足。
+    # 实证：2026-09-18 ticket 426224111 —— 塔日志报"连续 2 根破下沿 (close=4342.990)"，
+    #   而 4342.990 是 **14:25 那一根**（第 2 根应为 14:30 的 4346.970，当时尚未评估）
+    #   ⇒ 该笔实为**提前 1 根离场**（当次侥幸结论正确：14:30 确实也破了）。
+    # 语义：`bar_id` 非空时，同一 `bar_id` **只推进一次**（重复评估不重复计数，
+    #   但**下方触发判定仍执行** —— 已达标必须继续下发离场，不得因去重而卡住）。
+    # 空串 = 调用方未提供 ⇒ **回退旧行为**（每次调用都推进，向后兼容离线/影子调用）。
+    osc_edge_bar: str = ""              # 上一次推进贴边计数的 bar 身份
+    osc_break_bar: str = ""             # 上一次推进破界计数的 bar 身份
+    # 【P1-6 F7 2026-09-18】S0 护栏**剩余根数**（>0 = "离开趋势后的静默期"，禁 S0 箱体单）。
+    # 推进（每 bar 一次，见 decide 箱体入口块）：上一状态∈趋势态 → 重置为
+    # `state.osc_idle_block_bars`；否则递减。持久于 ctx（跨 bar / 跨重启存活）。
+    osc_idle_guard_left: int = 0
+    # ── 【马丁补仓 2026-09-18 · 用户决策】SL 后「及时」同向补下一档 ──────────────
+    # 本轮箱体单的**入场方向**（BUY/SELL）。用途：止损后按"同向"补下一档
+    # （用户选择"经典马丁"：0.5 做多止损 → 1.0 继续做多），方向必须锚定在
+    # **被止损的那一笔**上，而解冻后箱边可能已在另一侧 —— 故必须持久记住。
+    osc_last_dir: str = ""
     updated_at: str = ""
 
 
@@ -442,8 +551,19 @@ def fsm_signal_mode(intent: "StrategyIntent") -> str:
     必须分子模式（而非统一的 `state_fsm`）：桥侧平仓归因靠它区分"**震荡**止损"与
     "趋势止损" —— 规格 9.4 的 4ATR 锁止预算是震荡态专用的（见 `tools/position_sync.py`
     的子模式过滤）。子模式串里带 `osc` 才会被计入。
+
+    【2026-09-17 C 修复】原实现只认 `intent.state == "S1_OSC"`。而 S0_IDLE 现在也可出
+    箱体单（开关 `state.osc_in_idle`）⇒ 那些单会被**错标成 `state_trend`(62)**，连带
+    magic 逻辑码、桥侧平仓归因（震荡/趋势止损之分）、`scope=osc` 的破界平仓全部错位。
+    故改为**按意图语义判定**：箱体逆势单的 reason 恒以 `osc_` 开头
+    （`osc_at_box_lower` / `osc_at_box_upper`），而趋势侧 reason
+    （`init_*` / `mid_*` / `dir_none_veto` / `no_trend_dir` …）不含该前缀
+    ⇒ 用前缀判定比枚举状态名更稳（将来新增"可出箱体单"的状态无需再改此处）。
     """
-    return FSM_SIGNAL_MODE_OSC if intent.state == "S1_OSC" else FSM_SIGNAL_MODE_TREND
+    if str(intent.state or "") == "S1_OSC" \
+            or str(intent.reason or "").startswith("osc_"):
+        return FSM_SIGNAL_MODE_OSC
+    return FSM_SIGNAL_MODE_TREND
 
 
 def to_signal_fields(intent: "StrategyIntent", base_lot: float = 0.0) -> dict:
@@ -597,6 +717,7 @@ class StateStrategy:
         self._box_window = int(DEFAULTS["state.box.window"])
         self._slope_window = int(DEFAULTS["state.trend.slope_window"])
         self._pullback_atr = float(DEFAULTS["state.trend.pullback_atr"])
+        self._pullback_max_atr = float(DEFAULTS["state.trend.pullback_max_atr"])
         self._pullback_window = int(DEFAULTS["state.trend.pullback_window"])
         self._spike_atr_max = float(DEFAULTS["state.trend.spike_atr_max"])
         # L4 触价入场（§49）：默认 close_check = 既有行为，代码路径与改动前逐位一致
@@ -618,9 +739,31 @@ class StateStrategy:
         self._fade_trail_mult = float(DEFAULTS["state.trend.fade_trail_mult"])
         self._border_tol_atr = float(DEFAULTS["state.osc_border_tol_atr"])
         self._box_min_width_atr = float(DEFAULTS["state.osc_box_min_width_atr"])
+        # 【2026-09-23】箱宽上限（0.0 = 关闭；见 DEFAULTS 同名键注释）
+        self._box_max_width_atr = float(DEFAULTS["state.osc_box_max_width_atr"])
+        # 【D2 2026-09-17】震荡止损预算上限（键与 FSM 共用，见 DEFAULTS 注释）
+        self._osc_limit = float(DEFAULTS["state.osc_atr_loss_limit"])
         # 【路线 B】箱体波动扩张闸阈值；< 0 = 关闭（默认，零行为变更）
         self._vol_osc_skip_prob = float(DEFAULTS["state.vol.osc_skip_prob"])
+        # 【P2】仅当 vol 预测为 conformal 单例（高置信）时才拦（默认 False = 不附加该约束）
+        self._vol_skip_require_singleton = bool(
+            DEFAULTS["state.vol.osc_skip_require_singleton"])
         self._ladder = [float(x) for x in DEFAULTS["state.osc_lot_ladder"].split(",")]
+        # 【2026-09-17 A/C】S0 箱体入场收口（见 DEFAULTS 同名键注释）
+        self._osc_idle_block_after_trend = bool(
+            DEFAULTS["state.osc_idle_block_after_trend"])
+        # 【P1-6 F7】S0 护栏窗口长度（根；0 = 退回原"仅拦 1 根"语义）
+        self._osc_idle_block_bars = int(DEFAULTS["state.osc_idle_block_bars"])
+        self._edge_max_overshoot_atr = float(
+            DEFAULTS["state.osc_edge_max_overshoot_atr"])
+        # 【马丁补仓 2026-09-18】SL 后同向补下一档（见 DEFAULTS 同名键注释）
+        self._osc_ma_enabled = bool(DEFAULTS["state.osc_martingale_enabled"])
+        # 【可观测性 2026-09-18】`state.osc_in_idle` 提升为**实例属性**（原只在
+        # `decide()` 内即时读取 ⇒ 日志/签名/面板**全都看不见它**，"改了不等于看得见"）。
+        # ⚠ 初值取 **False**（保守）：热载成功前不放行 S0 箱体单 —— 与原先
+        #   "读配置失败 → 取 False（S0 不出单）"的取舍**逐位一致**。热载在
+        #   `load_config()` 完成（scheduler 每 30s 一次），故启动后最多 30s 生效。
+        self._osc_in_idle = False
         self._box_window_by_symbol: dict[str, int] = {}
         self._cache: dict[str, StrategyContext] = {}
 
@@ -637,6 +780,8 @@ class StateStrategy:
                 "state.trend.slope_window", self._slope_window))
             self._pullback_atr = await self._config.get_float(
                 "state.trend.pullback_atr", self._pullback_atr)
+            self._pullback_max_atr = await self._config.get_float(
+                "state.trend.pullback_max_atr", self._pullback_max_atr)
             self._pullback_window = int(await self._config.get_float(
                 "state.trend.pullback_window", self._pullback_window))
             self._spike_atr_max = await self._config.get_float(
@@ -691,16 +836,45 @@ class StateStrategy:
                 "state.osc_border_tol_atr", self._border_tol_atr)
             self._box_min_width_atr = await self._config.get_float(
                 "state.osc_box_min_width_atr", self._box_min_width_atr)
+            # 【2026-09-23】箱宽上限（0.0 = 关闭）。**必须计入下方 `_sig`** ——
+            # 否则"改了阈值而日志不变"，配置生效与否**看不见**（本仓库反复出现的盲区）。
+            _bmw = await self._config.get_float(
+                "state.osc_box_max_width_atr", self._box_max_width_atr)
+            if _bmw is not None:
+                self._box_max_width_atr = float(_bmw)
+            # 【D2 2026-09-17】震荡止损预算上限（与 FSM 共用同一键；.get_float 返回 None
+            #   时保留现值，避免配置缺失把闸门静默关掉）
+            _ol = await self._config.get_float("state.osc_atr_loss_limit", self._osc_limit)
+            if _ol is not None:
+                self._osc_limit = float(_ol)
             # 【路线 B】箱体波动扩张闸（< 0 = 关闭）。**必须计入下方 _sig**，
             # 否则"改了阈值而日志不变" —— 配置生效与否看不见（本仓库反复出现的盲区）。
             self._vol_osc_skip_prob = await self._config.get_float(
                 "state.vol.osc_skip_prob", self._vol_osc_skip_prob)
+            self._vol_skip_require_singleton = await self._config.get_bool(
+                "state.vol.osc_skip_require_singleton", self._vol_skip_require_singleton)
             _lad = (await self._config.get("state.osc_lot_ladder", "") or "").strip()
             if _lad:
                 try:
                     self._ladder = [float(x) for x in _lad.split(",") if x.strip()]
                 except ValueError:
                     logger.warning("state.osc_lot_ladder 非法（%s）→ 保留默认", _lad)
+            # 【2026-09-17 A/C】S0 箱体入场收口（两键见 DEFAULTS 注释）
+            self._osc_idle_block_after_trend = await self._config.get_bool(
+                "state.osc_idle_block_after_trend", self._osc_idle_block_after_trend)
+            # 【P1-6 F7】护栏窗口长度（下界 0 —— 0 = 原 1 根语义；不设上界，由运维决定）
+            self._osc_idle_block_bars = max(0, int(await self._config.get_float(
+                "state.osc_idle_block_bars", self._osc_idle_block_bars)))
+            # 【可观测性 2026-09-18】S0 是否可作箱体入场态 —— 原只在 `decide()` 内读取，
+            # 本行使其可热载 + 进签名 + 上日志 + 上 panel（`tuning`）。
+            # 读失败时由外层 except 兜住 ⇒ **保留现值**（初始 False = 不放行，保守）。
+            self._osc_in_idle = bool(await self._config.get_bool(
+                "state.osc_in_idle", self._osc_in_idle))
+            self._edge_max_overshoot_atr = await self._config.get_float(
+                "state.osc_edge_max_overshoot_atr", self._edge_max_overshoot_atr)
+            # 【马丁补仓 2026-09-18】SL 后同向补下一档（读失败由外层 except 兜住 ⇒ 保留现值）
+            self._osc_ma_enabled = bool(await self._config.get_bool(
+                "state.osc_martingale_enabled", self._osc_ma_enabled))
             for sym in (symbols or []):
                 try:
                     self._box_window_by_symbol[sym] = int(await self._config.get_float(
@@ -709,9 +883,11 @@ class StateStrategy:
                     pass
             # 仅当配置实际变化时打 INFO（30s 热重载一次 → 否则产生大量重复日志）
             _sig = (self._order_enabled, self._box_window, self._slope_window,
-                    round(self._pullback_atr, 6), self._pullback_window, self._max_adds,
+                    round(self._pullback_atr, 6), round(self._pullback_max_atr, 6),
+                    self._pullback_window, self._max_adds,
                     self._trail_lookback, round(self._fade_trail_mult, 6),
                     round(self._border_tol_atr, 6), round(self._box_min_width_atr, 6),
+                    round(self._box_max_width_atr, 6),
                     round(self._spike_atr_max, 6),
                     self._entry_mode, self._entry_wait_sec,
                     # 【§57】箱体模式/口径**也计入签名** —— 否则"改了模式而日志不变"，
@@ -721,23 +897,51 @@ class StateStrategy:
                     self._entry_confirm, self._tp_mode, round(self._tp_pct, 4),
                     self._break_confirm,
                     round(self._vol_osc_skip_prob, 6),
+                    self._vol_skip_require_singleton,
                     tuple(self._ladder),
+                    # 【2026-09-17 A/C】新增两键也计入签名（否则改了看不见）
+                    self._osc_idle_block_after_trend,
+                    # 【P1-6 F7 2026-09-18】护栏窗口长度也计入签名
+                    self._osc_idle_block_bars,
+                    # 【可观测性 2026-09-18】S0 箱体入场开关也计入签名
+                    self._osc_in_idle,
+                    # 【马丁补仓 2026-09-18】开关也计入签名（改了必须在日志里看见）
+                    self._osc_ma_enabled,
+                    round(self._edge_max_overshoot_atr, 6),
+                    # 【D2 2026-09-17】预算上限也计入签名（同纪律：改了必须在日志里看见）
+                    round(self._osc_limit, 6),
                     tuple(sorted(self._box_window_by_symbol.items())))
             if _sig != getattr(self, "_cfg_sig", None):
                 self._cfg_sig = _sig
                 logger.info(
                     "StateStrategy config loaded | order_enabled=%s box_window=%d "
-                    "slope_window=%d pullback_atr=%.2f max_adds=%d entry_mode=%s "
+                    "slope_window=%d pullback_atr=%.2f pullback_max_atr=%.2f "
+                    "max_adds=%d entry_mode=%s "
                     "entry_wait_sec=%d bands=%s(q=%s/%s) buffer=%s(%s) entry_confirm=%d "
-                    "tp=%s(%.2f) break_confirm=%d vol_osc_skip_prob=%.2f ladder=%s",
+                    "tp=%s(%.2f) break_confirm=%d vol_osc_skip_prob=%.2f "
+                    "vol_skip_singleton=%s ladder=%s "
+                    "idle_guard=%s idle_guard_bars=%d osc_in_idle=%s edge_overshoot_atr=%.2f "
+                    "osc_martingale=%s osc_atr_loss_limit=%.2f "
+                    # 【2026-09-23】箱宽上下限也上日志（改了必须看得见）
+                    "box_width=[%.2f,%.2f]",
                     self._order_enabled, self._box_window, self._slope_window,
-                    self._pullback_atr, self._max_adds, self._entry_mode,
+                    self._pullback_atr, round(self._pullback_max_atr, 6),
+                    self._max_adds, self._entry_mode,
                     self._entry_wait_sec,
                     self._bands_mode, self._q_high, self._q_low,
                     self._buffer_mode, self._buffer_pct, self._entry_confirm,
                     self._tp_mode, self._tp_pct, self._break_confirm,
                     self._vol_osc_skip_prob,
+                    self._vol_skip_require_singleton,
                     self._ladder,
+                    self._osc_idle_block_after_trend,
+                    self._osc_idle_block_bars,
+                    self._osc_in_idle,
+                    self._edge_max_overshoot_atr,
+                    self._osc_ma_enabled,
+                    self._osc_limit,
+                    self._box_min_width_atr,
+                    self._box_max_width_atr,
                 )
             else:
                 logger.debug("StateStrategy config unchanged")
@@ -823,19 +1027,68 @@ class StateStrategy:
         except Exception:  # noqa: BLE001
             return 0.0
 
-    def _spike_ok(self, high: Any, low: Any, atr: float) -> bool:
+    def _spike_ok(self, high: Any, low: Any, atr: float,
+                  base_high: Any = None, base_low: Any = None) -> bool:
         """追涨过滤（L4 实测最优项）：当前 bar 振幅 > spike_atr_max × ATR → 放弃入场。
 
         只作用于**首次入场**（S2 试错 / S3 无仓首建），**不加在加仓上** ——
         加仓路径未经该口径实测，不擅自推广（避免"改了没测的地方"）。
+
+        【B15-8 2026-09-17】"当前 bar" = **决策基准 bar**（`base_high/base_low`，由
+        scheduler 在**剥离基准 bar 之前**取出并传入）。为什么不能直接用 `high[-1]`：
+        2026-09-17 前视闭合修复后，`high/low` 是**已收盘**序列 ⇒ `high[-1]` 是 **T-1**
+        （非本根），与本文档声明的"当前 bar 振幅"不符。
+        `base_*` 为 None（调用方未提供）⇒ **回退旧口径**（行为与改动前逐位一致）。
         """
         if atr <= 0.0 or self._spike_atr_max <= 0.0:
             return True
         try:
-            rng = float(high[-1]) - float(low[-1])
+            if base_high is not None and base_low is not None:
+                rng = float(base_high) - float(base_low)      # 本根（决策基准 bar）
+            else:
+                rng = float(high[-1]) - float(low[-1])        # 回退：T-1（旧口径）
         except Exception:  # noqa: BLE001
             return True
         return rng <= self._spike_atr_max * atr
+
+    async def _clear_osc_budget_if_flat(
+        self, symbol: str, ctx: "StrategyContext", cur_atr_loss: float, positions_open: int
+    ) -> float:
+        """【规格 9.4「平完即清零」】该品种**已无持仓**且预算已用尽 ⇒ 清锁并归零计数。
+
+        【C4 2026-09-17 · 为什么抽成独立方法并前移】原实现内联在**贴边防抖 `return`
+        之后**，⇒ 未贴边的 bar（绝大多数）永远走不到 ⇒ `osc_atr_loss` /
+        `osc_loss_count` 只增不减、手数档位长期顶格。抽出后可在**入面判定之前**、
+        对 S0/S1/S5 统一调用（`OSC_BUDGET_STATES`）。
+
+        与桥的写入互补：桥只增（平仓时累加），本方法只在该品种**全平**后归零 ——
+        与 FSM 的清锁同一语义，且**幂等**（已清零 ⇒ 首行即返回）。
+
+        Returns:
+            清零后的 `cur_atr_loss`；未满足条件时**原样返回**。
+        """
+        if (self._osc_limit <= 0 or positions_open > 0
+                or cur_atr_loss < self._osc_limit):
+            return cur_atr_loss
+        logger.warning(
+            "[state_strategy] %s 震荡止损预算已用尽（%.3fATR ≥ 上限 %.2f，"
+            "连续止损 %d 次）且**已无持仓** → 按规格 9.4 清锁：两个计数器归零，"
+            "手数梯度回到第一档（%s）",
+            symbol, cur_atr_loss, self._osc_limit, ctx.consec_losses,
+            self._ladder[0] if self._ladder else 1.0)
+        try:
+            if self._redis is not None and getattr(
+                    self._redis, "is_initialized", False):
+                await self._redis.set(
+                    OSC_LOSS_KEY_TMPL.format(symbol=symbol), "0.000000")
+                await self._redis.set(
+                    OSC_LOSS_COUNT_KEY_TMPL.format(symbol=symbol), "0")
+        except Exception as _ce:  # noqa: BLE001
+            logger.warning("[state_strategy] %s 清锁写 Redis 失败（本轮仍按已清零"
+                           "处理，下轮会重试）：%s", symbol, _ce)
+        # 本进程内立即生效（否则本轮仍按旧计数取档）
+        ctx.consec_losses = 0
+        return 0.0
 
     def _pullback_entry(
         self, tdir: str, c: float, high: Any, low: Any, w: int, atr: float
@@ -851,9 +1104,14 @@ class StateStrategy:
         """
         seg_h = float(max(high[-w:])) if len(high) >= w else c
         seg_l = float(min(low[-w:])) if len(low) >= w else c
-        if tdir == "UP" and (seg_h - c) >= self._pullback_atr * atr:
+        _lo = self._pullback_atr * atr
+        # 【2026-09-22 新增】上界：0 = 关闭（既有行为）；>0 时"越过上界"= 深度回撤，
+        #   不算顺势回踩（调用方会走触价单路径；价位在另一侧时自然放弃，见
+        #   `_pullback_level` 的 `0 < lv < ref` 约束）。
+        _hi = (self._pullback_max_atr * atr) if self._pullback_max_atr > 0 else float("inf")
+        if tdir == "UP" and _lo <= (seg_h - c) <= _hi:
             return True, "BUY"
-        if tdir == "DOWN" and (c - seg_l) >= self._pullback_atr * atr:
+        if tdir == "DOWN" and _lo <= (c - seg_l) <= _hi:
             return True, "SELL"
         return False, ""
 
@@ -926,12 +1184,39 @@ class StateStrategy:
         slope: float,
         positions_open: int = 0,
         hold_only: bool = False,
+        # 【2026-09-19 阶段1】弃权闸（**按 bar 的一次性信号**，默认 False）：
+        #   True = 本根**禁止新开与加仓**，持仓保留；**离场/尾随/破箱止损完全不受影响**。
+        # 为什么不能复用 `hold_only`：它是**持久标志**，且"无持仓即自动解除"
+        #   （`state_machine` 第 7b 步），**无法表达"空仓也禁新开这一根"**。
+        # 闸点 = 本函数内**全部 4 处会产生 `action ∈ {open, add}` 的入口**（见各处注释）；
+        #   刻意**不用"提前 return"**：那会跳过破箱离场指令与 S4 的尾随收紧（放宽既有刹车）。
+        # 生效开关在 `state_infer`（`state.abstain.*`，默认关闭）。
+        abstain: bool = False,
         direction: str = "",
         age_bars: int = 0,
         shape: str = "",
         position_dir: str = "",
         fsm_adds_used: int = -1,
         vol_expand_proba: float = -1.0,
+        # 【P2 2026-09-19】vol 预测是否为 **conformal 单例**（高置信）。
+        #   True = 可信；False = 不可信；**None = 未知**（α≤0 / 缺 conformal 产物）。
+        # 语义：只有 `True` 才允许"高波动 ⇒ 拦箱体单"生效（见 `osc_skip_require_singleton`）；
+        #   **None 一律不拦**（不裁决 ⇒ 保持既有行为，绝不因调用方漏传而加码限制）。
+        # 刻意不加类型标注：本文件不保证已导入 `Optional`，标注会在定义期求值。
+        vol_route_singleton=None,
+        # 【2026-09-17 A】上一根 bar 的 FSM 状态：供"刚离开趋势态 ⇒ S0 不出箱体单"的护栏
+        # （唯一消费者 = `state.osc_idle_block_after_trend`；缺省 "" ⇒ 视为未知、**不放行**
+        #  S0 箱体单，即"绝不因调用方漏传而静默放宽闸门"）。
+        prev_state: str = "",
+        # 【B15-8 2026-09-17】决策基准 bar（**本根**）的 high/low：`high/low` 入参是
+        #   **已收盘**序列（`high[-1]` = T-1），而 `_spike_ok` 要判的是"本根是否插针"，
+        #   故由调用方单独传入。**None = 未提供 ⇒ 回退旧口径**（向后兼容、行为不变）。
+        base_high: Any = None,
+        base_low: Any = None,
+        # 【P1-7 2026-09-18】被评估的**已收盘 bar 身份**（`osc_edge_streak` /
+        #   `osc_break_streak` 的**同 bar 去重**键，详见 `StrategyContext.osc_edge_bar`）。
+        #   **"" = 未提供 ⇒ 回退旧行为**（每次调用都推进计数，向后兼容）。
+        bar_id: str = "",
     ) -> StrategyIntent:
         """产出交易意图（**不下单**；是否下单由调用方按 order_enabled 决定）。
 
@@ -943,6 +1228,9 @@ class StateStrategy:
                 方向以 `direction` 为准（见 `resolve_trend_dir`）。
             positions_open: 该品种真实持仓数（**影子期为 0/近似值**，见模块注释）。
             hold_only: FSM 的 hold_only 标志（停止新开/加仓但持仓保留）。
+            abstain: 【阶段1】本根弃权（True = 禁止新开/加仓，持仓保留）。
+                与 `hold_only` 正交、**不持久**；来源 = `state_infer` 的校准/conformal 弃权闸
+                （默认关闭；依据与验收门见 `state_infer.DEFAULTS` 的 `state.abstain.*`）。
             direction: 方向模块结果 up/down/none（`trend_direction`，**单一真值**）。
                 **"none" → 禁止趋势开仓**（用户规格：规避方向模糊的假趋势）。
             age_bars: 状态年龄（FSM 自计，§25）——承载"初生/中段"。
@@ -996,13 +1284,34 @@ class StateStrategy:
             it.reason = "no_box_or_atr"
             return it
 
+        # ── 【2026-09-17 B】箱体入场态集合（**唯一真源**：入场面与轮次生命周期共用）──
+        # `state.osc_in_idle`（默认 True）把 S0_IDLE 也放开为箱体入场态。该标志**必须被
+        # 两处共用** —— 否则就是"半截修复"：入场面放开了、生命周期还只认 S1 ⇒ 实测 07:15
+        # 在 S0 开单、07:20 转 S2 时立刻被判"结束震荡轮次、解冻箱体" ✗。
+        # （原先该读取在下方 S1 分支内，生命周期看不到 ⇒ 本次上提到这里。）
+        # 【可观测性 2026-09-18】改取 `load_config()` 热载的**实例属性**（原为每 bar
+        # 即时读取）：同一份真值现在同时进配置签名 / 启动日志 / panel `tuning`，
+        # 解决"改了它也完全看不见"（本仓库反复踩的盲区）。
+        # **保守语义逐位保留**：属性初值 False ⇒ 热载成功前 S0 不放行箱体单，
+        # 与原"读配置失败 → 取 False（S0 不出单）"的取舍一致。
+        _osc_in_idle = self._osc_in_idle
+        _BOX_ENTRY_STATES = (("S1_OSC", "S0_IDLE") if _osc_in_idle else ("S1_OSC",))
+
         # ── 冻结箱体生命周期（规格 §7.1：止盈 / 止损 / **状态切换** 任一即结束本轮）──
         # 此前只有"止盈"路径会解冻（且该路径无调用者）→ 一旦冻结就永久沿用旧箱体：
         # 后续每轮都用已经失效的 mid 作 TP 锚点（偏离真实箱体中值，止盈位错）。
         # 状态切换在此判定：本模块每根 bar 都拿到当前 fsm_state，无需额外事件源。
-        if ctx.box_frozen and fsm_state != "S1_OSC":
-            logger.info("[state_strategy] %s 离开 S1（→ %s）→ 结束震荡轮次、解冻箱体",
-                        symbol, fsm_state)
+        # 【2026-09-17 B 修复·孤儿单】★ 追加 `positions_open <= 0`：原实现只要"离开 S1"
+        #   就解冻并置 `osc_round_active=False`，而该标志是**破界离场**的判据之一
+        #   （`break_streak >= N **and** osc_round_active`）⇒ 持仓期间被清 ⇒
+        #   ① 冻结中值（TP 锚点）丢失；② **离场指令永久不再下发**（实测 07:15 开的 0.03 空单，
+        #   07:20 被"解冻"后价格突破上沿 4 根（阈值 2）却一次离场都没发，浮亏 -47 且持续扩大）
+        #   ⇒ 持仓被"孤儿化"，只剩会话 SL 兜底。
+        #   修法与**趋势侧先例**（上方"趋势轮次生命周期"）完全一致：**持仓仍在时不清**。
+        if (ctx.box_frozen and fsm_state not in _BOX_ENTRY_STATES
+                and positions_open <= 0):
+            logger.info("[state_strategy] %s 离开箱体入场态（→ %s，无持仓）"
+                        "→ 结束震荡轮次、解冻箱体", symbol, fsm_state)
             ctx.box_frozen, ctx.box_frozen_at, ctx.osc_round_active = False, "", False
             await self._save_ctx(ctx)
 
@@ -1043,9 +1352,16 @@ class StateStrategy:
         # ⇒ 行为与修复前**逐位一致**（无回归）；升级后补齐 `be` 一类漏判。
         _seq_changed = (_cur_round_seq >= 0 and ctx.frozen_round_seq >= 0
                         and _cur_round_seq != ctx.frozen_round_seq)
-        if ctx.box_frozen and (ctx.consec_losses != ctx.frozen_loss_count
-                               or _cur_atr_loss != ctx.frozen_atr_loss
-                               or _seq_changed):
+        # 【2026-09-17 B9 修复·孤儿单】★ 追加 `positions_open <= 0`（与上方路径 A 对齐）：
+        #   本判据只认"计数器变化"，**不校验持仓** ⇒ 多仓下平掉任意一仓即写计数器
+        #   （`consec_losses`/`osc_atr_loss`/`_cur_round_seq`），于是 `osc_round_active`
+        #   被清 ⇒ 破界离场判据（`break_streak >= N **and** osc_round_active`）永不成立，
+        #   剩余持仓被"孤儿化"，只剩会话 SL 兜底。
+        #   修法：持仓仍在时**不解冻**；待最后一仓平完（positions_open==0）再正常解冻。
+        if (ctx.box_frozen and positions_open <= 0
+                and (ctx.consec_losses != ctx.frozen_loss_count
+                     or _cur_atr_loss != ctx.frozen_atr_loss
+                     or _seq_changed)):
             logger.info("[state_strategy] %s 震荡本轮结束（计数 %s→%s / %.3f→%.3f / "
                         "轮次标记 %s→%s，止盈或止损）→ 解冻箱体，下一轮重算",
                         symbol, ctx.frozen_loss_count, ctx.consec_losses,
@@ -1062,6 +1378,64 @@ class StateStrategy:
             #   **当前滚动箱**写回 ctx（见上方"冻结箱体"分支的 else），故面板不会断档。
             #   v1 的清零会让箱体三线在面板上消失（用户当即发现），已撤回。
             await self._save_ctx(ctx)
+
+        # ══════════════════════════════════════════════════════════════════════
+        # ── 【马丁补仓 2026-09-18 · 用户决策】SL 后「及时」同向补下一档 ──────────
+        # 需求（用户原话）："0.5 止损后及时下 1.0、不是等行情变化后再接着下阶梯手数"。
+        # 缺陷（2026-09-18 复盘）：SL 后箱体被**解冻 + 滚动箱重建** ⇒ 重入场必须等价格
+        #   回到【新箱体】边缘（`osc_outside_box` / `osc_inside_box`），中间可空很久
+        #   （实测 09:41 的 0.5 止损 → 10:45 才补 1.0，空 64 分钟）＝用户说的"等行情变化"。
+        # 本块把"阶梯递进"与"箱体重建/FSM 状态"**解耦**：一旦本轮因**止损**结束且已平仓，
+        #   下一根 bar 直接用**本轮入场方向**市价补下一档（`ladder[连续止损次数]`）。
+        #   · 方向 = `ctx.osc_last_dir`（本轮入场方向）。用户选择「经典马丁·同向补」：
+        #     0.5 做多止损 → 1.0 继续做多（平均价下移），方向锚定在被止损的那一笔。
+        #   · 判据 = `ctx.consec_losses > ctx.frozen_loss_count`（本轮冻结快照）：
+        #     止盈会把 count 归零、be/expert count 不变 ⇒ 均不触发；
+        #     **只有真止损才 +1** ⇒ 精确锚定"止损之后"。
+        #   · 位置纪律：放在**两处解冻判定之后**（`box_frozen` 已清）+ 所有
+        #     箱体分支 `return` 之前 ⇒ 无论 FSM 处于 S0/S1 还是已切趋势态，都能补。
+        # ⚠ 安全边界（**不放宽任何既有刹车**）：
+        #   ① 必须 `positions_open<=0`（已平仓）才能补；
+        #   ② `state.osc_atr_loss_limit`（4ATR 预算）为**硬刹车**：预算已用尽 ⇒ 不补；
+        #   ③ 档位仍由 `state.osc_lot_ladder` 封顶（`min(count, len-1)`）；
+        #   ④ 下游风控 **全部照常生效**（`risk.max_lot_per_trade` / `max_concurrent_signals`
+        #      / 同向保本闸门 / 置信度闸门）—— 本块只产生"意图"，不放行任何风控。
+        # 幂等：补仓即冻结**新一轮**并把 `frozen_loss_count` 快照更新为当前 count
+        #   ⇒ 同一笔止损**只补一次**（下一笔止损才会再次触发）。
+        # 回滚：`set_cfg.py state.osc_martingale_enabled false`（秒级热生效，无需重启）。
+        # ══════════════════════════════════════════════════════════════════════
+        if (self._osc_ma_enabled and positions_open <= 0
+                # 【2026-09-19 阶段1】弃权闸点 ①（马丁补仓是本函数内**最早的**入场点）
+                and not abstain
+                and ctx.consec_losses > ctx.frozen_loss_count
+                and ctx.osc_last_dir in ("BUY", "SELL")
+                and _cur_atr_loss < self._osc_limit):
+            _ma_dir = ctx.osc_last_dir
+            _ma_idx = min(max(ctx.consec_losses, 0), len(self._ladder) - 1)
+            it.action, it.direction = "open", _ma_dir
+            it.reason = "osc_martingale_sl"
+            it.lot_multiplier = self._ladder[_ma_idx] if self._ladder else 1.0
+            it.tp_anchor = it.box_mid if it.box_mid > 0 else None
+            # 冻结当前滚动箱（与常规开仓**同构**）：保留 TP 锚点 + 破界离场护栏 + 轮次快照
+            ctx.box_upper, ctx.box_lower, ctx.box_mid = up, lo, mid
+            ctx.box_frozen = True
+            ctx.box_frozen_at = datetime.now(timezone.utc).isoformat()
+            ctx.osc_round_active = True
+            it.box_upper, it.box_lower, it.box_mid = up, lo, mid
+            it.box_frozen = True
+            ctx.frozen_loss_count, ctx.frozen_atr_loss = ctx.consec_losses, _cur_atr_loss
+            ctx.frozen_round_seq = _cur_round_seq
+            ctx.osc_edge_streak = 0
+            ctx.osc_break_streak = 0
+            ctx.osc_last_dir = _ma_dir
+            await self._save_ctx(ctx)
+            logger.warning(
+                "[state_strategy] %s 震荡马丁补仓：上轮 %s 止损（连亏 %d 次）→ 同向 %s 补第 %d 档"
+                "×%.2f（不等箱体重建/不等状态；预算 %.3f/%.2f；tp_anchor=%s）",
+                symbol, _ma_dir, ctx.consec_losses, _ma_dir, _ma_idx,
+                it.lot_multiplier, _cur_atr_loss, self._osc_limit,
+                f"{it.tp_anchor:.3f}" if it.tp_anchor else "-")
+            return it
 
         # ── 趋势轮次生命周期（与 S1 冻结箱体同构）──
         # 【必须放在所有状态分支**之前**】2026-09-15 回放（replay_state_chain.py）抓到：
@@ -1080,6 +1454,19 @@ class StateStrategy:
             ctx.touch_pending_at, ctx.touch_pending_dir = "", ""
             await self._save_ctx(ctx)
 
+        # ── 【C4 2026-09-17】震荡止损预算"平完即清零"**前移**（规格 9.4）────────
+        # 原实现位于**贴边防抖 `return` 之后**（见下方贴边块内）⇒ 未贴边时
+        # （`osc_edge_wait` / `osc_inside_box` / `osc_outside_box`，即绝大多数 bar）
+        # **永远走不到** ⇒ `osc_atr_loss` / `osc_loss_count` 只增不减、手数档位长期
+        # 顶格（用户实测"新轮首单直接 0.03"的另一半原因）。
+        # 位置纪律：必须在**任何入面 return 之前**；作用域：S0/S1/S5 且**无持仓**时清零。
+        # 有持仓的"封堵"（不出新箱体单）**仍保留在贴边处** —— 它依赖贴边上下文，不可前移。
+        # 幂等：已清零则 `_cur_atr_loss < _osc_limit` ⇒ 直接返回，无副作用、每 bar 可调。
+        # 回滚：`state.osc_atr_loss_limit` 调大（或 ≤0 = 关闭本闸）——秒级，无需改码/重启。
+        if fsm_state in OSC_BUDGET_STATES and positions_open <= 0:
+            _cur_atr_loss = await self._clear_osc_budget_if_flat(
+                symbol, ctx, _cur_atr_loss, positions_open)
+
         # ══════════════════════════════════════════════════════════════════════
         # 【§57-12.3-2】箱体突破**逻辑止损**（规格："震荡一旦被突破…箱体逆势单不能扛单"）
         # ⚠ **位置纪律**：必须在 S1 分支的**任何 return 之前** —— 否则 `osc_inside_box`
@@ -1092,20 +1479,26 @@ class StateStrategy:
         if _bh > 0.0 and self._break_confirm > 0:
             _side = ("below" if c < it.box_lower
                      else "above" if c > it.box_upper else "")
-            _brk_before = (ctx.osc_break_side, ctx.osc_break_streak)
-            if _side and _side == ctx.osc_break_side:
-                ctx.osc_break_streak += 1
-            elif _side:
-                # **换向即重置**：否则"先破下沿 1 根、再破上沿 1 根"会被误累加成连续 2 根
-                ctx.osc_break_side, ctx.osc_break_streak = _side, 1
-            else:
-                ctx.osc_break_side, ctx.osc_break_streak = "", 0
+            # ── 【P1-7 2026-09-18】**同 bar 去重**（详见 `StrategyContext.osc_break_bar`）──
+            # 同一根 bar 被重复评估（`_run_shadow_state` 已知会跑两次）时**不重复推进**；
+            # 但下方"是否已达确认根数"的触发判定**在守卫之外**照常执行 —— 已达标必须继续
+            # 下发离场指令，不得因去重而卡住（那会让该保护静默失效）。
+            if not (bar_id and bar_id == ctx.osc_break_bar):
+                _brk_before = (ctx.osc_break_side, ctx.osc_break_streak)
+                if _side and _side == ctx.osc_break_side:
+                    ctx.osc_break_streak += 1
+                elif _side:
+                    # **换向即重置**：否则"先破下沿 1 根、再破上沿 1 根"会被误累加成连续 2 根
+                    ctx.osc_break_side, ctx.osc_break_streak = _side, 1
+                else:
+                    ctx.osc_break_side, ctx.osc_break_streak = "", 0
+                ctx.osc_break_bar = bar_id
+                # 【落盘】非 S1 时**下面的 S1 分支不会执行** → 若只在那里落盘，破界进度
+                # 会在"离开 S1 但箱体轮次仍活跃（冻结）"期间丢失（重启即从 0 重算，
+                # 使"差一根就止损"的判定被推迟）。仅在**计数确实变化**时写，避免每 bar 写 Redis。
+                if (ctx.osc_break_side, ctx.osc_break_streak) != _brk_before:
+                    await self._save_ctx(ctx)
             it.break_streak = ctx.osc_break_streak
-            # 【落盘】非 S1 时**下面的 S1 分支不会执行** → 若只在那里落盘，破界进度
-            # 会在"离开 S1 但箱体轮次仍活跃（冻结）"期间丢失（重启即从 0 重算，
-            # 使"差一根就止损"的判定被推迟）。仅在**计数确实变化**时写，避免每 bar 写 Redis。
-            if (ctx.osc_break_side, ctx.osc_break_streak) != _brk_before:
-                await self._save_ctx(ctx)
             if (ctx.osc_break_streak >= self._break_confirm
                     and ctx.osc_round_active):
                 it.exit_now, it.exit_scope = True, "osc"
@@ -1118,12 +1511,52 @@ class StateStrategy:
                     "下" if _side == "below" else "上", c, it.box_lower, it.box_upper)
 
         # ── S1 震荡：箱体边界逆势（规格 12.2 高抛低吸）──
-        if fsm_state == "S1_OSC" and not hold_only:
+        # 【2026-09-17 C】S0_IDLE 也允许出箱体单（开关 `state.osc_in_idle`，默认 True）。
+        # 动机（实测 2026-09-17）：HEXP 家族停用后仅剩 FSM 供单，而模型在"衰竭段"连续判
+        # `trend_fade`（margin 0.25~0.70）⇒ FSM 在 S4（设计禁新单）↔ S0（原本也禁新单）
+        # 之间空转，02:00~02:55 连续 11 根零开仓意图 ⇒ 全系统无单。
+        # S0 是"未分类/复位"态，其箱体判定与 S1 **同源**（同一个 `compute_entry_box` +
+        # 同一个 ctx 轮次机 + 同一份破界止损），放开后仍受**全部既有护栏**：
+        # 箱宽下限、贴边防抖（`osc.entry_confirm_bars`）、同向仅 1 单、破界止损、
+        # 梯度手数、以及下游全部风控闸门。
+        # 回滚：`set_cfg.py state.osc_in_idle false`（秒级，无需重启/改码）。
+        # 【2026-09-17 A 新增·趋势污染护栏】S0 是"未分类/复位"态，其**最常见来源正是
+        #   S4_TREND_FADE 之后**（实测 07:10 S4 → 07:15 S0 → 07:20 S2）。刚离开趋势态就在
+        #   S0 按箱体逆势入场 = **在趋势里反向开仓**（07:15 那笔：S0 开 SELL 0.03 @4324.17，
+        #   随后连涨，浮亏 -47）。故：**S0 且上一状态 ∈ 趋势态**时不出箱体单。
+        #   开关 `state.osc_idle_block_after_trend`（默认 true；回滚 = 设 false）。
+        #   S1 不受影响 —— S1 本身就是"震荡判定"的结论，不存在该污染。
+        # 【2026-09-19 阶段1】弃权闸点 ②（S0/S1 箱体单）
+        if (fsm_state in _BOX_ENTRY_STATES and not hold_only and not abstain):
+            # 【P1-6 F7 2026-09-18】S0 护栏**窗口化**：原只看 `prev_state` ⇒ 仅拦 S4→S0 当根
+            #   1 根，次根 prev=S0 即放行（审计 F7）。现改为"离开趋势态后连续 N 根"：
+            #   推进（每 bar 一次）：prev∈趋势态 → 重置为 N 并拦；否则递减，>0 则拦。
+            #   N=`state.osc_idle_block_bars`（默认 3；0 = 退回原"仅拦 1 根"语义）。
+            #   S1_OSC 不受影响（它本身即"震荡判定"的结论，无趋势污染）。
+            if self._osc_idle_block_after_trend and fsm_state != "S1_OSC":
+                _guard_before = ctx.osc_idle_guard_left
+                _transition = str(prev_state or "") in TREND_STATES
+                if _transition:
+                    ctx.osc_idle_guard_left = self._osc_idle_block_bars
+                elif ctx.osc_idle_guard_left > 0:
+                    ctx.osc_idle_guard_left -= 1
+                if ctx.osc_idle_guard_left != _guard_before:
+                    await self._save_ctx(ctx)   # 窗口进度必须跨 bar 持久（否则永不递减）
+                if _transition or ctx.osc_idle_guard_left > 0:
+                    it.reason = "osc_idle_after_trend"
+                    return it
             # 箱体退化保护（理由见 DEFAULTS）：width < 2×tol 时 `c<=lo+tol` 与
             # `c>=up-tol` **同时成立** → 方向由 if/elif 顺序决定（等价随机），必须拦。
             if _bh < self._box_min_width_atr * atr:
                 it.reason = "osc_box_too_narrow"
                 await self._save_ctx(ctx)     # 破界计数也要落盘（否则跨 bar 丢进度）
+                return it
+            # 【2026-09-23】箱体**宽度上限**（`0.0` = 关闭，默认零行为变更；依据见 DEFAULTS）：
+            # 宽箱 = "假箱体"（波动放大/趋势的代理）⇒ 逆势单易被突破。
+            # 与上面"下限"对称：**下限防"方向二义性"，上限防"在趋势里逆势开仓"**。
+            if self._box_max_width_atr > 0.0 and _bh > self._box_max_width_atr * atr:
+                it.reason = "osc_box_too_wide"
+                await self._save_ctx(ctx)
                 return it
             # ── 入场触发区（规格 12.2「价格缓冲 buffer」；两种口径）──
             #   atr（**默认 = 既有行为**）：`close <= lo + tol_atr`（ATR 归一 → 跨品种可移植）
@@ -1135,19 +1568,65 @@ class StateStrategy:
                 _up_t = it.box_upper * (1.0 - self._buffer_pct)
             else:
                 _lo_t, _up_t = it.box_lower + tol, it.box_upper - tol
-            _at_lower, _at_upper = (c <= _lo_t), (c >= _up_t)
+            # 【2026-09-17 C 修复·贴边判据由"单边"改"双侧"】原为单边（`c <= lo+tol` /
+            #   `c >= up-tol`）⇒ 价格**已突破**边界（远在箱外）仍判"贴上沿" ⇒ 在突破途中
+            #   逆势抄顶/抄底（实测事故：box=[4292.22, 4315.26]，成交 4324.17 = 上沿之上 8.9 点）。
+            # 现为双侧：越界容忍 = `state.osc_edge_max_overshoot_atr × ATR`（默认 **0.0**
+            #   = 必须仍在箱内）⇒ "贴边" = 靠近边界**且尚未越界**。
+            _ovs = self._edge_max_overshoot_atr * atr
+            _at_lower = (_lo_t >= c >= it.box_lower - _ovs)
+            _at_upper = (_up_t <= c <= it.box_upper + _ovs)
             # ── 入场防抖（规格 12.2「满足防抖 K 线校验」）──
             # 连续 N 根满足**同侧**边界条件才允许开仓。为什么需要：单根插针即触发是
             # "抄底摸顶被反向收割"的直接来源，连续确认能把一次性插针滤掉。
             # 默认 1 = 与既有行为逐位一致（单根即触发）。
-            ctx.osc_edge_streak = (ctx.osc_edge_streak + 1) if (_at_lower or _at_upper) else 0
+            # 【P1-7 2026-09-18】**同 bar 去重**（同 `osc_break_streak`，见 ctx.osc_edge_bar）：
+            #   同一根 bar 被重复评估时**不重复推进**防抖进度（否则 `entry_confirm=N` 会被
+            #   N/2 根满足）。`osc.entry_confirm_bars` 默认 1 ⇒ 现值下无行为差异，
+            #   但一旦调大（或与破界共用同一根 bar 的重复调用）即必须正确。
+            if not (bar_id and bar_id == ctx.osc_edge_bar):
+                ctx.osc_edge_streak = (ctx.osc_edge_streak + 1) if (_at_lower or _at_upper) else 0
+                ctx.osc_edge_bar = bar_id
             it.edge_streak = ctx.osc_edge_streak
             if ctx.osc_edge_streak < self._entry_confirm:
                 # `osc_edge_wait` = 贴边但防抖未满；`osc_inside_box` = 仍在箱内（规格 9.2）
+                # 【2026-09-17 C】新增 `osc_outside_box` = **已在箱外（突破）** —— 双侧判据
+                #   拦下的正是这一类；不区分会让人把"突破被拦"误读成"价格在箱内"（与事实相反）。
                 it.reason = ("osc_edge_wait" if (_at_lower or _at_upper)
-                             else "osc_inside_box")
+                             else ("osc_outside_box"
+                                   if (c > it.box_upper or c < it.box_lower)
+                                   else "osc_inside_box"))
                 await self._save_ctx(ctx)
                 return it
+            # ── 【D2 2026-09-17 治本】震荡止损预算闸 + 规格 9.4「平完即清零」──────────
+            # 缺陷 A（预算被绕过）：4ATR 预算此前**只在 FSM 处于 S1_OSC 时**被判
+            #   （state_machine.decide：`if cur == S1_OSC and osc_atr_loss >= limit → S5`）。
+            #   而 S0_IDLE 现在也允许出箱体单 ⇒ 状态是 S0 时预算即便已用尽也照开
+            #   （实测 `osc_atr_loss=4.814 ≥ limit=4.0`，07:15 仍开 SELL 0.03）⇒ 防爆仓失效。
+            # 缺陷 B（计数器永不复位 ⇒ 手数档位长期顶格）：规格 9.4 的"清锁"只在 FSM
+            #   自身处于 S5 时执行，而 **S5 只能从 S1_OSC 进入** ⇒ S0 出的箱体单永远推进不到
+            #   S5 ⇒ `osc_atr_loss` / `osc_loss_count` **只增不减** ⇒ 手数档位长期停在最高档
+            #   （这正是用户实测"新轮首单直接 0.03"的另一半原因）。
+            # 本处按规格原文补全：**该品种全部持仓平完 ⇒ 清锁止并归零计数**（与桥的
+            #   "只增"写入互补；清零是 docstring 允许的例外，且与 FSM 的清锁同一语义、幂等）。
+            #   用量化证据驱动，不依赖 FSM 是否进过 S5。
+            # 回滚：把 `state.osc_atr_loss_limit` 调大（或 ≤0 = 关闭本闸）即可。
+            if self._osc_limit > 0 and _cur_atr_loss >= self._osc_limit:
+                if positions_open <= 0:
+                    # 【C4 2026-09-17】清锁逻辑已抽为 `_clear_osc_budget_if_flat` 并**前移**到
+                    # 入面判定之前（未贴边的 bar 也必须能清锁）；此处保留调用以免出现第二份
+                    # 实现（铁律第十三章：同一语义只有一个实现点）。幂等：通常此时已清零。
+                    _cur_atr_loss = await self._clear_osc_budget_if_flat(
+                        symbol, ctx, _cur_atr_loss, positions_open)
+                else:
+                    it.reason = "osc_atr_locked_no_new_order"
+                    it.lot_multiplier = 0.0
+                    logger.warning(
+                        "[state_strategy] %s 震荡止损预算已用尽（%.3fATR ≥ 上限 %.2f，"
+                        "连续止损 %d 次）→ 不出新箱体单（持仓保留、沿用既有 SL，规格 9.4）",
+                        symbol, _cur_atr_loss, self._osc_limit, ctx.consec_losses)
+                    await self._save_ctx(ctx)
+                    return it
             if _at_lower:
                 it.action, it.direction, it.reason = "open", "BUY", "osc_at_box_lower"
             else:
@@ -1174,9 +1653,45 @@ class StateStrategy:
             # 契约：`vol_expand_proba < 0` = 未提供 ⇒ **不裁决**（保持既有行为）；
             #   `self._vol_osc_skip_prob < 0` = 本闸关闭（默认，可一行回滚）。
             # 边界：**只拦箱体新开**，不碰持仓管理、不碰趋势路径（FSM 不参与预测）。
+            # 【P2 2026-09-19】`osc_skip_require_singleton` 开启时**额外要求预测可信**
+            #   （conformal 单例）⇒ 置信度真正接到闸门上。
+            #   `vol_route_singleton is None`（未知）⇒ `_vol_conf_ok = False` ⇒ **不拦**
+            #   （fail-safe：宁可少拦，不因"算不出置信度"而静默加码限制）。
+            _vol_conf_ok = (not self._vol_skip_require_singleton
+                            or vol_route_singleton is True)
+            # 【可观测性 2026-09-19】闸门候选标志（**只读**，用于下方曝光点）
+            _vol_open_cand = (it.action == "open")
             if (it.action == "open" and self._vol_osc_skip_prob >= 0.0
-                    and vol_expand_proba >= self._vol_osc_skip_prob):
+                    and vol_expand_proba >= self._vol_osc_skip_prob
+                    and _vol_conf_ok):
                 it.action, it.reason = "none", "osc_vol_expand_skip"
+            # ── 【可观测性 2026-09-19】vol 路由**只读曝光点** ──────────────────────
+            # 动机（本轮实测）：`state.vol.osc_skip_prob` 默认 -1.0（关闭）⇒ 上方那个 if
+            #   不成立 ⇒ `vol_expand_proba` **既不参与决策、也不被记录、也不进面板**
+            #   ⇒ 模型即便部署，闸门关闭时全链路**没有任何 p_cal 曝光位**（"只观测"观测不到）。
+            # 为什么记在这里：这是**唯一"真的会开箱体新单"**的入场点
+            #   （上方 `positions_open > 0` 已把同向持仓降级为 none；下方冻结要求 action==open）
+            #   ⇒ 记下的样本恰好是"第二跳（振幅 → 箱体单 R）"所需的样本集，
+            #   且频次有界（**不是每 bar 一行**，只在贴边候选时产生）。
+            # 纪律：本段**只读**，不修改 `it` 任何字段 ⇒ 决策逐位不变、零回滚风险。
+            #   回滚 = 删除本段（无配置键、无状态）。
+            # 【2026-09-19 开闸取证】必须落**可结算的字段**：闸门一旦开启，"被拦"的候选
+            #   **不会产生订单**，事后无从结算 ⇒ 若不在此记录 `bar_id` 与箱体三线，
+            #   "运行结果能否证明价值"永远无法回答（本仓库红线：改动必须可归因）。
+            #   有了 (bar_id, dir, close, box 三线) 即可**离线重放**该候选的
+            #   TP(箱体中值/对边) 与破界结局 ⇒ 得到反事实 R，与"放行"组直接对照。
+            if _vol_open_cand:
+                logger.info(
+                    "[vol_route] %s bar=%s 箱体入场候选 | p_cal=%s singleton=%s "
+                    "阈值=%s 结果=%s | dir=%s close=%.5f box=[%.5f,%.5f,%.5f] reason=%s",
+                    symbol, (bar_id or "?"),
+                    ("NA" if vol_expand_proba < 0.0 else f"{vol_expand_proba:.4f}"),
+                    ("未知" if vol_route_singleton is None
+                     else ("单例" if vol_route_singleton else "非单例")),
+                    self._vol_osc_skip_prob,
+                    ("放行" if it.action == "open" else "被拦"),
+                    it.direction, float(close[-1]),
+                    float(lo), float(mid), float(up), it.reason)
             # 【2026-09-15 修复】冻结箱体**只在真的下单时**发生（`it.action == "open"`）。
             # 此前是"只要触及边界就冻" —— 即使被 `positions_open` 拦成 `none`（或下游
             # `state.order_enabled=False` 不下单）也照样冻结 ⇒ 凭空产生一个 TP 锚点，
@@ -1191,11 +1706,14 @@ class StateStrategy:
                 ctx.frozen_round_seq = _cur_round_seq
                 ctx.osc_edge_streak = 0       # 已开仓 → 防抖进度清零（下一轮重新累计）
                 ctx.osc_break_streak = 0      # 新一轮从 0 计破界
+                # 【马丁补仓 2026-09-18】记住本轮入场方向 → 止损后按"同向"补下一档
+                ctx.osc_last_dir = it.direction
             await self._save_ctx(ctx)
             return it
 
         # ── S2 趋势初生：顺势回踩，仅 1 笔 ──
-        if fsm_state == "S2_TREND_INIT" and not hold_only:
+        # 【2026-09-19 阶段1】弃权闸点 ③（S2 趋势初生）
+        if fsm_state == "S2_TREND_INIT" and not hold_only and not abstain:
             tdir, _src = resolve_trend_dir(direction, slope)
             it.dir_source = _src
             if tdir == "none":
@@ -1209,7 +1727,7 @@ class StateStrategy:
             if positions_open > 0:
                 it.reason = "init_already_open"
                 return it
-            if not self._spike_ok(high, low, atr):
+            if not self._spike_ok(high, low, atr, base_high, base_low):
                 it.reason = "init_spike_skip"     # 追涨过滤（L4 实测最优项）
                 return it
             _ok, _dir = self._pullback_entry(tdir, c, high, low, w_pull, atr)
@@ -1238,7 +1756,8 @@ class StateStrategy:
             return it
 
         # ── S3 趋势中段：无仓则首建，有仓则顺势加仓 ──
-        if fsm_state == "S3_TREND_MID" and not hold_only:
+        # 【2026-09-19 阶段1】弃权闸点 ④（S3 首建 + 顺势加仓）
+        if fsm_state == "S3_TREND_MID" and not hold_only and not abstain:
             # 方向来源：**方向模块是当场真值**；`ctx.trend_dir` 只是"本轮已锁定的方向"。
             # 【2026-09-15 修复】此前是 `tdir = ctx.trend_dir or tdir`（锁定值**盖过**模块读数）
             # → 模块已改判反向时，仍会按旧方向加仓（"一错到底"）。现改为：
@@ -1258,7 +1777,7 @@ class StateStrategy:
                 if not mod_dir:
                     it.reason = "no_trend_dir"
                     return it
-                if not self._spike_ok(high, low, atr):
+                if not self._spike_ok(high, low, atr, base_high, base_low):
                     it.reason = "mid_spike_skip"
                     return it
                 _ok, _dir = self._pullback_entry(mod_dir, c, high, low, w_pull, atr)
@@ -1321,11 +1840,18 @@ class StateStrategy:
             it.action, it.direction, it.reason = "add", _dir, "mid_add_on_pullback"
             it.lot_multiplier = 1.0                # 趋势加仓固定 base_lot（规格 10.2）
             it.add_count = ctx.add_count + 1
-            # 仅在"无权威来源"时自增：有权威来源（`fsm_adds_used`）时，计数由
-            # **真实持仓**决定 —— 本次意图即使被拦不下单，下一根 bar 的持仓数才是真值。
-            # 这样"拦单不计入"，不会出现"策略以为加过、实际没有"的提前封顶。
+            # 【C5 2026-09-17】无权威来源（`fsm_adds_used < 0` = 持仓计数失败/未知）时
+            # **不再自增** `ctx.add_count`：原实现自增 ⇒ 被风控拦下、**未成交**的加仓意图
+            # 也被计入 ⇒ 达到 `max_adds` 后 `mid_max_adds_reached` **提前封顶**，本轮加仓
+            # 机会被静默吃掉（计数与真实成交数脱钩）。
+            # 取舍：**宁少算、不提前封顶** —— 代价是 `-1` 窗口内可能超出 `max_adds`；
+            # 由风控侧 `risk.max_concurrent_signals` / `risk.max_total_exposure` /
+            # 单笔上限兜底（不会无限加仓）。WARNING 便于统计 `-1` 揭示率（两段式观察）。
             if int(fsm_adds_used) < 0:
-                ctx.add_count += 1
+                logger.warning(
+                    "[state_strategy] %s 加仓计数权威缺失（fsm_adds_used=-1，持仓计数失败）"
+                    "→ 本轮**不自增** add_count（当前 %d / 上限 %d），避免提前封顶",
+                    symbol, ctx.add_count, self._max_adds)
             await self._save_ctx(ctx)
             return it
 
@@ -1357,7 +1883,11 @@ class StateStrategy:
             return it
 
         # ── 其它（S0 空闲等）：不下单 ──
-        it.action, it.reason = "none", f"{fsm_state.lower()}_no_new_order"
+        # 【2026-09-19 阶段1】弃权留痕：`abstain` 只拦**新开/加仓**（上方 4 处闸点），
+        #   不拦离场与尾随 ⇒ 这里**只改留痕原因**，动作本就是 none（不改任何行为）。
+        #   留痕落在 `intent_reason`（已落库的既有列）⇒ **无需新增 DB 列**。
+        it.action, it.reason = "none", (
+            "abstain_veto" if abstain else f"{fsm_state.lower()}_no_new_order")
         return it
 
     # ── 【已移除】normalize_after_close ──────────────────────
@@ -1383,6 +1913,7 @@ class StateStrategy:
             "trail_lookback": self._trail_lookback,
             "fade_trail_mult": self._fade_trail_mult,
             "box_min_width_atr": self._box_min_width_atr,
+            "box_max_width_atr": self._box_max_width_atr,
             "entry_mode": self._entry_mode,
             "entry_wait_sec": self._entry_wait_sec,
             # 【§57 箱体规格】上屏可见 —— 否则"改了模式但看不到生效"（反复出现的盲区）
@@ -1396,4 +1927,11 @@ class StateStrategy:
             "tp_pct": self._tp_pct,
             "break_confirm_bars": self._break_confirm,
             "ladder": self._ladder,
+            # 【马丁补仓 2026-09-18】开关上屏（改了必须看得见；面板/接口读 `tuning`）
+            "osc_martingale_enabled": self._osc_ma_enabled,
+            # 【可观测性 2026-09-18】S0 箱体入场开关 + 趋势污染护栏上屏
+            "osc_in_idle": self._osc_in_idle,
+            "osc_idle_block_after_trend": self._osc_idle_block_after_trend,
+            # 【P1-6 F7】护栏窗口长度上屏（改了必须看得见）
+            "osc_idle_block_bars": self._osc_idle_block_bars,
         }

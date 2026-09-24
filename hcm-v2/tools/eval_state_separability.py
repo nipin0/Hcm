@@ -47,6 +47,44 @@ def _load(name: str, path: str):
 SF = _load("state_features", os.path.join(_SIG, "state_features.py"))
 TSM = _load("train_state_model", os.path.join(_TOOLS, "train_state_model.py"))
 
+# ── 【2026-09-19 D1】「未来度量」特征集（**刻意作弊**，禁止进任何生产路径）──────────
+# 来源：`tools/build_state_labels.window_metrics` 落到 CSV 的**未来窗口**度量
+#   （`er/disp` 覆盖 i+1..i+n；`er1/disp1` 覆盖 i+1..i+mid；`er2/disp2` 覆盖 i+mid..i+n）。
+# 为什么需要这一集：`classify_label` 的判类输入**就是这些列** ⇒ 拿它们当特征等于把答案
+#   喂给模型。其**唯一用途**是量化两件事：
+#     ① 标签的"未来决定程度"（oracle ≈ 满分 ⇒ 标签是未来的函数，不是"当下状态"）；
+#     ② 与 base(27 维过去特征) 的差距 = **过去信息的上限**（决定"补特征"还有没有空间）。
+# 纪律：本集无配置键、无推理消费点，只在本脚本内以 --feature-set oracle 显式选择。
+ORACLE_COLS = [
+    "er", "disp", "er1", "disp1", "er2", "disp2",
+    "adx_t", "adx_slope", "mae_atr", "mfe_atr", "new_ext_dir", "delta",
+    "er2_f", "mae_f", "adx_slope_f", "new_ext_f",
+]
+
+
+def resolve_feature_cols(name: str, df) -> list:
+    """特征集解析（唯一处），缺列 fail-fast（防静默错列）。
+
+    `mem` / `mem_only` 的列名**从构造器模块取**（`build_state_memory_features` 是镜像列的
+    唯一实现处）—— 刻意不在此复制清单，否则两处清单会漂移。
+    """
+    if name == "oracle":
+        cols = list(ORACLE_COLS)
+    elif name == "l1":
+        cols = list(SF.STATE_FEATURE_COLS_L1)
+    elif name in ("mem", "mem_only"):
+        MEM = _load("build_state_memory_features",
+                    os.path.join(_TOOLS, "build_state_memory_features.py"))
+        cols = list(MEM.MEM_FEATURE_COLS)
+        if name == "mem":
+            cols = list(SF.STATE_FEATURE_COLS) + cols
+    else:
+        cols = list(SF.STATE_FEATURE_COLS)
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise SystemExit(f"[fatal] 特征集 {name} 缺列：{missing}")
+    return cols
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -54,6 +92,12 @@ def main() -> None:
     ap.add_argument("--label-col", default="label_id",
                     help="标签列名（默认 label_id；数据驱动状态用 state_id）")
     ap.add_argument("--splits", type=int, default=5, help="TimeSeriesSplit 折数")
+    ap.add_argument("--feature-set", default="base",
+                    choices=["base", "l1", "oracle", "mem", "mem_only"],
+                    help="base = STATE_FEATURE_COLS(27，现行推理契约)；"
+                         "l1 = base + 量价/点差(6)；"
+                         "oracle = 标签自身的未来度量（作弊集，仅用于量化「标签有多少是"
+                         "未来决定的」与「过去信息的上限」，禁止进任何生产路径）")
     args = ap.parse_args()
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -63,7 +107,7 @@ def main() -> None:
     import lightgbm as lgb
 
     df = pd.read_csv(args.labels)
-    cols = list(SF.STATE_FEATURE_COLS)
+    cols = resolve_feature_cols(args.feature_set, df)
     if args.label_col not in df.columns:
         raise SystemExit(f"[fatal] 缺标签列 {args.label_col}")
     df = df[df[args.label_col].notna()].copy()
@@ -73,7 +117,7 @@ def main() -> None:
     X = df[cols].astype(float)
     y = df["label_id"].to_numpy()
 
-    print(f"[data] 样本 {len(df)}  分布 "
+    print(f"[data] 样本 {len(df)}  feature_set={args.feature_set}({len(cols)}维)  分布 "
           f"{ {names[i]: int((y == i).sum()) for i in range(len(names))} }")
 
     def mk():

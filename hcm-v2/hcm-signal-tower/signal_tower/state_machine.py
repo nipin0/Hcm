@@ -56,6 +56,11 @@ PAUSE_KEY_TMPL = "hcm:state:pause:{symbol}"
 
 DEFAULTS: dict = {
     "state.infer_fail_bars": 3,
+    # 【B15-3 2026-09-17】hold_only 连续置位的 bar 数**上界**：超过则强制解除。
+    # 为什么必须有：规格 10.2 的语义是「**暂缓**加仓」而非「永久禁用」；若模型长期判趋势
+    # 而现实中已转震荡，「无持仓」与「趋势经确认重入」两个解除条件都可能长期不满足。
+    # 默认 12（对齐 `state.horizon_bars`）。下界 1（0 会让上界恒真 ⇒ 等于关闭 hold_only）。
+    "state.hold_only_max_bars": 12,
     "state.debounce.k_enter": 2,
     "state.debounce.k_exit": 2,
     "state.debounce.k_fade": 2,
@@ -65,6 +70,11 @@ DEFAULTS: dict = {
     # 远优于 4 类 argmax 推导的 20%/67.8%/滞后 3.5）。默认 False = 保持既有行为，
     # 开启属**核心机制变更**，须走变更说明与灰度（方案 §21.2）。
     "state.trigger.required": False,
+    # 【P1-5 F5 2026-09-18】触发器↔类别门**互认**：触发器响但模型**高置信判 oscillation**
+    # 时，多半是"箱体边沿被破"的假起点（审计 F5：S1 持箱体单可直接跳 S2）。
+    # 该值 = 否决阈值：`proba["oscillation"] >= 阈值` 时不翻 S2。**默认 0.0 = 关闭**
+    # （零行为变化，先观测 `oscillation` 概率分布再定值/启用；回滚 = 置 0.0）。
+    "state.trigger.osc_veto_proba": 0.0,
     # 【2026-09-16 新增】低置信（`decided=False`）时的**类别迁移语义**：
     #   · "hold"（默认 = 既有行为，零变化）：该根不参与类别防抖（不进不退）。
     #     代价（验收门实测，走前式 3 折 / 生产对齐口径）：一旦判过趋势，
@@ -75,6 +85,24 @@ DEFAULTS: dict = {
     #     漏检 **49** / 误报 84.7% / 中位提前量 **−1.0（提前）** ⇒ 由滞后转提前。
     #   ⇒ 不动任何阈值与防抖根数，仅改"低置信如何参与防抖"。
     "state.fsm.low_conf_policy": "hold",
+    # ── 【③-B 2026-09-19】「只用 trend_fade」：非 fade 三类**收敛到一个目标态** ──────
+    # 依据（**两套独立实验**均证实三类不可分，详见 docs/方案_状态机判别力改进_20260919.md
+    #   §7.4 / §7.6 / §7.7）：
+    #   · 两两时序 OOF AUC：oscillation vs trend_init **0.5526**、vs trend_mid **0.5550**、
+    #     trend_init vs trend_mid **0.5172**，三者准确率均**低于多数类基线**；
+    #     条件预测分布总变差 ≤ **8.5%**（trend_init vs trend_mid 仅 0.4%）；
+    #   · 补 6 列量价/点差特征（`--feature-set l1`）：macro_F1 **0.3328→0.3302**，无提升；
+    #   · 重定标签口径（oscillation 占比 16.9%→**35.0%**）：关键对 AUC 0.5538/0.5323/0.5124，
+    #     **无变化**（且把唯一可分类的占比从 19.8% 压到 4.9%）。
+    #   ⇒ 模型对这三类的 argmax 实为**噪声**；用它驱动 S1/S2/S3 的区分 = **按噪声迁移**
+    #     （生产实测 43 次迁移 / 251 bar，其中 S0_IDLE ↔ S4_TREND_FADE 反复横跳 ≥6 轮）。
+    # 语义：取值 ∈ {"", S0_IDLE, S1_OSC, S2_TREND_INIT}；**"" = 关闭（默认，零行为变化）**。
+    #   非空时：模型判 `oscillation / trend_init / trend_mid` → **一律落该目标态**
+    #   （仍走同一套防抖与第 8.5 步两道门，不绕过任何约束）；模型判 `trend_fade`
+    #   → 仍落 S4 不变（那是它**唯一可判**的类：recall 0.79 / AUC 0.76~0.80）。
+    # 建议值：`S2_TREND_INIT` —— 12 天整链回放中它占 **95%+ 成交**且是唯一稳定正边际
+    #   （均值 R **+0.076** / 累计 +12.4）；`S0_IDLE` 可作"非 fade 不下单"的对照臂。
+    "state.fsm.non_fade_target": "",
 }
 
 
@@ -100,6 +128,17 @@ CLASS_TO_STATE = {
 _TREND_STATES = (MarketState.S2_TREND_INIT, MarketState.S3_TREND_MID,
                  MarketState.S4_TREND_FADE)
 
+# 【③-B 2026-09-19】`state.fsm.non_fade_target` 的**枚举白名单**（非法值回退 ""）。
+# 刻意只含"语义明确且不违规格"的三个落点：S2_TREND_INIT（建议值）、S1_OSC（保守：落箱体域）、
+# S0_IDLE（对照臂：非 fade 不下单）。**不含 S3/S4/S5/S9** —— S3 是加仓阶段（规格：非趋势态
+# 不得直接进 S3，见 decide 第 5 步的两处改写）、S4 是衰竭（非 fade 三类不该落）、
+# S5 是锁止、S9 是暂停，均非"收敛"的合法落点。
+_NON_FADE_TARGET_ALLOWED = frozenset({"S0_IDLE", "S1_OSC", "S2_TREND_INIT"})
+
+# 【P1-5 F1 2026-09-18】`no_trigger` 周期告警间隔（根）：每连续丢弃 N 根告警一次
+# （命名常量，非魔法数字；首根也会告警一次，见 decide 的 no_trigger 分支）。
+_NO_TRIGGER_WARN_EVERY = 12
+
 
 def apply_osc_close(reason: str, sl_atr: float,
                     atr_loss: float, count: int) -> tuple[float, int]:
@@ -115,14 +154,35 @@ def apply_osc_close(reason: str, sl_atr: float,
     |---|---|---|
     | `tp` | 一轮成功结束 | **两个计数器都归零**（梯度回到第一档） |
     | `sl` | 策略性止损 | `atr_loss += sl_atr`、`count += 1` |
-    | 其它 | `be` / `manual` / `expert` / `stop_out` | **不计入**（原样返回） |
+    | 其余 | `be` / `manual` / `expert` / `stop_out`（含未知/空） | **只把 `count` 归零**；`atr_loss` **原样保留** |
 
-    *其它不计入的理由*：
-      · `be`（保本出场）**没有亏损** —— 规格说的是"累计**止损**"，保本不应计入；
-        若计入会让"连续止损"计数虚高、梯度手数无端放大。
-        ⚠ 该口径**尚未经用户确认**（方案 §37.5-3），当前取"不计入"。
-      · `manual` / `expert` / `stop_out` 不是策略性止损，混入会污染锁止判定
-        （其中 `expert` 还包含桥自身的移动止损成交，计入会把正常止盈保护算成亏损）。
+    *两个计数器语义不同，故规则也不同*：
+      · `atr_loss` 表达「**用掉多少止损预算**」（规格 9.4 的 4ATR 防爆仓）。
+        未发生止损 ⇒ 预算没被用掉 ⇒ **不动**（保本/人工/桥移动止损都不产生止损损失）。
+        故它**只由 `tp` 归零**（或由 `_clear_osc_budget_if_flat` 在预算用尽且全平时清锁）。
+      · `count` 表达「**连续**止损次数」（`state.osc_lot_ladder` 的定义：
+        "震荡梯度手数倍率（逗号分隔，**按连续止损次数取**）"）。
+        任何**非 `sl`** 的平仓都**打断了"连续"** ⇒ `count` 归零。
+
+    【2026-09-21 修正 · 为什么把"其余"从"原样返回"改为"count 归零"】
+      旧规则下 `count` **只有 `tp` 一条归零路径**，而这条路径在生产上**实际不可达**：
+      箱体单的止盈由**桥侧主动平仓**实现（破界离场 / 移动止损 / 冻结箱体中值）
+      ⇒ MT5 `deal.reason = 3 (EXPERT)` ⇒ 归因记 `expert` **而非** `tp`。
+      实测（2026-09-21，近 3 天 19 笔 magic 61xxxxx 箱体单）：`close_reason` 中
+        `tp` 出现 **0 次**（`expert` 12 / `sl` 6 / 其它 1）。
+      而另一条归零路径 `_clear_osc_budget_if_flat` 要求 `atr_loss >= 4.0`，
+      当时实测 `atr_loss = 3.41 < 4.0` ⇒ 亦未触发。
+      ⇒ 两条归零路径同时失效 ⇒ `count` 自 2026-09-18 起**单调不减、永久停在 2**
+        ⇒ `ladder[2] = 1.5×` ⇒ **新单恒为 0.03 手**（base_lot 0.02），
+        1.0 档（0.02）与 0.5 档（0.01）结构性不可达（实测近 4 天 TT 档分布：
+        00→2 笔 / 01→7 笔 / **02→14 笔**）。
+      本修正把 `count` 的语义纠正回规格原文的「**连续**」：
+      非 `sl` 平仓即中断连续 ⇒ 归零 ⇒ 档位回落到第一档。
+      ⚠ 已知副作用（已记录，未修）：同一轮若 master=`sl`、follower=`expert`
+        （两个账户各自对账、写入同一个**品种级**键），结果会**依赖对账先后顺序**
+        （`sl` 先 → count=0；`expert` 先 → count=1）—— 旧语义下二者等价，
+        故此项**顺序无关性**在本轮修正中退化了。方向是**保守**（手数偏小），
+        但"不可复现"本身是本仓库 BUG-3 曾专门修过的问题，**待后续在写入侧按轮次归一**。
 
     Args:
         reason: 平仓归因（`tools/position_sync.py:_CLOSE_REASON_BY_DEAL`）。
@@ -131,10 +191,15 @@ def apply_osc_close(reason: str, sl_atr: float,
     """
     r = str(reason or "").strip().lower()
     if r == "tp":
+        # 一轮成功结束：预算与梯度**双双归零**（`tp` 是唯一会清 `atr_loss` 的平仓事件）。
         return 0.0, 0
     if r == "sl":
+        # 真止损：既占 ATR 预算，也推进「连续止损」计数。
         return float(atr_loss) + max(0.0, float(sl_atr)), int(count) + 1
-    return float(atr_loss), int(count)
+    # 其余任何归因（be/manual/expert/stop_out/未知/空）：**只把 `count` 归零**，
+    # `atr_loss` 原样保留（未发生止损 ⇒ 预算没被用掉）。
+    # 规则取"全域"而非枚举已知值：非 `sl` 即打断连续 ⇒ 不留静默特例。
+    return float(atr_loss), 0
 
 
 @dataclass
@@ -147,6 +212,7 @@ class FSMState:
     pending_class: str = ""
     pending_streak: int = 0
     hold_only: bool = False          # 停止新开/加仓但持仓保留（S3/S4 转震荡）
+    hold_only_bars: int = 0          # 【B15-3】hold_only 已连续置位的 bar 数（上界兜底用）
     consecutive_fail: int = 0        # 连续推理失败计数
     osc_atr_loss: float = 0.0        # 累计震荡止损（ATR 倍数）
     last_class: str = ""             # 最近一次判定类别（观测）
@@ -161,6 +227,11 @@ class FSMState:
     # 而是**跨窗口的位置**属性。而"已持续多少根"是**纯过去可观测量** —— 不需要预测、
     # 也不需要人工阈值，由状态机自己数出来。策略层据此区分轻仓试错与顺势加仓。
     age_bars: int = 0
+    # 【P1-5 F1 2026-09-18】`no_trigger` 丢弃的**连续根数**（把静默丢弃变成可见计数）。
+    # 背景（审计 F1）：`require_trigger=true` 下模型判趋势但触发器未响 → `_keep("no_trigger")`
+    # 全程无日志 ⇒ 43% 的触发器机会被静默丢弃且不可观测。本计数随状态落 Redis、可上屏/告警。
+    # 语义：目标态 ∈ {S2,S3} 且触发器未确认 → +1；通过门 或 目标态离开趋势入口 → 清零。
+    no_trigger_bars: int = 0
     updated_at: str = ""
 
 
@@ -179,6 +250,12 @@ class FSMDecision:
     infer_decided: bool = False
     infer_reason: str = ""
     predicted_class: str = ""
+    # 【2026-09-19 阶段1】本根弃权（True = 禁止新开/加仓，持仓保留；离场不受影响）。
+    # 来源 = `state_infer` 的校准/conformal 弃权闸（默认关闭 ⇒ 恒 False）。
+    # 设计：**按 bar 一次性**，刻意**不写入 `FSMState`** ⇒ 天然不跨 bar 残留；
+    #   与 `hold_only`（持久、空仓自动解除）正交；也**不改 `infer_decided`**，
+    #   故 `low_conf_policy`（hold/decay）行为逐位不变。
+    abstain: bool = False
     proba: dict = field(default_factory=dict)
     margin: float = 0.0
     model_version: str = ""
@@ -202,7 +279,12 @@ def decide(
     trigger_on: bool = False,
     direction: str = "",
     require_trigger: bool = False,
+    # 【③-B 2026-09-19】非 fade 三类（oscillation/trend_init/trend_mid）的目标态收敛；
+    # "" = 关闭（默认，逐位保持既有行为）。取值白名单校验在 `MarketStateMachine.load_config`。
+    non_fade_target: str = "",
     low_conf_policy: str = "hold",
+    hold_only_max_bars: int = 12,
+    osc_veto_proba: float = 0.0,
 ) -> FSMDecision:
     """纯状态迁移函数（无 IO / 无时钟依赖）。
 
@@ -233,6 +315,7 @@ def decide(
             infer_decided=bool(getattr(infer, "decided", False)),
             infer_reason=str(getattr(infer, "reason", "")),
             predicted_class=str(getattr(infer, "state", "") or ""),
+            abstain=bool(getattr(infer, "abstain", False)),
             proba=dict(getattr(infer, "proba", {}) or {}),
             margin=float(getattr(infer, "margin", 0.0) or 0.0),
             model_version=str(getattr(infer, "model_version", "") or ""),
@@ -299,6 +382,22 @@ def decide(
     # （`infer_fail`（推理失败）仍优先于本块：那是"算都算不出来"，保守起见不在此放行。）
     if (trigger_on and cur not in _TREND_STATES
             and cur not in (MarketState.S5_OSC_LOCKED, MarketState.S9_PAUSED)):
+        # 【P1-5 F5 2026-09-18】触发器↔类别门**互认**：读模型 oscillation 概率。
+        #   `osc_veto_proba<=0` = 关闭（默认，零行为变化）；>0 = 阈值。
+        #   无论开关，oscillation 概率高时留痕（供定值后再启用）。
+        try:
+            _osc_p = float((getattr(infer, "proba", {}) or {}).get("oscillation", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001
+            _osc_p = 0.0
+        if _osc_p >= 0.5:
+            logger.info(
+                "[state_machine] %s trigger_enter 伴随模型 oscillation=%.3f"
+                "（F5 观测；veto 阈值=%s）", st.symbol, _osc_p, osc_veto_proba)
+        if osc_veto_proba > 0.0 and _osc_p >= osc_veto_proba:
+            logger.warning(
+                "[state_machine] %s trigger_enter 被高置信 oscillation(%.3f>=%.3f) 否决"
+                "（F5 互认：防箱体边沿假突破翻 S2）", st.symbol, _osc_p, osc_veto_proba)
+            return _keep("trigger_osc_veto")
         if direction in ("up", "down"):
             st.hold_only = False
             st.direction = direction
@@ -347,6 +446,18 @@ def decide(
         target = CLASS_TO_STATE.get(str(getattr(infer, "state", "") or ""))
         if target is None:
             return _keep("unknown_class")
+        # ── 【③-B 2026-09-19】非 fade 三类**收敛到一个目标态**（开关，默认关闭）──────
+        # 为什么：`oscillation / trend_init / trend_mid` 两两 AUC 0.51~0.55、条件分布
+        #   总变差 ≤8.5%，两套独立实验（补 l1 特征 / 重定标签口径）均**无法分开**
+        #   ⇒ 模型对三者的 argmax 是**噪声**，用它驱动 S1/S2/S3 的区分 = 按噪声迁移。
+        # 做法：**只改目标态**；不动防抖根数、不动第 8.5 步两道门（不绕过任何约束）。
+        #   保留 `trend_fade` 不受影响 —— 它是模型**唯一可判**的类（recall 0.79 / AUC 0.76~0.80）。
+        if non_fade_target and target != MarketState.S4_TREND_FADE:
+            try:
+                target = MarketState(non_fade_target)
+            except ValueError:
+                # 白名单外（配置绕过 load_config 注入时的兜底）→ 不改写，保持既有行为
+                pass
 
     # 【规格 §6.3 对齐 2026-09-15】非趋势态**不得直接跳进 S3**。
     # 规格的迁移表里趋势入口是 S2（"轻仓试错、仅 1 笔、**禁加仓**"），S3 才是加仓阶段；
@@ -366,16 +477,44 @@ def decide(
     #      迁移 0043 的说明。
 
     # 7) 同态：清零待迁计数
+    # 【B15-3 2026-09-17】**删除**此处原有的 `st.hold_only = False`：
+    #   原实现"同态即解除 hold_only" ⇒ 规格 10.2「趋势态下转震荡 → 停止加仓、持仓保留」
+    #   **只生效一根 bar**（下一根只要模型再判同一趋势态就被清掉，S3 加仓逻辑照常运行）。
+    #   `hold_only` 的解除改由下方 7b 的两条**显式**条件承担，不再由"同态"隐式解除。
     if target == cur:
         st.pending_class = ""
         st.pending_streak = 0
-        if cur in (MarketState.S2_TREND_INIT, MarketState.S3_TREND_MID):
-            st.hold_only = False
         return _keep("same_state")
+
+    # 7b) 【B15-3 2026-09-17】`hold_only` 的显式解除与上界兜底。
+    #   解除条件（二者之一）：
+    #     (a) **已无持仓** —— hold_only 的语义前提是"持仓保留"（规格 10.2），无仓即无意义；
+    #     (b) 趋势态**经确认重新进入** —— 由下方第 8.5 步的两道门（触发器 + 方向）通过时
+    #         解除；触发器直达入口（第 4a 步）自带的 `st.hold_only = False` 保留不动。
+    #   上界兜底：连续置位超过 `hold_only_max_bars` 根 → 强制解除 + WARNING。
+    #     为什么必须有：规格 10.2 的语义是「暂缓加仓」而非「永久禁用」；若模型长期判趋势
+    #     而现实中已转震荡，(a)(b) 都可能长期不满足 ⇒ 必须有一条时间上界兜底。
+    if st.hold_only:
+        if positions_open <= 0:
+            st.hold_only = False
+            st.hold_only_bars = 0
+        else:
+            st.hold_only_bars += 1
+            if st.hold_only_bars > max(1, int(hold_only_max_bars)):
+                logger.warning(
+                    "[state_machine] %s hold_only 连续 %d 根（> 上限 %d）→ 强制解除"
+                    "（防「永久停止加仓」；规格 10.2 语义为暂缓）",
+                    st.symbol, st.hold_only_bars, hold_only_max_bars)
+                st.hold_only = False
+                st.hold_only_bars = 0
 
     # 8) hold_only：趋势态下转震荡且仍有持仓 → 保留趋势态、仅置 hold_only
     #    （规格 10.2：停止加仓、持仓保留、不新增趋势单；决策 Q4 已确认此语义）
     if target == MarketState.S1_OSC and cur in _TREND_STATES and positions_open > 0:
+        # 【B15-3】每次重新置位都把上界计时归零（否则计时跨多段 hold_only 累加，
+        # 会让上界提前触发、把"暂缓"误判成"到点"）
+        if not st.hold_only:
+            st.hold_only_bars = 0
         st.hold_only = True
         st.pending_class = ""
         st.pending_streak = 0
@@ -386,11 +525,30 @@ def decide(
     #      (b) 方向必须明确（"none" → 拒绝；"" = 未接入方向模块 → 不否决）
     if target in (MarketState.S2_TREND_INIT, MarketState.S3_TREND_MID):
         if require_trigger and not trigger_on:
+            # 【P1-5 F1 2026-09-18】把"静默丢弃"变成**可见计数 + 周期告警**（行为不变）。
+            st.no_trigger_bars += 1
+            if st.no_trigger_bars == 1 or st.no_trigger_bars % _NO_TRIGGER_WARN_EVERY == 0:
+                logger.warning(
+                    "[state_machine] %s no_trigger：模型判 %s 但触发器未确认 → 已连续丢弃 %d 根"
+                    "（require_trigger=true；审计 F1 可见化）",
+                    st.symbol, target.value, st.no_trigger_bars)
             return _keep("no_trigger")
+        st.no_trigger_bars = 0
         if direction == "none":
             return _keep("trend_no_dir")
+        # 【B15-3 2026-09-17】两道门**均通过** ⇒ 趋势态"经确认重新进入" ⇒ 解除 hold_only
+        # （解除条件 (b)）。**门未通过时不得解除** —— 否则又回到"隐式解除"的老缺陷。
+        if st.hold_only:
+            logger.info(
+                "[state_machine] %s hold_only 解除：趋势态经确认重入（trigger_on=%s "
+                "direction=%s）", st.symbol, bool(trigger_on), direction)
+        st.hold_only = False
+        st.hold_only_bars = 0
         if direction in ("up", "down"):
             st.direction = direction
+    else:
+        # 【P1-5 F1】目标态离开趋势入口 ⇒ no_trigger 连续计数清零（语义 = "连续"丢弃）。
+        st.no_trigger_bars = 0
 
     # 9) 防抖计数
     if st.pending_class != target.value:
@@ -425,7 +583,13 @@ class MarketStateMachine:
         self._osc_limit = float(DEFAULTS["state.osc_atr_loss_limit"])
         self._flat_reset = bool(DEFAULTS["state.fsm.flat_reset_enabled"])
         self._require_trigger = bool(DEFAULTS["state.trigger.required"])
+        # 【P1-5 F5】触发器等入口的 oscillation 否决阈值（<=0 = 关闭）
+        self._osc_veto_proba = float(DEFAULTS["state.trigger.osc_veto_proba"])
         self._low_conf_policy = str(DEFAULTS["state.fsm.low_conf_policy"])
+        # 【③-B 2026-09-19】非 fade 三类收敛目标态（"" = 关闭，默认零行为变化）
+        self._non_fade_target = str(DEFAULTS["state.fsm.non_fade_target"] or "")
+        # 【B15-3】hold_only 上界（防"永久停止加仓"，见 DEFAULTS 同名键注释）
+        self._hold_only_max_bars = int(DEFAULTS["state.hold_only_max_bars"])
         self._cache: dict[str, FSMState] = {}
 
     # ── 配置 ───────────────────────────────────────────────
@@ -447,23 +611,51 @@ class MarketStateMachine:
                 "state.fsm.flat_reset_enabled", self._flat_reset)
             self._require_trigger = await self._config.get_bool(
                 "state.trigger.required", self._require_trigger)
+            # 【P1-5 F5】oscillation 否决阈值（热载；<=0 即关闭）
+            self._osc_veto_proba = await self._config.get_float(
+                "state.trigger.osc_veto_proba", self._osc_veto_proba)
+            # 【B15-3】hold_only 上界：下界 1（0 会让上界恒真 = 等于关闭 hold_only，语义混乱）
+            self._hold_only_max_bars = max(1, int(await self._config.get_float(
+                "state.hold_only_max_bars", self._hold_only_max_bars)))
             # 字符串键（非数值）⇒ 用 get() 而非 get_float()，缺省保留现值
             _lcp = await self._config.get("state.fsm.low_conf_policy", None)
             if _lcp is not None and str(_lcp).strip():
                 self._low_conf_policy = str(_lcp).strip().lower()
+            # 【③-B 2026-09-19】非 fade 三类收敛目标态：**枚举白名单**校验，非法值回退 ""+告警
+            #   （与既有 `_lcp` 同风格：字符串键用 get() 而非 get_float()）
+            _nft = await self._config.get("state.fsm.non_fade_target", None)
+            if _nft is not None:
+                _s = str(_nft).strip().upper()
+                if _s == "":
+                    self._non_fade_target = ""
+                elif _s in _NON_FADE_TARGET_ALLOWED:
+                    if _s != self._non_fade_target:
+                        logger.warning(
+                            "[state_machine] 非 fade 收敛目标态 = %s（③-B：oscillation/"
+                            "trend_init/trend_mid 一律落此态，trend_fade 不受影响）", _s)
+                    self._non_fade_target = _s
+                else:
+                    logger.warning(
+                        "[state_machine] state.fsm.non_fade_target=%r 非法（允许 %s）→ 回退 ''（关闭）",
+                        _nft, "/".join(sorted(_NON_FADE_TARGET_ALLOWED)))
+                    self._non_fade_target = ""
             # 仅当配置实际变化时打 INFO（30s 热重载一次 → 否则产生大量重复日志）
             _sig = (self._k_enter, self._k_exit, self._k_fade, self._fail_bars,
                     round(self._osc_limit, 6), self._flat_reset, self._require_trigger,
-                    self._low_conf_policy)
+                    round(self._osc_veto_proba, 6),
+                    self._low_conf_policy, self._hold_only_max_bars,
+                    self._non_fade_target)
             if _sig != getattr(self, "_cfg_sig", None):
                 self._cfg_sig = _sig
                 logger.info(
                     "MarketStateMachine config loaded | k_enter=%d k_exit=%d k_fade=%d "
                     "fail_bars=%d osc_limit=%.1f flat_reset=%s require_trigger=%s "
-                    "low_conf_policy=%s",
+                    "osc_veto_proba=%.3f low_conf_policy=%s hold_only_max_bars=%d "
+                    "non_fade_target=%r",
                     self._k_enter, self._k_exit, self._k_fade,
                     self._fail_bars, self._osc_limit, self._flat_reset,
-                    self._require_trigger, self._low_conf_policy,
+                    self._require_trigger, self._osc_veto_proba, self._low_conf_policy,
+                    self._hold_only_max_bars, self._non_fade_target,
                 )
             else:
                 logger.debug("MarketStateMachine config unchanged")
@@ -597,6 +789,11 @@ class MarketStateMachine:
             trigger_on=bool(trigger_on), direction=str(direction or ""),
             require_trigger=self._require_trigger,
             low_conf_policy=self._low_conf_policy,
+            non_fade_target=self._non_fade_target,
+            # 【B15-3】hold_only 上界（防"永久停止加仓"）
+            hold_only_max_bars=self._hold_only_max_bars,
+            # 【P1-5 F5】oscillation 否决阈值（<=0 关闭）
+            osc_veto_proba=self._osc_veto_proba,
         )
         if bar_time:
             st.last_bar_time = bar_time
@@ -641,4 +838,6 @@ class MarketStateMachine:
             "k_enter": self._k_enter, "k_exit": self._k_exit, "k_fade": self._k_fade,
             "fail_bars": self._fail_bars, "osc_limit": self._osc_limit,
             "flat_reset_enabled": self._flat_reset,
+            # 【③-B 2026-09-19】非 fade 收敛目标态（"" = 关闭）
+            "non_fade_target": self._non_fade_target,
         }

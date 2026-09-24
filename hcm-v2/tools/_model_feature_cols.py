@@ -51,7 +51,6 @@ hcm:live:hexp:ai:{sym} 的实际入模特征）交叉验证，发现 **live_base
 MODEL_FEATURE_COLS = [
     "adx_14",
     "rsi_14",
-    "macd",
     "atr_14",
     "plus_di",
     "minus_di",
@@ -143,6 +142,22 @@ MODEL_FEATURE_COLS = [
     # 训练侧: quality_features 从 H1 K线 h1_trend_dir_at 重算(已收盘棒,无泄露)。
     # 推理侧: quality_scorer._h1_features 从 PG H1 K线同函数重算(60s 缓存)。
     "h1_trend_dir",
+    # ── 【2026-09-18 特征平稳化·实测裁决】仅采纳 1 项：macd → macd_norm（替换口径）──
+    # 对 7 个候选新特征做 TimeSeriesSplit(5 折)×5 种子【配对】AUC 实测
+    # （n=952，HEXP:%，--no-ds-align；脚本 tools/_scratch/_ab_stationary_20260918.py、
+    #   _ab2_groups_20260918.py、_ab3_replace_20260918.py）：
+    #   macd→macd_norm【替换】 quality dAUC=+0.0109 CI[+0.0000,+0.0218]（显著正）
+    #                          entry   dAUC=+0.0046 CI[-0.0031,+0.0122]（非负）   ✔ 采纳
+    #   atr_rel / bbw_atr（加 or 替换）：quality/entry 均 ≈0 或显著负            ✘ 弃用
+    #   结构/箱体 4 列（range_width_atr / box_edge_dist_atr / donchian_break_20 /
+    #     atr_chg_atr）：entry dAUC=-0.0195 CI[-0.0319,-0.0071]（显著负）        ✘ 弃用
+    #     → gain 高但样本外不泛化，与 tmf_qf_* 同病理：n=952 下共线新列只增方差。
+    # 结论：平稳化【仅采纳 MACD 一列（替换）】，其余候选经实测不采纳，不留死代码。
+    # 真源：quality_features._add_structure_factors 的 macd_norm = (EMA12-EMA26)/ATR，shift(1)。
+    # ⚠️ 部署前置（train/serve 对称）：quality_scorer.build_features 须产出 macd_norm
+    #    （已在 build_features 取列清单登记）；macd 仍保留产出以兼容旧 v108
+    #    （模型按 feature_name() 取列、多余列自动忽略）。
+    "macd_norm",
 ]
 
 # 【TimesFM 特征 2026-08-30】独立导出，供 quality_features / quality_scorer 在 join / 注入时
@@ -151,6 +166,12 @@ MODEL_FEATURE_COLS = [
 # 【2026-09-01 已加回】tmf_* 13 维已纳入 MODEL_FEATURE_COLS（35→48 维）：TimesFM 抽取已恢复
 # （hcm_ai.timesfm_features 最新 2026-08-31 19:00 UTC），训练/推理同表同口径 join 注入、非恒 0。
 # 本列表仍保留独立导出，供 join/注入时按名遍历使用。
+# 【2026-09-21 TimesFM 卸载】本常量已**无任何消费者**：
+#   `quality_scorer.py` 与 `quality_features.py` 的 import 与用法均已移除，
+#   且没有任何在线模型的 `feature_name()` 含 tmf（全部 76 个模型实测）。
+# 保留理由：它是已归档抽取器（`tools/_attic_timesfm_20260921/timesfm_features.py`）的
+#   列名契约记录，供离线审计/追溯；若确认不再需要，可直接删除本列表。
+# 实测回顾：全 17 维 ΔAUC = −0.0019（95%CI 跨 0）；`qf_*` 单变量 AUC 0.62 系时间代理伪影。
 TMF_FEATURE_COLS = [
     "tmf_pc00", "tmf_pc01", "tmf_pc02", "tmf_pc03", "tmf_pc04", "tmf_pc05", "tmf_pc06", "tmf_pc07",
     "tmf_trend_cont", "tmf_rev_prob", "tmf_vol_cycle", "tmf_mtf_resonance", "tmf_hist_sim",

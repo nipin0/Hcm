@@ -60,6 +60,68 @@ export const CLASS_CN: Record<string, string> = {
   oscillation: '震荡', trend_init: '趋势初生', trend_mid: '趋势中段', trend_fade: '趋势衰竭',
 };
 
+/* ── 【2026-09-17 面板口径修复】两套词汇必须带来源，否则"震荡"一词指两件事 ──────────
+ * · `state`（STATE_CN）= 状态机执行态 → **下单依据**（StateStrategy 按它分支）；
+ * · `predicted_class`（CLASS_CN）= 模型 4 类概率的 argmax → **不驱动下单**，仅行情形态参考。
+ * 二者可能同时显示"震荡"（S1_OSC 与 oscillation 的中文名相同）—— 实测已因此两次误读：
+ *   "在箱底开空"（箱体画法）与"震荡首单下了 0.02 手"（实为趋势单）。
+ * ⇒ 展示时必须并列来源，禁止裸用同一个词。 */
+export const EXEC_TAG = '（执行态·下单依据）';
+export const MODEL_TAG = '（模型·仅参考·不驱动下单）';
+
+/** magic 前导逻辑码 → 子模式中文（展示口径；解析真值在 state_strategy.decode_fsm_magic） */
+export const LOGIC_CN: Record<string, string> = {
+  '61': '震荡', '62': '趋势', '11': 'HEXP', '55': 'RANGE',
+};
+
+/** MT5 magic → 可读解码：`61 01 02 00` = 震荡·S1_OSC·触上沿·阶梯档0
+ *
+ * 【2026-09-17 显示修复】第 3~4 位（state_code）原样拼成 `S05` —— 而 `_STATE_CODES`
+ * （state_strategy.py）里 `05 = S0_IDLE`（S0 箱体入场专用码，非 S5）⇒ 面板/终端显示
+ * "S05" 会被读成"S5 锁止"，**本人在排查 0.03 事故时就先读错了一次** ⇒ 必须映射。
+ */
+export const MAGIC_STATE_CN: Record<string, string> = {
+  '01': 'S1_OSC',
+  '02': 'S2_TREND_INIT',
+  '03': 'S3_TREND_MID',
+  '04': 'S4_TREND_FADE',
+  '05': 'S0_IDLE',
+};
+
+/** magic 第 5~6 位（触发原因码）→ 可读；未登记一律「其它」（与 MAGIC_REASON_CODES 同口径） */
+export const MAGIC_REASON_CN: Record<string, string> = {
+  '01': '触下沿',
+  '02': '触上沿',
+  '11': '趋势首建',
+  '12': '趋势首建·触价',
+  '21': '中段首建',
+  '22': '中段首建·触价',
+  '23': '中段回踩加仓',
+  '99': '其它',
+};
+
+export const decodeMagic = (m?: number | string | null): string => {
+  const v = Number(m ?? 0);
+  if (!Number.isFinite(v) || v <= 0) return '—';
+  const s = String(Math.trunc(v));
+  if (s.length === 8) {
+    const st = MAGIC_STATE_CN[s.slice(2, 4)] || `S${s.slice(2, 4)}`;
+    const rs = MAGIC_REASON_CN[s.slice(4, 6)] || s.slice(4, 6);
+    return `${LOGIC_CN[s.slice(0, 2)] || s.slice(0, 2)}·${st}`
+      + `·${rs}·阶梯档${s.slice(6, 8)}`;
+  }
+  return `${LOGIC_CN[s] || s}（裸码）`;
+};
+
+/** 手数倍率口径说明（回答"为什么是这个手数"） */
+export const lotMultNote = (mode?: string | null, mult?: number | null): string => {
+  const m = String(mode || '');
+  if (m === 'state_trend') return '趋势单恒 1.0×（规格 10.2）';
+  if (m === 'state_osc') return `震荡阶梯 ×${mult ?? '—'}（档位 0.5/1.0/1.5，按连续止损次数取）`;
+  if (!m) return '非 FSM 单（走置信度分档 risk.lot_multiplier_*）';
+  return `${m}（非 FSM 分档口径）`;
+};
+
 /** 概率曲线色：与状态色同源，但 trend_mid 提亮（#2468d1 在深底上做细线不可辨） */
 export const CLASS_LINE_COLOR: Record<ClassKey, string> = {
   oscillation: '#999999',
@@ -133,6 +195,11 @@ export interface LiveResp {
 }
 
 export interface KlineBar {
+  /* 【2026-09-17 D4】逐 bar 箱体（塔落 `market_state_log`；NULL=该 bar 不可算） */
+  box_upper?: number | string | null;
+  box_lower?: number | string | null;
+  box_mid?: number | string | null;
+  box_frozen?: boolean | string | null;
   open_time: string;
   open: number; high: number; low: number; close: number;
   tick_volume?: number;

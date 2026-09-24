@@ -12,8 +12,13 @@
     ⚠ 边界：只在**片段内部**寻找起点 —— 构造训练集时须丢弃该段末尾 L 根，
       否则会用到下一段的信息（走前式评估下即为泄露）。
 
-产出：`lgbm_onset_{tf}_v{N}_s{k}.txt` × K 个种子 + `..._meta.json`
+产出：`lgbm_{target}_{tf}_v{N}_s{k}.txt` × K 个种子 + `lgbm_{target}_{tf}_v{N}_meta.json`
       meta 含：lead / **决策阈值（按 OOF 最大 F1 标定）** / 特征列 / OOF 指标 / PR 曲线表
+      + 【P2 2026-09-19】**校准器**（isotonic 正类概率）与 **conformal 分位**（供路由/弃权消费）
+
+⚠ 【P2 修复 2026-09-19】meta 文件名**必须随 `--target` 变化**：此前写死 `lgbm_onset_`，
+  而模型文件名已随 target 变化 ⇒ 训 `--target vol` 会**覆盖 onset 的 meta**，
+  使 `load_onset_models` 静默读到 vol 的阈值（真实缺陷，非推测；两类模型不可互相加载）。
 
 用法：
     python train_onset_model.py --csv _scratch/state_M5_v2.csv --tf M5 --version 1 --lead 5
@@ -33,7 +38,13 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 
-MODELS_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+# ⚠ 【2026-09-19 晋升纪律修复】默认输出目录**不再是生产目录**（与 `train_state_model` 同款）。
+#   此前默认落 `<tools>/models`（= 容器 `/app/review_models` 的 bind mount 源）
+#   ⇒ **不带 `--outdir` 训练即等于"训练即上线"**，且 `state_infer` 按 `max(version)`
+#   隐式选版 ⇒ 一次误训练立刻被采纳。现复用既有四态规范（`auto_retrain.MODEL_STAGING_DIR`）：
+#   TRAIN → `_staging`（不占版本号）→ ACCEPT → 显式 promote 到 `models/`。
+MODELS_DIR_PROD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+MODELS_DIR_DEFAULT = os.path.join(MODELS_DIR_PROD, "_staging")
 
 # 类别顺序即模型输出列序（契约）
 ONSET_NAMES = ["no_onset", "onset"]
@@ -161,11 +172,24 @@ def main() -> None:
                     help="特征集：base = STATE_FEATURE_COLS(27)；"
                          "l1 = base + L1_FEATURE_COLS（量价/点差 6 列）。"
                          "默认 base（与既有 onset 模型契约一致，零变化）")
+    ap.add_argument("--oof-out", default=None, dest="oof_out",
+                    help="【P2】把 OOF 预测落盘 CSV（open_time / y / oof）——"
+                         "供**经济分层验收**（置信度分桶 × 实际前视边际）使用。"
+                         "不落盘则无法在训练后复核「置信度是否有经济含义」。")
     ap.add_argument("--seeds", type=int, default=5, help="最终模型 bagging 种子数")
     ap.add_argument("--splits", type=int, default=5, help="时序 OOF 折数")
+    ap.add_argument("--gap", type=int, default=None,
+                    help="训练/验证折之间丢弃的 bar 数（消除前瞻标签在折边界的重叠）。"
+                         "默认 = lead（onset）或 12（vol）；0 = 旧行为（含泄漏）。")
     ap.add_argument("--outdir", default=MODELS_DIR_DEFAULT)
     ap.add_argument("--report", default=None)
     args = ap.parse_args()
+
+    # 【2026-09-19 晋升纪律守卫】显式指向生产目录时**必须可见**（同 `train_state_model`）：
+    # 该目录是容器 `/app/review_models` 的 bind mount 源 ⇒ 写入即被 `max(version)` 采纳。
+    if os.path.abspath(args.outdir) == os.path.abspath(MODELS_DIR_PROD):
+        print("[warn] --outdir 指向**生产模型目录** ⇒ 产物会被立刻采纳。"
+              "建议用默认 `_staging`，验收后再显式晋升。")
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -228,7 +252,12 @@ def main() -> None:
                                   n_jobs=-1, verbose=-1, **tsm.DEFAULTS)
 
     # ── 时序 OOF：用于无偏评估与阈值标定 ──
-    tss = TimeSeriesSplit(n_splits=args.splits)
+    # 【2026-09-19 泄漏修复】训练/验证折之间丢弃 `_gap` 根：标签是**前瞻**的
+    #   （onset 看 `lead` 根、vol 看 12 根），而 `TimeSeriesSplit` 默认两折首尾相接
+    #   ⇒ 训练折末尾的标签用到了验证折开头的价格 ⇒ 折边界标签重叠（轻度泄漏）。
+    _gap = (int(args.gap) if args.gap is not None
+            else (int(args.lead) if args.target == "onset" else 12))
+    tss = TimeSeriesSplit(n_splits=args.splits, gap=_gap)
     oof = np.full(len(ys), np.nan)
     for tr, te in tss.split(X):
         if len(np.unique(ys[tr])) < 2:
@@ -252,6 +281,36 @@ def main() -> None:
         print(f"    thr={c['thr']:.4f}  P={c['precision']:.3f}  R={c['recall']:.3f}  "
               f"F1={c['f1']:.3f}  触发={c['on_rate']:.1%}")
 
+    # ── 【P2 2026-09-19】校准 + conformal（"波动路由 + 弃权"的两块产物）──────────
+    # 为什么二分类也要这两块：
+    #   · 路由要把 `P(波动扩张)` 与阈值比较 ⇒ 必须**校准后**才可比（未校准的尺度会漂移）；
+    #   · 弃权要"预测集合为单例才有 ≤α 的分布无关保证"。
+    # 实现复用 `train_state_model` 的两个纯函数（**不在此另写一份**）：
+    #   多分类的 conformal 需要 (n,k) 概率矩阵 ⇒ 这里把二分类拼成 2 列再复用。
+    _p2 = np.column_stack([1.0 - oof[cov], oof[cov]])
+    calib = tsm.fit_binary_prob_calibrator(oof[cov], ys[cov])
+    conf = tsm.conformal_quantiles(_p2, ys[cov])
+    print("\n===== 校准（OOF；isotonic 正类概率）=====")
+    print(f"  ECE   {calib['ece_raw']:.4f} → 样本内 {calib['ece_cal']:.4f}"
+          f" → **交叉拟合 {calib.get('ece_cal_cv', float('nan')):.4f}**")
+    print(f"  Brier {calib['brier_raw']:.4f} → {calib['brier_cal']:.4f}")
+    print("===== conformal（OOF；集合为单例 ⇒ 可决策，错误率 ≤ α）=====")
+    for _a, _v in conf.items():
+        if isinstance(_v, dict):
+            print(f"  alpha={_a}: 阈值={_v['thr']:.4f} 覆盖率={_v['coverage']:.1%} "
+                  f"单例率={_v['singleton_rate']:.1%} 单例准确率={_v['singleton_acc']}")
+
+    if args.oof_out:
+        pd.DataFrame({
+            "open_time": df["open_time"].iloc[idx][cov].to_numpy(),
+            "y": ys[cov],
+            "oof": oof[cov],
+            # 校准后的 P(y=1)：用 meta 里的 (x, y) 阈值对线性插值复现
+            # （与推理侧 `state_infer.apply_calibrator` 同一算法，避免两份实现漂移）
+            "oof_cal": np.interp(oof[cov], np.asarray(calib["x"]),
+                                 np.asarray(calib["y"])),
+        }).to_csv(args.oof_out, index=False)
+        print(f"[out] OOF: {args.oof_out}")
     # ── 最终 bagging 模型（全量训练）──
     os.makedirs(args.outdir, exist_ok=True)
     paths, imp = [], np.zeros(len(cols))
@@ -285,8 +344,17 @@ def main() -> None:
         "eval_oof": {"auc": auc, **{k: float(v) for k, v in best.items()}},
         "pr_curve": thr_info["curve"],
         "feature_importance": {c: float(v) for c, v in zip(cols, imp)},
+        # 【P2 2026-09-19】"波动路由 + 弃权"的两块产物。消费方：
+        #   `signal_tower/state_infer.py`（`load_vol_models` / `load_onset_models`）。
+        # **缺这两块 ⇒ 该模型不支持弃权/校准路由**（增量能力恒为关闭，不改既有行为）。
+        "calibration": calib,
+        "conformal": conf,
     }
-    meta_path = os.path.join(args.outdir, f"lgbm_onset_{args.tf}_v{args.version}_meta.json")
+    # ⚠ meta 文件名随 `--target` 变化（P2 修复：此前写死 `lgbm_onset_`，
+    #   训 vol 会覆盖 onset 的 meta ⇒ `load_onset_models` 静默读到 vol 的阈值）。
+    #   `--target onset` 下生成名与修复前**逐字相同** ⇒ 向后兼容、零变化。
+    meta_path = os.path.join(
+        args.outdir, f"lgbm_{args.target}_{args.tf}_v{args.version}_meta.json")
     with open(meta_path, "w", encoding="utf-8") as fh:
         json.dump(meta, fh, ensure_ascii=False, indent=2)
     print(f"\n[out] {len(paths)} models + meta → {args.outdir}")

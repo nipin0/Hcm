@@ -618,10 +618,14 @@ async def write_klines_to_pg(pool, rates, symbol, timeframe_str, broker_utc_offs
         # broker_utc_offset_s 非网格整数倍造成的 H4/D1 错位（详见 _align_bar_open_epoch）。
         snapped_epoch, dev = _align_bar_open_epoch(raw_epoch, bar_sec)
         if dev > ALIGN_WARN_SECONDS:
-            log.warning(
-                "K-line open_time misaligned (%s %s): raw=%s dev=%ss -> snapped=%s",
-                symbol, timeframe_str, raw_epoch, dev, snapped_epoch,
-            )
+            _mk = (symbol, timeframe_str)
+            _tnow = time.time()
+            if _tnow - _misalign_last_log.get(_mk, 0.0) >= _MISALIGN_LOG_INTERVAL:
+                _misalign_last_log[_mk] = _tnow
+                log.warning(
+                    "K-line open_time misaligned (%s %s): raw=%s dev=%ss -> snapped=%s",
+                    symbol, timeframe_str, raw_epoch, dev, snapped_epoch,
+                )
         ts = datetime.fromtimestamp(snapped_epoch, tz=timezone.utc)
         # 仅跳过 open_time 严格属于未来的棒（经纪商时钟超前 / 周期边界预生成下一根）；
         # 正在形成的棒 open_time 在过去，正常写入。+10s 容忍极小时钟抖动。
@@ -945,8 +949,13 @@ CLOSE_CONFIG_DEFAULTS: dict[str, float] = {
     #   trail_start≈7.7 ≥ TP距 7.65，行情暴跌到 4029.56 仍按固定 TP 平，漏掉 3.2 点）。
     "close.trail_start_tp_ratio": 0.5,
     # tp_relay_enabled: 移动止盈接力 TP 追利开关（2026-07-23）。
-    #   True → 盈利超过 trail_start 后 TP 同步前移(锁 50% 盈利 + trail_wide 缓冲)接力追利；
+    #   True → 盈利超过 trail_start 后 TP 同步前移(锁 50% 盈利 + **tp_trail_wide** 缓冲)接力追利；
     #   False → 仅 SL 移动保本/追利, TP 保持开仓原值不变。
+    #   ⚠ 【2026-09-21 注释更正】原文写的是「trail_wide 缓冲」，**与实际代码不符** ——
+    #     TP 接力用的是 **`tp_trail_wide`**（= ATR × close.tp_trail_wide_atr_mult，见 :5411/:5608），
+    #     而 `trail_wide`（= ATR × close.trail_wide_atr_mult，见 :5386/:5596）是**移动止损线宽**。
+    #     两者是两个独立键：一个挂在 **TP** 上、一个挂在 **SL** 上，取值本就不必相同
+    #     （europe 实际为 0.6 / 0.8）。原文措辞会让人误以为同一个键，故更正。
     "close.tp_relay_enabled": True,
     # tp_trail_wide_atr_mult: 承接 TP 追利时, TP 跟随现价前移的缓冲(ATR 倍数)。
     #   TP 保持在价格前方该距离(tick.bid + buf / tick.ask - buf), 价格涨过原 TP 后
@@ -1641,6 +1650,10 @@ def place_mt5_order(mt5, signal_data, symbol, timeframe_str, redis_conn=None):
         "code": 0, "message": "ok", "mt5_ticket": result.order,
         "filled_price": result.price, "volume": result.volume,
         "sl": sl, "tp": tp,
+        # 【2026-09-17】回传**实际写入 MT5 的 magic**（含显式 0 与默认 123456），
+        # 供开仓落库写 `hcm_trading.positions.magic`（风控「同向保本闸门」按 magic 族
+        # 判定保本后可追单，见 rule_chain._magic_family / _check_cooldown）。
+        "magic": magi,
     }
 
 
@@ -1863,8 +1876,8 @@ async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
                     result.get("sl", 0.0), result.get("tp", 0.0))
                 await conn.execute("""
                     INSERT INTO hcm_trading.positions
-                    (account_id, symbol, direction, open_price, current_price, lot, sl, tp, mt5_ticket, open_time, signal_id, order_id)
-                    VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,now(),$9,$10)
+                    (account_id, symbol, direction, open_price, current_price, lot, sl, tp, mt5_ticket, open_time, signal_id, order_id, magic)
+                    VALUES ($1,$2,$3,$4,$4,$5,$6,$7,$8,now(),$9,$10,$11)
                 """, _exec_account, msg_symbol,
                      msg_data.get("direction", "BUY"),
                      _open_price,
@@ -1872,7 +1885,8 @@ async def _execute_signal(pool, mt5, redis_conn, msg_data: dict,
                     result.get("sl", 0.0),
                     result.get("tp", 0.0),
                     result.get("mt5_ticket"),
-                    sid, _oid)
+                    sid, _oid,
+                    int(result.get("magic", 0) or 0))
             # P3 归因修复：建立 ticket→signal_id 映射，供平仓对账找回 signal_id
             # MT5 持仓对象无 signal_id 属性，UPSERT 路径会丢；Redis 映射与开仓路径无关
             _ticket = result.get("mt5_ticket")
@@ -4746,48 +4760,159 @@ def _rev_seen(redis_conn, tag: str, ticket: int, ts) -> bool:
 
 
 async def _rev_log_adjust(pool, acct, ticket, sym, direction, entry, cur,
-                          old_sl, new_sl, atr, score, cutoff, is_rev, mode):
-    """【P3 2026-09-04】记录一次 SL 调整，供后续反事实归因。
+                          old_sl, new_sl, atr, score, cutoff, is_rev, mode,
+                          tp=0.0):
+    """【P3 2026-09-04；0052 2026-09-21 补 tp】记录一次 SL 调整，供后续反事实归因。
 
     只写入、绝不干预交易；任何异常仅告警，不向上传播（失败安全）。
+
+    【2026-09-21 0052 为什么加 `tp`】反事实口径 v2（`_rev_settle_closed`）需要在
+    「old_sl vs tp」之间做**首触赛跑**才能给出双向结论（saved / **killed**）。
+    v1 没记 tp ⇒ 只能单边判「会不会在 old_sl 被止损」⇒ `delta` 几乎恒 >= 0
+    ⇒ `verdict='killed'` **结构性不可达**（实测全期 killed = 0 条）。
+    三处调用点均已传 `pos.tp`；缺省 0.0 = 未设止盈（赛跑退化为单边，但不影响写库）。
     """
     try:
         dd = (abs(float(cur) - float(entry)) / float(atr)) if atr else 0.0
+        _tp = float(tp or 0)
         async with pool.acquire() as conn:
             await conn.execute(
                 "INSERT INTO hcm_ai.reversal_attribution "
                 "(account_id, ticket, symbol, direction, entry_price, price_at_adj, "
-                " old_sl, new_sl, atr, score, cutoff, is_reversal, mode, dd_atr) "
-                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                " old_sl, new_sl, atr, score, cutoff, is_reversal, mode, dd_atr, tp) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
                 int(acct), int(ticket), sym, direction,
                 float(entry), float(cur), float(old_sl), float(new_sl),
                 float(atr), float(score), float(cutoff), bool(is_rev),
-                str(mode), float(dd),
+                str(mode), float(dd), (_tp if _tp > 0 else None),
             )
     except Exception as e:
         log.warning("[REV] attribution insert failed ticket=%s: %s", ticket, e)
 
 
-async def _rev_settle_closed(mt5, pool, open_tk: set):
-    """【P3 2026-09-04】结算已平仓持仓的反事实归因。
+# 【2026-09-21 0052】反事实口径 v2 的口径常量。
+# 视界 H：赛跑窗口 = [adj_ts, adj_ts + H]，**与"被评估的动作"无关**（修 v1 的截断偏差）。
+# 为什么必须固定视界：v1 用 `deal_time`（实际平仓时刻）作右端，而"收紧止损"这个被评估的
+#   动作本身就会让平仓提前 ⇒ 窗口被动作自己截断 ⇒ 价格来不及走到 old_sl ⇒ delta=0。
+#   实测 v1：mode='act' 共 29 行，delta 非零者 **0** 条。
+_REV_CF_HORIZON_H = 12.0
+_REV_CF_BASIS = "v2_race"
+
+
+def _rev_cf_decide(t_sl, t_tp, old_sl, tp_px, exit_px):
+    """反事实 v2 的**决策**部分（纯函数，零 IO）。
+
+    返回 `(cf_exit, cf_touch, ambiguous)`：
+      old_sl 与 tp 同 bar 双触 → (old_sl, 'both_same_bar', True)  # 同 bar 无法定序，不冒充方向
+      先触 old_sl（或 tp 未设） → (old_sl, 'sl', False)
+      先触 tp                  → (tp_px,  'tp', False)           # ← 这一支让 `killed` 可达
+      视界内都未触及            → (exit_px, 'none', False)        # 视作动作无影响 ⇒ delta=0
+
+    ⚠ 为什么抽成**纯函数**：这是"评估装置的判定口径"本身。v1 把它埋在
+    `_rev_settle_closed` 的 SQL 与分支里，既无法离线穷举、也无法独立验证
+    —— 一个不可验证的评估器，等于没有评估能力。抽出来后 `verify_reversal_cf.py`
+    可对全部取值组合做表驱动断言。
+    """
+    if t_sl is not None and t_tp is not None and t_sl == t_tp:
+        return old_sl, "both_same_bar", True
+    if t_sl is not None and (t_tp is None or t_sl < t_tp):
+        return old_sl, "sl", False
+    if t_tp is not None:
+        return tp_px, "tp", False
+    return exit_px, "none", False
+
+
+def _rev_cf_verdict(realized, cf_exit, entry_px, sign, ambiguous):
+    """由反事实出场价得出 `(cf_pnl, delta, verdict)`（纯函数，零 IO）。
+
+    `delta = realized - cf_pnl`（价格差口径，**未乘手数**）：
+      >0 → 'saved'（动对了）/ <0 → 'killed'（**动错了**）/ =0 → 'neutral'
+      ambiguous=True → delta 记 0 且 verdict='ambiguous'（同 bar 无法定序，不冒充方向）
+
+    ⚠ 抽成纯函数的理由同 `_rev_cf_decide`：v1 里这段与 SQL 混在一起，
+    `verdict` 只有 saved/neutral 可达而无人察觉（killed 全期 0 条）。
+    """
+    cf_pnl = (cf_exit - entry_px) * sign
+    delta = realized - cf_pnl
+    if ambiguous:
+        return cf_pnl, 0.0, "ambiguous"
+    if delta > 1e-6:
+        return cf_pnl, delta, "saved"
+    if delta < -1e-6:
+        return cf_pnl, delta, "killed"
+    return cf_pnl, delta, "neutral"
+
+
+async def _rev_cf_race(conn, sym, direction, old_sl, tp_px, adj_ts, win_end):
+    """反事实 v2 的**取数**部分：固定视界 [adj_ts, win_end] 内 old_sl 与 tp 的首触时刻。
+
+    返回 `(t_sl, t_tp)`，各自可能为 None（该视界内未触及）。
+
+    为什么视界是 `[adj_ts, adj_ts + H]` 而**不是** `[adj_ts, deal_time]`：
+      v1 用后者（"调整 → 平仓"），而 `deal_time` 是**被评估的动作自己**改变的
+      —— 收紧止损会让平仓提前 ⇒ 窗口被截断 ⇒ 价格来不及走到 old_sl
+      ⇒ `cf_exit = exit_px` ⇒ delta 恒 0。实测：`mode='act'` 共 29 行，非零 delta **0** 条。
+      改用与动作无关的固定视界后，反事实路径才完整可见。
+    """
+    if direction == "BUY":
+        _sl_cond, _tp_cond = "low <= $3", "high >= $4"
+    else:
+        _sl_cond, _tp_cond = "high >= $3", "low <= $4"
+    # tp 未设（传 None）时 `high >= NULL` 为 NULL ⇒ FILTER 不计数 ⇒ t_tp = NULL
+    # ⇒ 赛跑自动退化为单边（与 v1 等效，但不会写出假结论）。
+    q = ("SELECT MIN(open_time) FILTER (WHERE " + _sl_cond + ") AS t_sl, "
+         "       MIN(open_time) FILTER (WHERE " + _tp_cond + ") AS t_tp "
+         "FROM hcm_market.klines "
+         "WHERE symbol=$1 AND time_frame='M5' "
+         "  AND open_time >= $2 AND open_time <= $5")
+    row = await conn.fetchrow(q, sym, adj_ts, old_sl,
+                              (tp_px if (tp_px and tp_px > 0) else None), win_end)
+    if not row:
+        return None, None
+    return row["t_sl"], row["t_tp"]
+
+
+async def _rev_settle_closed(mt5, pool, open_tk: set, redis_conn=None):
+    """【P3 2026-09-04；口径 v2 2026-09-21】结算已平仓持仓的反事实归因。
 
     对每条未结算记录：若 ticket 已不在当前持仓中，说明已平仓 →
       实际盈亏 = (平仓价 - 开仓价) × 方向符号
-      反事实   = 假设保持 old_sl：用「调整 → 平仓」区间的 M5 极值判断是否会被触及
-                 触及 → 反事实在 old_sl 止损；未触及 → 持仓继续，以实际平仓价离场
-      delta    = 实际 - 反事实（>0 表示反转头净贡献为正 = 减亏/增利）
+      反事实(v2) = 「若 SL 保持 old_sl」，自 adj_ts 起在**视界 H** 内做**首触赛跑**：
+          先触及 old_sl  → cf_exit = old_sl                     （动对了：避开更深的止损）
+          先触及 tp      → cf_exit = tp                         （**动错了**：被提前扫出、错过止盈）
+          同 bar 双触    → cf_exit = old_sl，verdict='ambiguous' （同 bar 无法定序，不冒充方向）
+          视界内均未触及 → cf_exit = exit_px ⇒ delta=0，cf_touch='none'（视作动作无影响）
+      delta = 实际 - 反事实（>0 = saved 减亏/增利；**<0 = killed 误杀**）
+      ⇒ 第二支（tp）就是 v1 缺失的那一半，使 `killed` 可达（修 0052 缺陷 2）。
+
+    ⚠ **只在 `adj_ts + H` 已过时才结算该行**：保证赛跑窗口内 K 线完整。
+      代价 = 结算相对平仓**滞后 H**（"可评估性换时效性"；H 由 ai.rev.cf_horizon_hours 控制）。
+      v1 无此门 ⇒ 窗口常被截断 ⇒ act 行 delta 恒 0。落后平仓更久总比结论恒 0 有用。
+
+    ⚠ v2 下 `mode='log'/'log_skip'`（**未行动**）行的 SL 本就等于 old_sl
+      ⇒ 实际出场即反事实出场 ⇒ **delta 恒 0** ⇒ 主指标自动只反映 act 行（修缺陷 3）。
 
     open_tk：调用方已获取的当前持仓 ticket 集合（避免重复调用 MT5）。
+    redis_conn：可选，仅用于读 ai.rev.cf_horizon_hours（缺省用模块常量）。
     """
+    H = _REV_CF_HORIZON_H
+    if redis_conn is not None:
+        try:
+            H = float(_rev_float_cfg(redis_conn, "ai.rev.cf_horizon_hours", H))
+        except Exception:
+            pass
+    if H <= 0:
+        H = _REV_CF_HORIZON_H
     try:
         async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT id, ticket, symbol, direction, entry_price, old_sl, "
-                "       new_sl, adj_ts "
+                "       new_sl, tp, adj_ts "
                 "FROM hcm_ai.reversal_attribution "
                 "WHERE account_id=$1 AND closed_ts IS NULL "
+                "  AND adj_ts <= now() - make_interval(secs => $2) "
                 "ORDER BY adj_ts LIMIT 50",
-                int(ACCOUNT_ID_MODE))
+                int(ACCOUNT_ID_MODE), float(H) * 3600.0)
     except Exception as e:
         log.warning("[REV] attribution fetch failed: %s", e)
         return
@@ -4812,48 +4937,39 @@ async def _rev_settle_closed(mt5, pool, open_tk: set):
             sym = r["symbol"] or "XAUUSD"
             entry_px = float(r["entry_price"] or 0)
             old_sl = float(r["old_sl"] or 0)
+            tp_px = float(r["tp"] or 0)
             adj_ts = r["adj_ts"]
             sign = 1.0 if direction == "BUY" else -1.0
             realized = (exit_px - entry_px) * sign
-            # ② 反事实：区间 M5 极值 vs old_sl
-            cf_exit = exit_px
+            # ② 反事实 v2：固定视界 [adj_ts, adj_ts+H] 内 old_sl 与 tp 的**首触赛跑**
+            #   （取数 _rev_cf_race / 判定 _rev_cf_decide 均已抽出，见上：口径必须可独立验证）
+            cf_exit, cf_touch, cf_ambiguous = exit_px, "none", False
             if old_sl > 0:
                 try:
-                    if deal_time is not None:
-                        q = ("SELECT MIN(low) AS lo, MAX(high) AS hi "
-                             "FROM hcm_market.klines "
-                             "WHERE symbol=$1 AND time_frame='M5' "
-                             "AND open_time >= $2 AND open_time <= $3")
-                        args = (sym, adj_ts, deal_time)
-                    else:
-                        q = ("SELECT MIN(low) AS lo, MAX(high) AS hi "
-                             "FROM hcm_market.klines "
-                             "WHERE symbol=$1 AND time_frame='M5' AND open_time >= $2")
-                        args = (sym, adj_ts)
+                    win_end = datetime.fromtimestamp(
+                        adj_ts.timestamp() + float(H) * 3600.0, tz=timezone.utc)
                     async with pool.acquire() as c2:
-                        row = await c2.fetchrow(q, *args)
-                    if row:
-                        lo = float(row["lo"]) if row["lo"] is not None else None
-                        hi = float(row["hi"]) if row["hi"] is not None else None
-                        if direction == "BUY" and lo is not None and lo <= old_sl:
-                            cf_exit = old_sl
-                        elif direction == "SELL" and hi is not None and hi >= old_sl:
-                            cf_exit = old_sl
+                        t_sl, t_tp = await _rev_cf_race(
+                            c2, sym, direction, old_sl, tp_px, adj_ts, win_end)
+                    cf_exit, cf_touch, cf_ambiguous = _rev_cf_decide(
+                        t_sl, t_tp, old_sl, tp_px, exit_px)
                 except Exception:
                     pass
-            cf_pnl = (cf_exit - entry_px) * sign
-            delta = realized - cf_pnl
-            verdict = ("saved" if delta > 1e-6
-                       else ("killed" if delta < -1e-6 else "neutral"))
+            cf_pnl, delta, verdict = _rev_cf_verdict(
+                realized, cf_exit, entry_px, sign, cf_ambiguous)
             async with pool.acquire() as c3:
                 await c3.execute(
                     "UPDATE hcm_ai.reversal_attribution SET closed_ts=now(), "
                     "exit_price=$1, realized_pnl=$2, cf_exit_price=$3, cf_pnl=$4, "
-                    "delta=$5, verdict=$6 WHERE id=$7",
-                    exit_px, realized, cf_exit, cf_pnl, delta, verdict, int(r["id"]))
-            log.info("[REV] settle ticket=%s %s exit=%.2f realized=%.2f "
-                     "cf=%.2f delta=%.2f (%s)",
-                     tk, direction, exit_px, realized, cf_pnl, delta, verdict)
+                    "delta=$5, verdict=$6, cf_touch=$7, cf_horizon_h=$8, cf_basis=$9 "
+                    "WHERE id=$10",
+                    exit_px, realized, cf_exit, cf_pnl, delta, verdict,
+                    cf_touch, float(H), _REV_CF_BASIS, int(r["id"]))
+            log.info("[REV] settle ticket=%s %s exit=%.2f@%s realized=%.2f "
+                     "cf=%.2f delta=%.2f (%s touch=%s H=%.1fh)",
+                     tk, direction, exit_px,
+                     (deal_time.strftime("%m-%d %H:%M") if deal_time else "?"),
+                     realized, cf_pnl, delta, verdict, cf_touch, H)
         except Exception as e:
             log.warning("[REV] settle failed ticket=%s: %s", tk, e)
 
@@ -4870,7 +4986,8 @@ async def _rev_apply_verdicts(mt5, redis_conn, pool):
     # 避免重复调用 MT5）。刻意放在 enabled 判断之前：即使反转头被禁用，
     # 历史调整记录也必须闭环结算，否则归因样本永远残缺。
     try:
-        await _rev_settle_closed(mt5, pool, {int(p.ticket) for p in positions})
+        await _rev_settle_closed(mt5, pool, {int(p.ticket) for p in positions},
+                                 redis_conn=redis_conn)
     except Exception as _se:
         log.warning("[REV] settle loop failed: %s", _se)
     if not _rev_bool_cfg(redis_conn, "ai.rev.enabled", False):
@@ -4904,7 +5021,8 @@ async def _rev_apply_verdicts(mt5, redis_conn, pool):
                             entry=_entry, cur=_cur,
                             old_sl=float(getattr(pos, "sl", 0) or 0), new_sl=_nsl,
                             atr=_atr, score=score, cutoff=cutoff,
-                            is_rev=is_rev, mode="log")
+                            is_rev=is_rev, mode="log",
+                            tp=float(getattr(pos, "tp", 0) or 0))
                     except Exception as _le:
                         log.warning("[REV] shadow attribution failed ticket=%s: %s",
                                     ticket, _le)
@@ -5020,7 +5138,8 @@ async def _rev_apply_verdicts(mt5, redis_conn, pool):
                             pool, int(ACCOUNT_ID_MODE), ticket, sym, direction,
                             entry=entry, cur=cur, old_sl=cur_sl, new_sl=new_sl,
                             atr=atr, score=score, cutoff=cutoff,
-                            is_rev=is_rev, mode="log_skip")
+                            is_rev=is_rev, mode="log_skip",
+                            tp=float(getattr(pos, "tp", 0) or 0))
                     except Exception as _sk:
                         log.warning("[REV] skip attribution failed ticket=%s (%s): %s",
                                     ticket, _skip, _sk)
@@ -5048,7 +5167,8 @@ async def _rev_apply_verdicts(mt5, redis_conn, pool):
                 await _rev_log_adjust(
                     pool, int(ACCOUNT_ID_MODE), ticket, sym, direction,
                     entry=entry, cur=cur, old_sl=cur_sl, new_sl=new_sl,
-                    atr=atr, score=score, cutoff=cutoff, is_rev=is_rev, mode=mode)
+                    atr=atr, score=score, cutoff=cutoff, is_rev=is_rev, mode=mode,
+                    tp=float(getattr(pos, "tp", 0) or 0))
             except Exception as _ae:
                 log.warning("[REV] attribution log failed ticket=%s: %s", ticket, _ae)
         except Exception as e:
@@ -5133,6 +5253,47 @@ def _fsm_magic_logic(magic) -> str:
     except (TypeError, ValueError):
         return ""
     return "osc" if _v == 61 else "trend" if _v == 62 else ""
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 【2026-09-17】Magic 族（前导逻辑码）—— 与风控共用**同一实现文件**
+#   族公式的唯一实现在 `shared/magic_family.py`（风控容器经 compose 挂载导入）。
+#   本处按**绝对路径** importlib 加载同一文件（模式同 `_state_strategy_mod`），
+#   从而"同一条规则两份实现"不会发生（铁律第十三章）。
+#   降级：加载失败 → `_magic_family` 返回 0 ⇒ **不写**族级保本键 ⇒ 风控自动回退
+#   查 PG 真值源（语义不受损，只是慢一点）。绝不静默改变任何保本判定。
+# ══════════════════════════════════════════════════════════════════════════
+def _magic_family_mod():
+    """按路径惰性加载 shared/magic_family.py（只加载一次；失败缓存 None）。"""
+    if "mf" not in _SS_CACHE:
+        try:
+            import importlib.util as _ilu
+            import sys as _sys
+            _p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "shared", "magic_family.py")
+            _sp = _ilu.spec_from_file_location("magic_family", _p)
+            _m = _ilu.module_from_spec(_sp)
+            # 必须先注册 sys.modules 再 exec_module（同 `_state_strategy_mod` 的教训：
+            # 模块内若有 dataclass/注解解析会去查 sys.modules[cls.__module__]）。
+            _sys.modules.setdefault("magic_family", _m)
+            _sp.loader.exec_module(_m)
+            _SS_CACHE["mf"] = _m
+        except Exception as _e:  # noqa: BLE001
+            log.warning("magic_family 加载失败（不写族级保本键，风控回退查库）：%s", _e)
+            _SS_CACHE["mf"] = None
+    return _SS_CACHE["mf"]
+
+
+def _magic_family(magic) -> int:
+    """magic → 族（前导逻辑码）。0 = 未知/加载失败（调用方据此跳过族级键写入）。"""
+    _m = _magic_family_mod()
+    if _m is not None:
+        try:
+            return int(_m.magic_family(magic))
+        except Exception:  # noqa: BLE001
+            return 0
+    return 0
+
 
 # 【§57-12.3-2】箱体突破"立即离场"的**重试节流**（ticket → 上次尝试时刻）。
 # 为什么需要：塔在破界持续期间**每根 bar 都会重发** exit_now（这是对的——我们要出去），
@@ -5308,11 +5469,26 @@ async def _update_trailing_stops(mt5, redis_conn, pool):
                             try:
                                 _ct = (mt5.ORDER_TYPE_SELL if pos.type == 0
                                        else mt5.ORDER_TYPE_BUY)
+                                # 【2026-09-17 修复 D1：实盘 343 次失败 / 0 次成功】
+                                # 本请求原先**缺 `type_filling`**（且无 deviation/type_time/
+                                # magic/comment）⇒ 券商直接回 `retcode=10030 INVALID_FILL`
+                                # ⇒ 箱体破界止损（§57-12.3-2）**从未真正平过仓**：
+                                #   实测主号桥日志 343 失败 / 0 成功；01:15 那笔箱体空单本应
+                                #   01:20 离场（价≈4301），实际硬扛到 01:32 被会话 SL 打掉 -16.26。
+                                # 口径对齐：本文件**其余 5 处** order_send 全部显式带
+                                #   `type_filling _mt5_global.ORDER_FILLING_IOC`
+                                #   （:1626 / :2039 / :2385 / :2450 / :2976），**唯此处漏**
+                                #   ⇒ 此处补齐即可，不引入新口径（不新增配置键）。
                                 _r = mt5.order_send({
                                     "action": mt5.TRADE_ACTION_DEAL,
                                     "position": pos.ticket, "symbol": pos.symbol,
                                     "volume": pos.volume, "type": _ct,
                                     "price": tick.bid if pos.type == 0 else tick.ask,
+                                    "deviation": 50,
+                                    "magic": pos.magic,
+                                    "comment": "HCM_FSM_BAND_BREAK",
+                                    "type_time": _mt5_global.ORDER_TIME_GTC,
+                                    "type_filling": _mt5_global.ORDER_FILLING_IOC,
                                 })
                                 if _r and _r.retcode == 10009:
                                     log.warning(
@@ -5396,7 +5572,8 @@ async def _update_trailing_stops(mt5, redis_conn, pool):
                             log.info(f"#{pos.ticket} FSM clamp: cand={candidate}→{_c2} 过近"
                                      f"（min_dist={_fsm_min_dist:.2f}）→ 跳过本次移动")
                             candidate = pos.sl or 0.0
-                    # 移动止盈接力 TP 追利: TP 同步前移, 锁 50% 盈利 + trail_wide 缓冲
+                    # 移动止盈接力 TP 追利: TP 同步前移, 锁 50% 盈利 + tp_trail_wide 缓冲
+                    # （⚠ 用 tp_trail_wide，**不是** trail_wide；后者是移动止损线宽，见 :5386）
                     if tp_relay_enabled:
                         # 承接 TP 追利: TP 跟随现价前移, 保持在价格前方 tp_trail_wide 缓冲,
                         # 价格涨过原 TP 后继续承接趋势奔跑; 价格回落时棘轮不回退(只进不退)。
@@ -5855,6 +6032,12 @@ def _write_be_flags(mt5, redis_conn) -> None:
                 pass
         return
     _latest: dict[str, tuple] = {}
+    # 【2026-09-17 族级保本标志】`hcm:pos:be:{acct}:{dir}:{fam}` —— 供风控「同向保本闸门」
+    # 毫秒级读取；键语义与闸门口径一致：**同族最新一笔**持仓的保本状态。
+    # (dir, fam) → (time, be)；族由 `shared/magic_family.magic_family` 计算（单一实现）。
+    # flat 时不主动清族级键：靠 TTL(15s) 自然过期即可 —— 残留 "1" 在无持仓时无害
+    # （闸门在"无同族持仓"本就放行），避免为此每轮 SCAN 键空间。
+    _fam_latest: dict[tuple, tuple] = {}
     # 【2026-08-25 symbol 级保本标志】hexp 极值护栏分层裁决需判断"该 symbol 是否有保本持仓"
     # （hexp 无 account_id，读不了账户级键）。聚合本桥各持仓的 symbol→dir→be：
     # 任一持仓达保本即该 symbol:dir 置 1，供 hexp 决定是否豁免极值硬封。
@@ -5873,6 +6056,12 @@ def _write_be_flags(mt5, redis_conn) -> None:
         _be = (_sl >= _entry - _be_tol) if _dir == "BUY" else (_sl <= _entry + _be_tol)
         if _t >= (_latest.get(_dir) or (0,))[0]:
             _latest[_dir] = (_t, _be)
+        # 族级：仅聚合"该族最新一笔"（族=0 表示未知/手动 → 不参与族级键）
+        _fam = _magic_family(getattr(_pos, "magic", 0))
+        if _fam:
+            _fk = (_dir, _fam)
+            if _t >= (_fam_latest.get(_fk) or (0,))[0]:
+                _fam_latest[_fk] = (_t, _be)
         # symbol 级：任一持仓达保本即置 True
         _sb = _sym_be.setdefault(_sym, {})
         if _be:
@@ -5887,6 +6076,18 @@ def _write_be_flags(mt5, redis_conn) -> None:
                 redis_conn.set(_key, "1", ex=15)
             else:
                 redis_conn.delete(_key)
+        except Exception:
+            pass
+    # 族级标志写入（TTL 15s）。与方向级同一语义取向：**只有"达保本"才置 "1"**，
+    # 未达保本 → delete（键缺失 ⇒ 风控回退 PG 真值源），绝不用"键缺失"表达"未保本"
+    # 而把 PG 真值源屏蔽掉。
+    for (_fd, _ff), (_ft, _fbe) in _fam_latest.items():
+        try:
+            _fkey = f"hcm:pos:be:{ACCOUNT_ID_MODE}:{_fd}:{_ff}"
+            if _fbe:
+                redis_conn.set(_fkey, "1", ex=15)
+            else:
+                redis_conn.delete(_fkey)
         except Exception:
             pass
     # symbol 级标志写入（TTL 15s，与账户级一致；hexp 读它做极值豁免判断）

@@ -42,40 +42,16 @@ ALERT_KEY = "hcm:ai:quality:calib_alert"
 GATE_MIN_LEVELS = int(os.environ.get("QUALITY_RECALIB_MIN_LEVELS", "8"))
 
 
-def _ece(y: np.ndarray, p: np.ndarray, bins: int = 10) -> float:
-    edges = np.linspace(0.0, 1.0, bins + 1)
-    tot = max(len(y), 1)
-    e = 0.0
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        m = (p >= lo) & (p < hi if hi < 1.0 else p <= hi)
-        if m.sum() == 0:
-            continue
-        e += (m.sum() / tot) * abs(float(p[m].mean()) - float(y[m].mean()))
-    return float(e)
-
-
-def _monotonicity(y: np.ndarray, p: np.ndarray, bins: int = 10) -> float:
-    q = pd.qcut(pd.Series(p), bins, labels=False, duplicates="drop")
-    xs, ys = [], []
-    for b in sorted(pd.unique(q.dropna())):
-        m = (q == b).values
-        if m.sum() < 3:
-            continue
-        xs.append(float(p[m].mean()))
-        ys.append(float(y[m].mean()))
-    if len(xs) < 3:
-        return 0.0
-    return float(np.corrcoef(xs, ys)[0, 1])
-
-
-def _fit_platt(raw: np.ndarray, y: np.ndarray) -> PlattCalibrator:
-    from sklearn.linear_model import LogisticRegression
-    _eps = 1e-6
-    _p = np.clip(np.asarray(raw, float), _eps, 1.0 - _eps)
-    z = np.log(_p / (1.0 - _p)).reshape(-1, 1)
-    lr = LogisticRegression(C=1e6, solver="lbfgs", max_iter=2000)
-    lr.fit(z, np.asarray(y).astype(int))
-    return PlattCalibrator(float(lr.coef_[0][0]), float(lr.intercept_[0]))
+# 【2026-09-21 去重】_ece / _monotonicity / _fit_platt 已抽到 _calib_common.py（唯一真源）。
+# 以别名 import，保持下方所有调用点（_ece / _monotonicity / _fit_platt）零改动。
+# 理由：本脚本与 review_recalibrate.py 此前**各复制了一份逐字节相同**的实现；
+#   两条链本应只在"数据源 + 写盘目标"上不同（ai_pred_raw vs review_log；
+#   ai.lm.*_calib_path vs models/review_*/calib_review_*.pkl），
+#   而**校准质量的评估口径必须一致** —— 否则两个 calib_health 键的差异无法归因
+#   （到底是数据差还是实现差）。
+from _calib_common import ece as _ece  # noqa: E402
+from _calib_common import fit_platt as _fit_platt  # noqa: E402
+from _calib_common import monotonicity as _monotonicity  # noqa: E402
 
 
 def _fit_calibrator(raw: np.ndarray, y: np.ndarray, method: str = "platt") -> NumpyCalibrator:
@@ -195,8 +171,19 @@ def _load_pred_raw(db_url: str, window_days: int) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["head", "raw_proba", "cal_p",
                                      "pred_class", "signal_id", "signal_dir"])
-    return pd.DataFrame(rows, columns=["head", "raw_proba", "cal_p",
-                                       "pred_class", "signal_id", "signal_dir"])
+    df = pd.DataFrame(rows, columns=["head", "raw_proba", "cal_p",
+                                     "pred_class", "signal_id", "signal_dir"])
+    # 【D4 2026-09-17 修复·在线校准链永久失败】
+    # 本函数直连 PG 取列，`s.signal_id` 是 **bigint ⇒ pandas 推断为 int64**；
+    # 而 `_load_labels()`（:152）显式把 labels.csv 的 signal_id 转成 **str**，
+    # 于是 :270 的 `raw.join(labels, on="signal_id")` 抛：
+    #   ValueError: You are trying to merge on int64 and str columns for key 'signal_id'
+    # ⇒ 本脚本**每天 exit=1、从未成功校准过一次**（日志 tools\quality_recalibrate.log 实证），
+    #   三头概率长期停留在旧校准器上 ⇒ 概率不可当胜率读。
+    # 修法：与 _load_labels 同口径，两侧都归一到 str（bigint→str 无损；不用 int 是因为
+    # labels.csv 侧可能含空/非数值行，转 str 更稳）。
+    df["signal_id"] = df["signal_id"].astype(str)
+    return df
 
 
 def _load_quality_cfg() -> dict:

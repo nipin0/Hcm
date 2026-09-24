@@ -3,6 +3,8 @@ import { Box, Chip, Paper, Typography } from '@mui/material';
 import {
   C, STATE_COLOR, STATE_CN, CLASS_CN, CLASS_KEYS, CLASS_LINE_COLOR, BOX_COLOR, UD,
   fmt, fmtSigned, tsShort,
+  // 【2026-09-17 面板口径修复】语义边界常量与 magic/倍率解码
+  EXEC_TAG, MODEL_TAG, decodeMagic, lotMultNote,
 } from './theme';
 import type { LiveResp, RiskResp } from './theme';
 
@@ -76,9 +78,20 @@ export const FsmCard = ({ live }: { live: LiveResp | null }) => {
   const pc = lv.predicted_class ?? null;
   return (
     <Card title="FSM 状态" badge={<SrcPill ok="full" />}
-          right={dv ? STATE_CN[state || ''] || '' : ''}>
+          right={dv ? `${STATE_CN[state || ''] || ''}${EXEC_TAG}` : ''}>
       <Box sx={{ mb: 1 }}><StateBadge state={state} /></Box>
-      <KV k="行情形态 predicted_class" v={pc ? `${CLASS_CN[pc] || pc}` : '—'} />
+      {/* 【2026-09-17 面板口径修复】state 与 predicted_class 必须并列且带来源：
+          二者的中文名会撞车（S1_OSC="震荡" 与 oscillation="震荡"），实测已两次误读
+          （"箱底开空"与"震荡首单 0.02"）。 */}
+      <KV k={`执行态 state${EXEC_TAG}`}
+          v={<Box component="span" sx={{ color: STATE_COLOR[state || ''] || C.text }}>
+            {state ? `${state}（${STATE_CN[state] || '-'}）` : '—'}
+          </Box>} />
+      <KV k={`模型分类 predicted_class${MODEL_TAG}`} v={pc ? `${CLASS_CN[pc] || pc}` : '—'} />
+      <Box sx={{ color: C.weak, fontSize: 10.5, mt: 0.4, mb: 0.6, lineHeight: 1.5 }}>
+        下单由 <b>state</b>（状态机）决定；<b>predicted_class</b> 只是模型 4 类概率的最大项，
+        <b>不驱动下单</b>，两者可不一致。
+      </Box>
       <KV k="防抖计数 pending_streak"
           v={Number(fsm.pending_streak) > 0
             ? <Box component="span" sx={{ color: C.warn }}>{fsm.pending_streak}</Box>
@@ -133,7 +146,7 @@ export const BoxCard = ({ live }: { live: LiveResp | null }) => {
   const mis = !!dv?.freeze_rule_misaligned;
   return (
     <Card title="箱体状态" badge={<SrcPill ok="full" />}
-          right={isOsc ? '震荡态 → 箱体有效' : '非 S1_OSC 震荡态'}>
+          right={isOsc ? '执行态 S1_OSC → 箱体有效' : `执行态 ${dv?.state ?? '—'} ≠ S1_OSC → 箱体冻结`}>
       {/* 启用/冻结：如实显示后端字段；UI 的"非 S1 置灰"是视觉规则，两者不一致时如实并列 */}
       <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.8, mb: 1, flexWrap: 'wrap' }}>
         <Chip size="small" label={frozen ? '冻结' : '启用'}
@@ -172,16 +185,29 @@ export const RiskCard = ({ live, risk }: { live: LiveResp | null; risk: RiskResp
   return (
     <Card title="持仓风控" badge={<SrcPill ok="full" />}
           right={`positions_open=${risk?.positions_open ?? 0}`}>
-      {pos ? (
-        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.8, mb: 1 }}>
-          <Chip size="small"
-                label={`${String(pos.direction).toUpperCase()} ${fmt(pos.lot, 2)} 手`}
-                sx={{ height: 20, fontSize: 11, fontWeight: 600,
-                      color: String(pos.direction).toUpperCase() === 'BUY' ? UD.long : UD.short,
-                      backgroundColor: `${String(pos.direction).toUpperCase() === 'BUY' ? UD.long : UD.short}22` }} />
-          {risk!.positions_open > 1 && (
-            <Box sx={{ color: C.weak, fontSize: 10.5 }}>共 {risk!.positions_open} 笔</Box>
-          )}
+      {risk?.positions?.length ? (
+        <Box sx={{ mb: 1 }}>
+          {risk.positions.map((p: any, i: number) => (
+            <Box key={p.mt5_ticket || i}
+                 sx={{ py: 0.6, borderBottom: i < risk.positions.length - 1 ? `1px dashed ${C.divider}` : 0 }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.8, mb: 0.4 }}>
+                <Chip size="small"
+                      label={`${String(p.direction).toUpperCase()} ${fmt(p.lot, 2)} 手`}
+                      sx={{ height: 20, fontSize: 11, fontWeight: 600,
+                            color: String(p.direction).toUpperCase() === 'BUY' ? UD.long : UD.short,
+                            backgroundColor: `${String(p.direction).toUpperCase() === 'BUY' ? UD.long : UD.short}22` }} />
+                <Box sx={{ color: C.weak, fontSize: 10.5 }}>#{p.mt5_ticket}</Box>
+              </Box>
+              {/* 【2026-09-17 面板口径修复】把"手数从哪来"摊开：magic 解码（61=震荡/62=趋势）
+                  + 信号子模式 + 阶梯倍率 ⇒ 0.02 手是"趋势单恒 1.0×"而非"震荡首单"，一眼可辨。 */}
+              <KV k="magic 解码" v={decodeMagic(p.magic)} />
+              <KV k="signal_mode / FSM 执行态"
+                  v={`${p.signal_mode || '—'} / ${p.fsm_state || '—'}`} />
+              <KV k="手数倍率依据"
+                  v={`×${p.fsm_lot_mult ?? '—'}　${lotMultNote(p.signal_mode, p.fsm_lot_mult)}`} />
+              {p.fsm_reason ? <KV k="触发原因" v={String(p.fsm_reason)} /> : null}
+            </Box>
+          ))}
         </Box>
       ) : (
         <Box sx={{ color: C.weak, fontSize: 12, mb: 1 }}>当前无持仓</Box>
@@ -249,7 +275,9 @@ export const DetailPanels = ({ live, probeBar }: { live: LiveResp | null; probeB
       {/* LGBM 模型面板 */}
       <Card title="LGBM 模型面板" badge={<SrcPill ok="partial" />}
             right={probeBar ? '回放 bar 值' : '实时快照'}>
-        <Box sx={{ color: C.weak, fontSize: 11, mb: 0.6 }}>4 类预测概率（proba）</Box>
+        <Box sx={{ color: C.weak, fontSize: 11, mb: 0.6 }}>
+          4 类预测概率（模型输出，<b>不驱动下单</b>）
+        </Box>
         {CLASS_KEYS.map((k) => {
           const v = proba ? Number(proba[k]) : NaN;
           const w = Number.isFinite(v) ? Math.max(0, Math.min(1, v)) * 100 : 0;
@@ -265,7 +293,7 @@ export const DetailPanels = ({ live, probeBar }: { live: LiveResp | null; probeB
           );
         })}
         <Box sx={{ mt: 1 }}>
-          <KV k="原始分类 predicted_class"
+          <KV k={`原始分类 predicted_class${MODEL_TAG}`}
               v={(probeBar?.predicted_class || lv.predicted_class)
                 ? CLASS_CN[probeBar?.predicted_class || lv.predicted_class]
                 : '—'} />
@@ -281,7 +309,7 @@ export const DetailPanels = ({ live, probeBar }: { live: LiveResp | null; probeB
 
       {/* 箱体参数面板 —— 非 S1_OSC 整块置灰 */}
       <Card title="箱体参数面板" badge={<SrcPill ok="full" />}
-            right={frozenByRule ? '非震荡态 → 冻结' : '震荡态'}>
+            right={frozenByRule ? '执行态≠S1_OSC → 冻结' : '执行态=S1_OSC'}>
         <Box sx={{ position: 'relative' }}>
           <Box sx={{ filter: frozenByRule ? 'grayscale(1)' : 'none', opacity: frozenByRule ? 0.42 : 1,
                      transition: 'opacity .2s' }}>
@@ -295,7 +323,7 @@ export const DetailPanels = ({ live, probeBar }: { live: LiveResp | null; probeB
             <KV k="box_frozen_at" v={ctx.box_frozen_at ? tsShort(ctx.box_frozen_at) : '—'} />
             <KV k="frozen_loss_count" v={ctx.frozen_loss_count ?? '—'} />
             <KV k="osc_round_active" v={String(ctx.osc_round_active ?? '—')} />
-            <KV k="震荡段箱体状态" v={isOsc ? '有效' : '已离开震荡态'} />
+            <KV k="执行态=S1_OSC 时箱体是否有效" v={isOsc ? '有效' : '否（已离开 S1_OSC）'} />
           </Box>
           {frozenByRule && (
             <Box sx={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center',

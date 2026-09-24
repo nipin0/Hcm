@@ -162,7 +162,7 @@ INSERT INTO hcm_config.metadata (config_key, category, subcategory, default_valu
 ('indicator_stoch_smooth', 'signal_tower', 'indicator', '3', 'int', 'Stochastic 平滑周期', '随机指标平滑周期', 'number', 219, 'global'),
 ('indicator_ma_short', 'signal_tower', 'indicator', '10', 'int', '短期均线周期', '短期均线(SMA)周期', 'number', 220, 'global'),
 ('indicator_ma_long', 'signal_tower', 'indicator', '30', 'int', '长期均线周期', '长期均线(SMA)周期', 'number', 221, 'global'),
-('range_bbw_max', 'signal_tower', 'regime', '1.0', 'float', '震荡 BBW 上界', 'BBW <= 此值判定为震荡市（RegimeClassifier.range_bbw_max）', 'number', 125, 'global'),
+('range_bbw_max', 'signal_tower', 'regime', '0.0071', 'float', '震荡 BBW 上界', 'BBW <= 此值判定为震荡市（RegimeClassifier.range_bbw_max）。2026-09-17 按 XAUUSD M5 全历史 69242 根分位标定取 p75=0.0071；原值 1.0 因远大于 BBW 实测量级(mean 0.0062/max 0.117)而恒真、条件形同虚设', 'number', 125, 'global'),
 ('signal_tower.config_reload_interval', 'signal_tower', 'system', '30', 'int', '配置热重载间隔（秒）', '参数变更后最长生效延迟；调小=更敏捷', 'number', 126, 'global')
 ON CONFLICT (config_key) DO NOTHING;
 

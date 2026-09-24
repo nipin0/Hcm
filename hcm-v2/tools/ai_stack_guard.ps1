@@ -97,6 +97,16 @@ function Write-GuardLog([string]$msg) {
     Add-Content -LiteralPath $GUARDLOG -Value $line -Encoding utf8
 }
 
+# UTC epoch seconds (timezone-independent).
+# DO NOT use `Get-Date -UFormat %s`: it derives the epoch from LOCAL time (it adds the
+# UTC offset), so on this UTC+8 host every written `ts` field came out exactly +28800s
+# (8h) in the future -- measured 2026-09-18: TRUE=1789688904 vs -UFormat=1789717705
+# (skew = 28800). That is the "time-basis" bug fixed here (it also misled staleness
+# diagnosis). Single implementation point on purpose -- do not inline it again.
+function Get-UtcEpoch {
+    return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+}
+
 function Get-Sha256([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return '' }
     return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
@@ -192,7 +202,7 @@ foreach ($c in $COMPONENTS) {
             $dstat = ('name=' + $c.Display +
                       '|pid=0|running=False|beat_age_s=-1|readable=False|alive=False' +
                       '|action=disabled|healed=False|dry=False' +
-                      '|ts=' + [int][double]::Parse((Get-Date -UFormat %s)))
+                      '|ts=' + (Get-UtcEpoch))
             Invoke-Redis @('SET', ('hcm:ai:' + $name + ':status'), $dstat, 'EX', '180') | Out-Null
         }
         Write-Output ('[' + $name + '] DISABLED (skipped)')
@@ -320,7 +330,7 @@ foreach ($c in $COMPONENTS) {
                '|action=' + $action +
                '|healed=' + [bool]$healed +
                '|dry=' + [bool]$Dry +
-               '|ts=' + [int][double]::Parse((Get-Date -UFormat %s)))
+               '|ts=' + (Get-UtcEpoch))
 
     if (-not $Dry) {
         Invoke-Redis @('SET', ('hcm:ai:' + $name + ':status'), $status, 'EX', '180') | Out-Null

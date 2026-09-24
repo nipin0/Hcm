@@ -72,6 +72,10 @@ const SESSION_SUFFIXES: ConfigField[] = [
   { key: 'min_rr', label: '最低 R:R', type: 'number', step: 0.05, defaultValue: 1.2, min: 0.5, max: 3 },
   { key: 'breakeven_atr_mult', label: '保本触发 (ATR)', type: 'number', step: 0.05, defaultValue: 0.5, min: 0.1, max: 3 },
   { key: 'breakeven_buffer_atr_mult', label: '保本地板缓冲 (ATR)', type: 'number', step: 0.05, defaultValue: 0.15, min: 0.05, max: 1 },
+  // 【2026-09-21 补齐】原时段清单缺此项 ⇒ 面板无法调 保本门槛占 TP 距比例 的**时段值**，
+  //   而桥侧确实按会话读它（mt5_bridge.py:5400 `_session_cfg_float("breakeven_tp_ratio")`），
+  //   且后端 close.py 的 SESSION_SUFFIXES 本就有它 ⇒ 前端漏项，使该键时段值对本面板不可见。
+  { key: 'breakeven_tp_ratio', label: '保本门槛占 TP 距比例', type: 'number', step: 0.05, defaultValue: 0.5, min: 0.1, max: 1, description: '有效保本门槛 = min(breakeven_atr_mult × ATR, TP距 × 此比例)；调小=更早保本' },
   { key: 'trail_start_atr_mult', label: '移动止盈启动 (ATR)', type: 'number', step: 0.1, defaultValue: 2.0, min: 1, max: 8 },
   { key: 'trail_wide_atr_mult', label: '移动止盈线宽 (ATR)', type: 'number', step: 0.05, defaultValue: 0.7, min: 0.1, max: 4 },
   { key: 'tp_relay_enabled', label: '移动止盈接力 TP 追利', type: 'switch', defaultValue: true },

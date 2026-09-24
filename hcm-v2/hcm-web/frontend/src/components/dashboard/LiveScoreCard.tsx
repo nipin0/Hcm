@@ -23,7 +23,12 @@ const dirColor = (d?: string): string => {
 
 const pct = (n?: number): string => ((n ?? 0) * 100).toFixed(1) + '%';
 
-/** 实时评分卡：直观展示"能否下单"——评分 vs 自适应门槛 vs 是否通过。
+/** 实时评分卡：直观展示"能否下单"。
+ *
+ *  【口径（2026-09-17 A4 统一）】放行判据**唯一真源 = `threshold_passed`**
+ *  （hexp 侧 = `_grade_ok and direction != "NO_TRADE"`，**不比较** `pre_score`）。
+ *  `threshold` 仅是**参考分档下界**，用于展示"评分相对下界的占比"，**不是闸门** ——
+ *  不得据 `pre_score >= threshold` 判读能否下单（会得到与 `threshold_passed` **相反**的结论）。
  *  数据来自信号塔 _live_score_publisher 每 3s 写入 hcm:live:score:{symbol}_{tf}。 */
 export default function LiveScoreCard({
   symbol,
@@ -99,7 +104,7 @@ export default function LiveScoreCard({
           />
           {!passed && data?.direction && data.direction !== 'NO_TRADE' && (
             <Typography variant="caption" sx={{ color: '#64748b' }}>
-              倾向 {data.direction}（未过门槛）
+              倾向 {data.direction}（未放行：等级或方向未达）
             </Typography>
           )}
         </Box>
@@ -115,11 +120,12 @@ export default function LiveScoreCard({
               {pct(pre)}
             </Typography>
             <Typography variant="body2" sx={{ color: '#94a3b8' }}>
-              评分 / 门槛 {pct(thr)}
+              评分 / 参考下界 {pct(thr)}
             </Typography>
           </Box>
 
-          {/* 进度条：评分相对门槛的占比 */}
+          {/* 进度条：评分相对**参考下界**的占比（仅供观察，**非**放行判据 ——
+              放行以右上 Chip 的 threshold_passed 为准） */}
           <LinearProgress
             variant="determinate"
             value={ratio}

@@ -22,6 +22,16 @@ from typing import Any, Optional
 from shared.redis_client import RedisClient, StreamMessage, validate_safety_config, CRITICAL_SAFETY_KEYS
 from shared.errors import ErrorCode, HcmError
 
+# ── 【2026-09-17】signal_status 回写重试参数 ─────────────────────────────
+# 竞态来源：signal_publisher.publish 先 XADD 到 Redis、后 INSERT PostgreSQL
+# （signal_publisher.py:264-275）→ 风控可能在该行落库前回写状态：
+# UPDATE 命中 0 行、asyncpg 不报错 → 状态永久停在 0（漏斗把"被风控拒"误算成"在途"）。
+_STATUS_WRITE_ATTEMPTS = 4          # 总尝试次数（含首次）
+_STATUS_WRITE_RETRY_DELAY_SEC = 0.05  # 每次间隔（行落库在 XADD 后 ~ms 级，50ms 足够）
+# 【P1-10 C2 2026-09-18】重试耗尽后的**延迟补偿**（秒）：publisher 先 XADD 后 INSERT，
+# 高负载下行落库可能 >200ms ⇒ 耗尽后不放弃，改为数秒后**后台再写一次**（不阻断消费循环）。
+_STATUS_LATE_WRITE_DELAY_SEC = 5.0
+
 logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────
@@ -34,6 +44,38 @@ DEFAULT_CONSUMER_NAME = "risk-consumer-1"
 DEFAULT_BLOCK_MS = 5000
 DEFAULT_RETRY_MAX = 3
 DEFAULT_RETRY_DELAY = 0.5
+
+# ── 信号作用域统一判定（2026-09-16）──────────────────────────────
+# 后续风控链路按「本信号的 Magic」归属/分流的单一真源。
+# 当前仅做归因与分流（scope），订单闸口口径仍按 (account, direction)，
+# 不改变 rule_chain 持仓数/冷却/保本追单逻辑（见变更说明）。
+_LIFECYCLE_ACTIONS = ("close", "modify", "partial_close", "add", "add_position")
+
+
+def _signal_scope(signal_data: dict) -> dict:
+    """统一判定信号作用域（scope），供派发与审计共用，避免 signal_mode/magic 散落判定。
+
+    Returns:
+        dict: {
+            "scope":       "manual" (手动跟单生命周期) / "model" (模型自动信号)，
+            "mode":        signal_mode 小写值（manual_mirror / state_* / filtered / "" 等），
+            "action":      生命周期动作（manual_mirror 时有效），
+            "magic":       信号 magic（手动跟单=主号原 magic；模型自动=信号自带或 0），
+            "is_lifecycle": 是否走"免规则链"派发分支（manual_mirror + 生命周期动作），
+        }
+    """
+    mode = str(signal_data.get("signal_mode", "")).strip().lower()
+    action = str(signal_data.get("action", "")).strip().lower()
+    magic = signal_data.get("magic", 0)
+    is_lifecycle = (mode == "manual_mirror" and action in _LIFECYCLE_ACTIONS)
+    scope = "manual" if mode == "manual_mirror" else "model"
+    return {
+        "scope": scope,
+        "mode": mode,
+        "action": action,
+        "magic": magic,
+        "is_lifecycle": is_lifecycle,
+    }
 
 
 @dataclass
@@ -91,6 +133,9 @@ class RiskStreamConsumer:
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._db = db_pool
+        # 【P1-10 C2 2026-09-18】延迟补偿任务的**强引用集合**（防 asyncio 任务被 GC；
+        # 完成后自动移除）。见 `_late_status_write`。
+        self._late_status_tasks: set = set()
 
         # Statistics
         self._stats: dict[str, int] = {
@@ -112,7 +157,7 @@ class RiskStreamConsumer:
             if self._redis is None:
                 return
             # 手动模式镜像：原样保留主号手数
-            if str(signal_data.get("signal_mode", "")) == "manual_mirror":
+            if _signal_scope(signal_data)["mode"] == "manual_mirror":
                 return
 
             # 【2026-09-15 FSM】行情状态机信号：**跳过 confidence 分档，改用 FSM 自有倍率**。
@@ -145,7 +190,7 @@ class RiskStreamConsumer:
             # （top1−top2，典型 0.1~0.4）；该值 ≤1.0 不触发下方归一化 → 被判"低置信"
             # → 落最小档 mult_low ⇒ 手数恒 base×0.5、S1 梯度与趋势 base_lot 全失效。
             # 用 ai_lot_tier 也救不了：本函数只有 low/mid/high **3 档**，表达不了 S1 的 4 档。
-            if str(signal_data.get("signal_mode", "")).strip().lower().startswith("state"):
+            if _signal_scope(signal_data)["mode"].startswith("state"):
                 try:
                     fsm_mult = float(signal_data.get("fsm_lot_multiplier", 1.0) or 1.0)
                 except (TypeError, ValueError):
@@ -213,7 +258,14 @@ class RiskStreamConsumer:
                 multiplier = mult_low
                 tier = "low"
 
-            raw_lot = base * multiplier * (co_ai_mult if co_ai_mult > 0 else 1.0)
+            # 【2026-09-17 B7 修复】**不再**把 `suggested_lot_ratio` 折进 lot —— 该字段
+            # 由**桥**统一应用一次（`tools/mt5_bridge.py:1309-1317`），此处再乘会导致
+            # **平方衰减**：实测 `scheduler.py:4095-4109` + `:4670` 证明
+            # `suggested_lot_ratio = co_exec_lot_mult × composite_atten`（塔层**单一**倍率），
+            # 且 rule_chain 会在 evaluate（本函数**之后**）继续改这个字段
+            # （extreme_pending ×0.5 / reverse_order ×0.3），故唯一可用的应用点是**最后的桥**。
+            # 影响：手数由 ratio² 恢复为 ratio（co_exec=0.4 → 0.16× → 0.4×，即变大 2.5 倍）。
+            raw_lot = base * multiplier
             # 安全封顶：不超过风控单笔上限，防止 tower.lot_size / 倍率误配导致超限被整单拒绝
             if max_lot and max_lot > 0 and raw_lot > max_lot:
                 raw_lot = max_lot
@@ -381,10 +433,15 @@ class RiskStreamConsumer:
                 # risk_max_open_positions（开仓数已满）与 risk_cool_minutes（开仓冷却未过）把平仓/
                 # 改单直接 REJECT，导致「主号平仓、跟单号不继承」（即"跟单号没同步"）。
                 # 故对生命周期动作强制放行；硬上限/硬止损等不可逆护栏仍在桥侧执行。
-                _sig_mode = str(msg.data.get("signal_mode", "")).lower()
-                _sig_action = str(msg.data.get("action", "")).lower()
-                _LIFECYCLE = ("close", "modify", "partial_close", "add", "add_position")
-                if _sig_mode == "manual_mirror" and _sig_action in _LIFECYCLE:
+                _scope = _signal_scope(msg.data)
+                # 入口审计：每个信号都归因 scope/mode/action/magic，
+                # 便于后续"按本信号的 Magic 圈订单"排查与可观测。
+                await self._audit_signal_stage(
+                    signal_id, "ingest",
+                    scope=_scope["scope"], mode=_scope["mode"],
+                    action=_scope["action"], magic=_scope["magic"],
+                )
+                if _scope["is_lifecycle"]:
                     from risk_engine.rule_chain import RuleChainResult, RuleResult
                     rule_result = RuleChainResult(
                         passed=True,
@@ -399,7 +456,7 @@ class RiskStreamConsumer:
                     decision = "PASS"
                     logger.info(
                         "Manual mirror lifecycle bypass rule chain: action=%s sig=%s",
-                        _sig_action, msg.data.get("signal_id"),
+                        _scope["action"], msg.data.get("signal_id"),
                     )
                 else:
                     # 先按置信分/共源/AI 计算动态手数，再走规则链，
@@ -430,6 +487,7 @@ class RiskStreamConsumer:
                     await self._audit_signal_stage(
                         signal_id, "rejected",
                         reason=",".join(map(str, rule_result.rejected_rules)),
+                        scope=_scope["scope"], magic=_scope["magic"],
                     )
                     await self._update_signal_status(
                         signal_id, 2, decision,
@@ -585,6 +643,7 @@ class RiskStreamConsumer:
             "trace_id": signal_data.get("trace_id", ""),
             "signal_mode": signal_data.get("signal_mode", ""),  # 修复：manual_mirror 护栏依赖此字段
             "magic": signal_data.get("magic", 0),  # 透传主号原 magic（手动跟单桥侧下单时用主号原 magic）
+            "scope": _signal_scope(signal_data)["scope"],  # 2026-09-16：信号作用域(manual/model)，分流/归因用
             "action": signal_data.get("action", ""),  # 透传 manual_mirror 动作（open/close/modify/partial_close/add）
             "close_mode": signal_data.get("close_mode", "all"),  # 2026-07-23：精确平仓模式
             "close_ticket": int(signal_data.get("close_ticket", 0) or 0),  # 2026-07-23：主号被平/改的 ticket
@@ -637,6 +696,8 @@ class RiskStreamConsumer:
                 )
                 await self._audit_signal_stage(
                     signal_data.get("signal_id"), "risk_passed", decision=decision,
+                    scope=_signal_scope(signal_data)["scope"],
+                    magic=signal_data.get("magic", 0),
                 )
             return msg_id
         except Exception as exc:
@@ -775,22 +836,79 @@ class RiskStreamConsumer:
                 "Skip signal_status write for manual_mirror signal_id=%s (reuses原开仓 signal_id)",
                 signal_id)
             return
+        # 【2026-09-17 竞态修复】按**受影响行数**判定并短暂重试（原因见文件头常量注释）。
+        # 两类 0 行必须区分：
+        #   ① 该信号行**尚未落库**（publisher 先 XADD 后 INSERT 的竞态）→ 重试等待；
+        #   ② 行已存在但 `signal_status=3`（护栏命中，属预期跳过）→ 不重试（避免噪音）。
+        _use_block = bool(status == 2 and block_reason)
+        _sql = (
+            "UPDATE hcm_signal.signals SET signal_status=$1, block_reason=$2, "
+            "updated_at=now() WHERE signal_id=$3 AND signal_status <> 3"
+            if _use_block else
+            "UPDATE hcm_signal.signals SET signal_status=$1, updated_at=now() "
+            "WHERE signal_id=$2 AND signal_status <> 3"
+        )
+        _args = (status, block_reason, signal_id) if _use_block else (status, signal_id)
         try:
-            if status == 2 and block_reason:
-                await self._db.execute(
-                    "UPDATE hcm_signal.signals SET signal_status=$1, block_reason=$2, "
-                    "updated_at=now() WHERE signal_id=$3 AND signal_status <> 3",
-                    status, block_reason, signal_id,
-                )
-            else:
-                await self._db.execute(
-                    "UPDATE hcm_signal.signals SET signal_status=$1, updated_at=now() "
-                    "WHERE signal_id=$2 AND signal_status <> 3",
-                    status, signal_id,
-                )
-            logger.debug("Signal status updated: signal_id=%s, status=%s", signal_id, status)
+            for _attempt in range(_STATUS_WRITE_ATTEMPTS):
+                _tag = await self._db.execute(_sql, *_args)
+                if not (isinstance(_tag, str) and _tag.strip().endswith(" 0")):
+                    logger.debug("Signal status updated: signal_id=%s, status=%s",
+                                 signal_id, status)
+                    return
+                _row = await self._db.fetchval(
+                    "SELECT 1 FROM hcm_signal.signals WHERE signal_id=$1", signal_id)
+                if _row:
+                    logger.debug(
+                        "signal_status write skipped (row exists, unchanged — likely 3): "
+                        "signal_id=%s", signal_id)
+                    return
+                await asyncio.sleep(_STATUS_WRITE_RETRY_DELAY_SEC)
+            logger.warning(
+                "signal_status write hit 0 rows x%d (row not inserted yet? publisher "
+                "race): signal_id=%s, status=%s — funnel may show 'in-flight'",
+                _STATUS_WRITE_ATTEMPTS, signal_id, status)
+            # 【P1-10 C2 2026-09-18】重试耗尽（行仍未落库）→ 挂**后台延迟补偿**再写一次；
+            # 不阻断消费循环、不静默留下 status=0（复用同一 SQL/参数，不写第二份）。
+            try:
+                _t = asyncio.create_task(
+                    self._late_status_write(_sql, _args, signal_id, status))
+                self._late_status_tasks.add(_t)
+                _t.add_done_callback(self._late_status_tasks.discard)
+            except Exception as exc:  # noqa: BLE001 — 派发失败不影响主流程
+                logger.warning("[C2] 延迟补偿派发失败：signal_id=%s %s", signal_id, exc)
         except Exception as exc:
             logger.warning("Failed to update signal_status: signal_id=%s: %s", signal_id, exc)
+
+    async def _late_status_write(self, sql: str, args: tuple,
+                                 signal_id: int, status: int) -> None:
+        """【P1-10 C2 2026-09-18】signal_status 竞态耗尽后的**延迟补偿**（后台，非阻断）。
+
+        背景：publisher 先 XADD 后 INSERT（`signal_publisher.py:264-275`）⇒ 消费者可能在
+        行落库前回写状态；主路径已做 `_STATUS_WRITE_ATTEMPTS`×`_STATUS_WRITE_RETRY_DELAY_SEC`
+        重试，但高负载下行落库可能更慢 ⇒ 重试耗尽后状态停在 0（漏斗把"被拒"误算"在途"）。
+        本协程在 `_STATUS_LATE_WRITE_DELAY_SEC` 后**再写一次**（复用主路径同一 SQL/参数）；
+        若仍未见行则留 WARNING（保持可观测，绝不静默）。
+        """
+        await asyncio.sleep(_STATUS_LATE_WRITE_DELAY_SEC)
+        if self._db is None or not self._db.is_initialized:
+            return
+        try:
+            _tag = await self._db.execute(sql, *args)
+            if not (isinstance(_tag, str) and _tag.strip().endswith(" 0")):
+                logger.info("[C2] 延迟补偿写入成功：signal_id=%s status=%s", signal_id, status)
+                return
+            _row = await self._db.fetchval(
+                "SELECT 1 FROM hcm_signal.signals WHERE signal_id=$1", signal_id)
+            if _row:
+                logger.debug("[C2] 延迟补偿跳过（行已存在，多为 status=3）：signal_id=%s",
+                             signal_id)
+                return
+            logger.warning(
+                "[C2] 延迟补偿仍未落库：signal_id=%s status=%s（漏斗可能显示 in-flight）",
+                signal_id, status)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[C2] 延迟补偿异常：signal_id=%s %s", signal_id, exc)
 
     async def health_check(self) -> dict:
         """Check consumer health.

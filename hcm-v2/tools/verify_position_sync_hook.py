@@ -151,7 +151,8 @@ async def main() -> None:
     rd3.kv[KA], rd3.kv[KC] = "1.5", "1"
     await PS._fsm_osc_counter_writeback(MockConn("state_osc", _flat_klines()), rd3,
                                         LOG, _row(), 1, "be")
-    ck("be → 不计入（原样）", (rd3.kv.get(KA), rd3.kv.get(KC)), ("1.5", "1"))
+    ck("be → count 归零、atr_loss 保留", (rd3.kv.get(KA), rd3.kv.get(KC)),
+       ("1.500000", "0"))
 
     print("\n=== 5) 兜底路径（无 K 线可还原 ATR）===")
     rd4 = MockRedis()

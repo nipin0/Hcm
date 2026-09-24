@@ -51,6 +51,7 @@ from web.api.ai_config import create_ai_config_router  # AI 信号质量模块 a
 from web.api.ai_report import create_ai_report_router  # AI 报表聚合（只读）
 from web.api.ai_ops import create_ai_ops_router        # [2026-08-29] AI 中枢监控（三头实时+DeepSeek 效果，只读）
 from web.api.state import create_state_router          # [2026-09-15] FSM 行情状态机监控（只读）
+from web.api.ai_health import create_ai_health_router  # [2026-09-17] AI 体检表（TimesFM/LightGBM/状态机 聚合，只读）
 
 # ── Configuration ──────────────────────────────
 
@@ -228,6 +229,8 @@ async def startup():
     app.include_router(create_ai_ops_router(db_pool, config_provider, auth_handler, redis_client))
     # [2026-09-15] FSM 行情状态机监控（只读）：live / logs / proba / kline / risk
     app.include_router(create_state_router(db_pool, config_provider, auth_handler, redis_client))
+    # [2026-09-17] AI 体检表（TimesFM / LightGBM 质量栈 / FSM 状态机 三块健康聚合，只读）
+    app.include_router(create_ai_health_router(db_pool, config_provider, auth_handler, redis_client))
 
     # Mount frontend static files at root, BUT keep /docs /openapi.json for backend
     if FRONTEND_DIST and os.path.isdir(FRONTEND_DIST):

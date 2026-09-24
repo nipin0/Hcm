@@ -358,21 +358,29 @@ def decide(
         if _pbc_abs > 0 and (
                 (direction == "SELL" and ai_mm >= _pbc_abs) or
                 (direction == "BUY" and ai_mm <= -_pbc_abs)):
-            action, final_grade = "VETO", grade
+            # 【2026-09-17 A3】不再 `= "VETO", grade` —— 那会把上方 RANGE 降级档
+            # （334-336）重置回原 grade，丢弃降级信息。VETO 只需改 action。
+            action = "VETO"
             pullback_chase = "veto_pullback_chase"
 
     # 【阶段 1·方向共振】dir_lm(方向头) × dir_hexp(HEXP 方向)：
     #   仅否决/增强 action，绝不改 snapshot.direction（方向永远由 HEXP 决定）。
     #   灰度：ai.lm.direction_fuse=false 时不参与（仅保留上方删 ai_opened 纪律修正）。
     dir_resonance = "none"
-    if _g(cfg, "ai.lm.direction_fuse") and ai_direction not in (None, "HOLD", "NO_TRADE"):
+    # 【2026-09-17 A3 修复】补 `not range_mode` 排除（与 pullback_chase 356 行对齐）：
+    #   RANGE 均值回归**天生逆动量**，而本规则否决"方向与 AI 方向头相反"的信号 ⇒
+    #   对 RANGE 必命中（同 343-352 行 pullback 的实测：14 次注入 7 次 SELL 被 100% VETO）。
+    #   用户 2026-09-10 决策是"RANGE 不参与常规分数否决"，本条此前漏排除属实现缺口。
+    if (_g(cfg, "ai.lm.direction_fuse")
+            and not snapshot.get("range_mode", False)
+            and ai_direction not in (None, "HOLD", "NO_TRADE")):
         dir_hexp = direction
         _p_veto = _g(cfg, "ai.lm.dir_veto_prob")
         _opp = {"BUY": "SELL", "SELL": "BUY"}
         if dir_hexp in ("BUY", "SELL"):
             if ai_direction == _opp.get(dir_hexp) and (ai_dir_prob or 0.0) >= _p_veto:
                 # 反向否决：dir_lm 高置信反向 → 否决该信号（仅拒绝，不改方向，铁律友好）
-                action, final_grade = "VETO", grade
+                action = "VETO"
                 dir_resonance = "veto_reverse"
             elif ai_direction == dir_hexp:
                 # 同向增强：hexp 已放行(passed)的已开信号升级一级增强置信；
@@ -387,12 +395,16 @@ def decide(
     #   仅否决/增强入场时机质量，绝不改 snapshot.direction（方向永远由 HEXP 决定，铁律友好）。
     #   灰度：ai.lm.entry_fuse=false 时不参与。与 dir_resonance 平行、独立维度，VETO 优先。
     entry_resonance = "none"
-    if _g(cfg, "ai.lm.entry_fuse") and ai_entry is not None:
+    # 【2026-09-17 A3 修复】同上补 `not range_mode` 排除（理由与方向共振一致：
+    #   买点头也是按"顺势/好买点"训练，RANGE 的逆动量入场被系统性打到低分）。
+    if (_g(cfg, "ai.lm.entry_fuse")
+            and not snapshot.get("range_mode", False)
+            and ai_entry is not None):
         _e_boost = _g(cfg, "ai.lm.entry_boost_prob")
         _e_veto = _g(cfg, "ai.lm.entry_veto_prob")
         if ai_entry <= _e_veto:
             # 否决差买点：点位质量差 → 否决该信号（仅拒绝入场时机，不改方向）。
-            action, final_grade = "VETO", grade
+            action = "VETO"
             entry_resonance = "veto_bad_entry"
         elif ai_entry >= _e_boost:
             # 增强好买点：hexp 已放行(passed)的已开信号升级一级增强入场质量置信；

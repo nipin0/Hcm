@@ -7,7 +7,8 @@ short-circuit on the first rejection.
 Rule Chain Order (matching PRD spec):
   risk_min_confidence → risk_max_lot_single → risk_max_total_lot →
   risk_max_open_positions → risk_max_daily_loss → risk_min_margin →
-  risk_max_spread_pips → risk_cool_minutes → risk_spread_check_enabled
+  risk_cool_minutes
+  （2026-09-17 C9 下架：原 risk_max_spread_pips 与 risk_spread_check_enabled 两条已删除）
 """
 
 from __future__ import annotations
@@ -59,6 +60,30 @@ def _as_bool(v: Any, default: bool = False) -> bool:
     if s in ("0", "false", "no", "n", "off", ""):
         return False
     return default
+
+
+# ── 【2026-09-17】Magic 族（前导逻辑码）—— 跨服务单一实现 ────────────────
+# 需求（用户 2026-09-16/17 拍板）：持仓单保本后，有信号要下新单时先判断是否
+#   "同类型信号（同 Magic 族）"；只有同族之间才构成"保本 → 可追单"关系；
+#   同族订单照常受闸门约束；不同族互不牵连；无同族持仓 → 直接放行。
+# 实证（09-16 复盘）：HEXP(11) 一笔未保本 SELL 封锁了 state_trend(62) 的 SELL；
+#   state_osc(61) 开仓 363ms 后 HEXP(11) 同向信号被误拒。
+#
+# 实现体在 `shared/magic_family.py`（主机桥 mt5_bridge 按绝对路径加载**同一文件**）；
+# 本处只做导入 —— 族公式只此一份，不在两侧各写一遍（铁律第十三章）。
+try:
+    from shared.magic_family import magic_family as _magic_family
+except Exception as _mf_exc:  # noqa: BLE001
+    # 【部署兜底】挂载缺失/导入失败 → 归族恒 0 ⇒ 本闸门回退"仅按方向"的旧口径
+    # （更严，绝不静默放宽），并 CRITICAL 可见（绝不静默改变闸门口径）。
+    logger.critical(
+        "shared.magic_family 导入失败（compose 挂载缺失？）→ 保本闸门回退旧口径(按方向)：%s",
+        _mf_exc,
+    )
+
+    def _magic_family(magic: Any) -> int:  # type: ignore[misc]
+        """兜底：族不可知 → 0（调用方按旧口径处理，不臆造族）。"""
+        return 0
 
 
 # ── Rule result types ──────────────────────────
@@ -125,17 +150,21 @@ class RuleChain:
 
         # Cached thresholds (hot-reloadable) — MUST call load_config() before evaluate()
         self._min_confidence: float = -1.0
+        # 【2026-09-17 量纲隔离】FSM 子模式的独立置信度阈值。
+        #   FSM(state_osc/state_trend) 下发的 `confidence` 是**模型决策边际** dec.margin
+        #   （实测 0.008~0.41），与 `scorecard_total/100`（实测 0.2~1.0）**不是同一量纲**；
+        #   用同一个阈值筛两种量纲属语义错配。详见 `_check_confidence` 的实证注释。
+        self._min_conf_fsm_trend: float = -1.0
+        self._min_conf_fsm_box: float = -1.0
         self._max_lot_single: float = -1.0
         self._max_total_lot: float = -1.0
         self._max_open_positions: int = -1
         self._max_daily_loss: float = -1.0
         self._min_margin: float = -1.0
-        self._max_spread_pips: float = -1.0
         self._cool_minutes: int = -1
         # [2026-08-22] 同向保本闸门：保本判定容差（价格单位）。
         # 桥保本时 SL = entry ± 0.15×ATR 严格优于 entry，默认 0 即可（仅兜浮点/点差）。
         self._be_tolerance: float = 0.0
-        self._spread_check_enabled: bool = False
 
         # ── 分值驱动最大持仓数（2026-08-11 v2.5）──
         # 高分值信号允许更多持仓、低分值保守限制。
@@ -268,18 +297,9 @@ class RuleChain:
             }
             return result
 
-        # Rule 7: Maximum Spread (if enabled)
-        if self._spread_check_enabled:
-            r = self._check_spread(signal_data)
-            result.results.append(r)
-            if not r.passed:
-                result.passed = False
-                result.rejected_rules.append(r.rule_name)
-                result.violations[r.rule_name] = {
-                    "actual": r.actual_value,
-                    "threshold": r.threshold,
-                }
-                return result
+        # 【2026-09-17 C9 下架】原 Rule 7「最大点差」已整体移除 —— 该规则因信号载荷
+        # 从不携带 `spread` 字段而**恒跳过**（死规则），用户拍板"下架"（不补数据、不激活）。
+        # 同时删除：规则本体 `_check_spread`、实例属性、配置键读取、面板登记。
 
         # Rule 8: Cooldown Period — real Redis-backed check
         r = await self._check_cooldown(signal_data)
@@ -312,15 +332,7 @@ class RuleChain:
                 }
                 return result
 
-        # Rule 9: Spread Check Enabled flag (pass-through, already handled in #7)
-        r = RuleResult(
-            rule_name="risk_spread_check_enabled",
-            passed=True,
-            actual_value=float(self._spread_check_enabled),
-            threshold=1.0,
-            message="Spread check is enabled" if self._spread_check_enabled else "Spread check is disabled",
-        )
-        result.results.append(r)
+        # 【2026-09-17 C9 下架】原 Rule 9（点差开关透传）随 Rule 7 一并移除。
 
         return result
 
@@ -342,14 +354,42 @@ class RuleChain:
         # → 该闸门从未拦过任何信号。归一到 0–1 后再比较（与 _apply_dynamic_lot
         # 中 `if score > 1.0: score /= 100` 同口径，避免两处阈值语义分裂）。
         conf_norm = confidence / 100.0 if confidence > 1.0 else confidence
-        passed = conf_norm >= self._min_confidence
+        # ── 【2026-09-17 量纲隔离】按 signal_mode 选阈值 ──────────────────────────
+        # FSM(state_osc/state_trend) 的 confidence 是**模型决策边际** dec.margin
+        # （`scheduler.py` 发布点取 `dec.margin`），实测区间 0.008~0.41；而
+        # scorecard_total/100 实测 0.2~1.0。同一阈值筛两种量纲 = 语义错配。
+        # 实证（2026-09-17，68 个 FSM 意图的 60min 前向波幅 + 20 笔已成交）：
+        #   · state_trend(S2/S3)：net_edge 全桶为正（≥0.20 +1.66 / 0.10-0.20 +0.66 /
+        #     0.05-0.10 +0.62 / <0.05 +1.01 ATR）⇒ 闸门**无筛选力**，只是错杀
+        #     （闸门以上 +1.54 vs 以下 +0.82 ATR）；已成交 20 笔全在 ≥0.10，
+        #     <0.10 无成交样本可比（被本闸门挡住）⇒ 默认 0.0 放行。
+        #   · state_osc(S1 箱体)：net_edge 全桶为负（-1.59~-4.09 ATR），闸门以上 -2.90
+        #     vs 以下 -3.27 ⇒ 同样无判别力，但**保守起见默认沿用全局阈值**（零行为变化），
+        #     是否调整由运维通过独立键决定。
+        # 阈值键：`risk_min_confidence_fsm_trend` / `risk_min_confidence_fsm_box`。
+        # `rule_name` 保持不变（既有审计/告警按名匹配），作用域体现在 message 的 [scope]。
+        _mode = str(signal_data.get("signal_mode", "") or "").strip().lower()
+        _thr = self._min_confidence
+        _scope = "global"
+        if _mode == "state_trend":
+            _thr = self._min_conf_fsm_trend
+            _scope = "fsm_trend"
+        elif _mode == "state_osc":
+            _thr = self._min_conf_fsm_box
+            _scope = "fsm_box"
+        # 兜底：阈值未装载（负数，正常不会出现——load_config 成功才置 _config_loaded）
+        # → 回退全局值，避免"未装载即恒过"的静默放宽。
+        if _thr < 0.0:
+            _thr = self._min_confidence
+            _scope = "global(fallback)"
+        passed = conf_norm >= _thr
         return RuleResult(
             rule_name="risk_min_confidence",
             passed=passed,
             actual_value=conf_norm,
-            threshold=self._min_confidence,
-            message=f"Confidence {conf_norm:.4f} >= {self._min_confidence:.4f}" if passed
-            else f"Confidence {conf_norm:.4f} < {self._min_confidence:.4f}",
+            threshold=_thr,
+            message=(f"Confidence {conf_norm:.4f} >= {_thr:.4f} [{_scope}]" if passed
+                     else f"Confidence {conf_norm:.4f} < {_thr:.4f} [{_scope}]"),
         )
 
     def _check_max_single_lot(self, signal_data: dict) -> RuleResult:
@@ -522,38 +562,6 @@ class RuleChain:
             else f"Free margin {free_margin:.2f} < {self._min_margin}",
         )
 
-    def _check_spread(self, signal_data: dict) -> RuleResult:
-        """Check current spread does not exceed max.
-
-        Uses spread value from signal if available, otherwise passes.
-
-        Args:
-            signal_data: Signal data dict.
-
-        Returns:
-            RuleResult for risk_max_spread_pips.
-        """
-        spread = float(signal_data.get("spread", 0))
-        if spread == 0:
-            # No spread data in signal — pass
-            return RuleResult(
-                rule_name="risk_max_spread_pips",
-                passed=True,
-                actual_value=0.0,
-                threshold=self._max_spread_pips,
-                message="No spread data in signal — skipping",
-            )
-
-        passed = spread <= self._max_spread_pips
-        return RuleResult(
-            rule_name="risk_max_spread_pips",
-            passed=passed,
-            actual_value=spread,
-            threshold=self._max_spread_pips,
-            message=f"Spread {spread:.1f} pips <= {self._max_spread_pips:.1f}" if passed
-            else f"Spread {spread:.1f} pips > {self._max_spread_pips:.1f}",
-        )
-
     async def _check_cooldown(self, signal_data: dict) -> RuleResult:
         """同向保本闸门（纯 BE，2026-08-22 替代旧时间窗冷却）。
 
@@ -563,13 +571,19 @@ class RuleChain:
           - 已达保本（BUY: sl >= entry - tol / SELL: sl <= entry + tol）→ 放行；
           依次阶梯加仓，直到 Rule 4（max_open_positions）封顶（本规则不替代限仓）。
 
-        读取路径（毫秒级）：
-          1) 快路径：Redis 保本标志 `hcm:pos:be:{account}:{dir}`（桥 trailing 抬 SL
-             时写入，TTL 15s）。仅当标志 == "1"（达保本）时直接放行；
-          2) 回退真值源：实时查 PG positions（每次信号毫秒级、不缓存），取最新一笔
-             同向 open 持仓的 entry_price/sl_price 判定。
+        【2026-09-17 按 Magic 归口】判定维度由 (账户, 方向) 细化为
+        **(账户, 方向, magic 族)**（族公式见 `_magic_family`）：
+          - 取该账户该方向下 **magic 族相同** 的**最新一笔** open 持仓判保本；
+          - 同族未保本 → 拒绝该族新单；同族已保本 → 放行；
+          - **不同族互不牵连**；**无同族持仓 → 放行**（首笔开仓）；
+          - `fam == 0`（magic 未知/手动）→ 回退旧口径（仅按方向过滤），
+            保证"族不可知"时不削弱既有防接刀强度。
 
-        失败行为（用户已拍板）：DB/Redis 源不可用 → fail-open 放行（记 CRITICAL）。
+        为什么弃用 Redis 快路径：`hcm:pos:be:{account}:{dir}` 是**方向级**标志，
+        不含 magic 族 → 用它必然把跨族持仓算进来（正是本次要消除的牵连）。
+        真值源统一为 PG positions（每信号一次查询，毫秒级，不缓存）。
+
+        失败行为（用户已拍板）：DB 源不可用 → fail-open 放行（记 CRITICAL）。
         sl_price IS NULL（未知）→ fail-open 放行（一致）。
         """
         account_id = int(signal_data.get("account_id", 0))
@@ -588,6 +602,11 @@ class RuleChain:
 
         tol = float(getattr(self, "_be_tolerance", 0.0) or 0.0)
 
+        # ── 【2026-09-17 按 Magic 归口】本闸门的判定维度：(账户, 方向, magic 族) ──
+        # 入单族来自信号流字段 `magic`（signal_publisher 透传；FSM 为 8 位布局），
+        # 族公式唯一实现在 `_magic_family`。fam=0 → 回退旧口径（见下方查询）。
+        _fam = _magic_family(signal_data.get("magic"))
+
         # ── 2026-08-25 极值分层裁决：hexp 极值+保本追单候选（extreme_pending=True）──
         # hexp 检测到"极值区+动量回撤但该 symbol 已有同向保本持仓"时不再硬封，而是标记
         # extreme_pending 放行到此做最终裁决：本账户同向确实已保本 → 放行 + 轻仓追单(×0.5)；
@@ -599,46 +618,39 @@ class RuleChain:
         #   DB 不可达（无法确认保本）才拒绝（防接刀，从严 fail-closed）。
         _extreme_pending = _as_bool(signal_data.get("extreme_pending", False))
         if _extreme_pending and direction in ("BUY", "SELL"):
-            _account_be = False
-            _be_source = "redis"
-            if self._redis is not None:
-                try:
-                    _af = await self._redis.get(f"hcm:pos:be:{account_id}:{direction}")
-                    _account_be = (_af is not None and str(_af).strip() == "1")
-                except Exception:
-                    _account_be = False
-            if not _account_be:
-                # Redis 未确认 → 回退 PG 真值源（与正常路径一致），避免误拒合法极值追单
-                _be_source = "pg"
-                _db_be, _db_err = await self._account_be_from_db(account_id, direction, tol)
-                if _db_err:
-                    # DB 不可达：无法确认保本 → 从严拒绝（fail-closed，防接刀），记 CRITICAL
-                    logger.critical(
-                        "extreme_pending BE check DB FAILED (account=%s, dir=%s) — "
-                        "reject (fail-closed, 防极值接刀)", account_id, direction,
-                    )
-                    return RuleResult(
-                        rule_name="risk_cool_minutes",
-                        passed=False,
-                        actual_value=0.0,
-                        threshold=0.0,
-                        message="extreme_pending + BE 真值源(DB)不可达 → 拒绝(防极值接刀)",
-                    )
-                # 【2026-08-25 BUG 修复】无同向持仓(_db_be=None) → 放行，等价正常路径的
-                # entry is None 语义。原 `bool(None)=False` 会把"账户根本无同向持仓"误判成
-                # "有持仓但未保本"而拒绝，导致 A 级 SELL 信号在无持仓时被 risk_cool_minutes
-                # 错误拦截（接刀护栏本意是拦"已有持仓未保本仍追单"，不拦首笔开仓）。
-                if _db_be is None:
-                    return RuleResult(
-                        rule_name="risk_cool_minutes",
-                        passed=True,
-                        actual_value=0.0,
-                        threshold=0.0,
-                        message="extreme_pending + 无同向持仓 → 放行(首笔开仓,无接刀风险)",
-                    )
-                _account_be = bool(_db_be)
-            if _account_be:
-                # 账户同向已保本（Redis 或 PG 确认）→ 放行 + 轻仓（极值追单，suggested_lot_ratio×0.5）
+            # 【2026-09-17 按 Magic 归口】不再读 Redis 方向级标志
+            # `hcm:pos:be:{acct}:{dir}`（该键不含 magic 族，会把跨族持仓算进来 ——
+            # 正是本需求要消除的牵连）；统一走 PG 同族真值源（毫秒级）。
+            _be_source = "pg"
+            _db_be, _db_err = await self._account_be_from_db(
+                account_id, direction, tol, family=_fam)
+            if _db_err:
+                # DB 不可达：无法确认保本 → 从严拒绝（fail-closed，防接刀），记 CRITICAL
+                logger.critical(
+                    "extreme_pending BE check DB FAILED (account=%s, dir=%s) — "
+                    "reject (fail-closed, 防极值接刀)", account_id, direction,
+                )
+                return RuleResult(
+                    rule_name="risk_cool_minutes",
+                    passed=False,
+                    actual_value=0.0,
+                    threshold=0.0,
+                    message="extreme_pending + BE 真值源(DB)不可达 → 拒绝(防极值接刀)",
+                )
+            if _db_be is None:
+                # 【2026-08-25 BUG 修复】无同族持仓 → 放行，等价正常路径的 entry is None
+                # 语义。原 `bool(None)=False` 会把"账户根本无同向持仓"误判成"有持仓但
+                # 未保本"而拒绝，导致 A 级信号在无持仓时被 risk_cool_minutes 错误拦截
+                # （接刀护栏本意是拦"已有持仓未保本仍追单"，不拦首笔开仓）。
+                return RuleResult(
+                    rule_name="risk_cool_minutes",
+                    passed=True,
+                    actual_value=0.0,
+                    threshold=0.0,
+                    message="extreme_pending + 无同族持仓 → 放行(首笔开仓,无接刀风险)",
+                )
+            if _db_be:
+                # 同族已保本（PG 确认）→ 放行 + 轻仓（极值追单 ×0.5）
                 try:
                     _cur = float(signal_data.get("suggested_lot_ratio", 1.0) or 1.0)
                     signal_data["suggested_lot_ratio"] = round(_cur * 0.5, 4)
@@ -649,31 +661,35 @@ class RuleChain:
                     passed=True,
                     actual_value=1.0,
                     threshold=0.0,
-                    message=f"extreme_pending + 账户同向已保本({_be_source}) → 放行(轻仓×0.5 追单)",
+                    message=f"extreme_pending + 同族已保本({_be_source}) → 放行(轻仓×0.5 追单)",
                 )
-            else:
-                return RuleResult(
-                    rule_name="risk_cool_minutes",
-                    passed=False,
-                    actual_value=0.0,
-                    threshold=0.0,
-                    message="extreme_pending + 账户未保本(Redis/PG 均确认) → 拒绝(防极值接刀)",
-                )
+            return RuleResult(
+                rule_name="risk_cool_minutes",
+                passed=False,
+                actual_value=0.0,
+                threshold=0.0,
+                message="extreme_pending + 同族未保本(PG 确认) → 拒绝(防极值接刀)",
+            )
 
-        # ── 快路径：Redis 保本标志（毫秒级；仅 "1" 视为已达保本，其余回退 DB）──
-        if self._redis is not None:
+        # ── 快路径：Redis **族级**保本标志（桥写 `hcm:pos:be:{acct}:{dir}:{fam}`，TTL 15s）──
+        # 与旧「方向级」键 `hcm:pos:be:{acct}:{dir}` 的区别：族级键只反映**同族最新一笔**
+        # 持仓的保本状态，与本闸门新口径一致；方向级键仍由 `_check_reverse_order` 使用
+        # （语义不变，故桥两侧键并存）。
+        # 未命中/桥未升级 → 回退下方 PG 真值源，行为不变。
+        if _fam and self._redis is not None:
             try:
-                flag = await self._redis.get(f"hcm:pos:be:{account_id}:{direction}")
-                if flag is not None and str(flag).strip() == "1":
+                _flag = await self._redis.get(
+                    f"hcm:pos:be:{account_id}:{direction}:{_fam}")
+                if _flag is not None and str(_flag).strip() == "1":
                     return RuleResult(
                         rule_name="risk_cool_minutes",
                         passed=True,
                         actual_value=1.0,
                         threshold=0.0,
-                        message="Redis BE flag=1 最新同向持仓已达保本，放行",
+                        message=f"族级 BE flag=1 (magic_fam={_fam}) 同族最新持仓已保本，放行",
                     )
             except Exception as exc:
-                logger.warning("Redis BE flag read failed (fallback to DB): %s", exc)
+                logger.warning("Redis 族级 BE flag read failed (fallback to DB): %s", exc)
 
         # ── 回退真值源：实时查库（毫秒级，不缓存）──
         entry = None
@@ -690,19 +706,38 @@ class RuleChain:
                 # 结论：当前未平持仓的唯一可靠真值源仍是 positions 表；
                 # 若要真正满足铁律 10.2 的双源，第二源应取 MT5 实时持仓快照
                 # （桥写入的 Redis 键），而非 orders。见待办 P0-4'。
-                row = await self._db.fetchrow(
-                    "SELECT open_price, sl FROM hcm_trading.positions "
+                # 【2026-09-17 按 Magic 归口】取该 (账户,方向) 的**全部** open 持仓，
+                # 在 Python 侧筛「magic 族相同」的**最新一笔**（已按 open_time DESC 排序，
+                # 首个命中即最新）。为什么不在 SQL 里筛：
+                #   ① 族公式只保留一份（`_magic_family`），不在 SQL 再写一份 CASE；
+                #   ② 规避 `LIKE '%_WEIGHTS'` 一类下划线转义陷阱。
+                #   持仓行数受 max_positions 约束（个位量级），Python 侧筛无性能问题。
+                # `_fam == 0`（magic 未知/手动）→ 不过滤 = 回退旧口径（仅按方向）。
+                # 【2026-09-17 B8 修复】补 `AND symbol=$n`：原 SQL **不按品种过滤**，
+                # 而 `_get_open_positions_count` 有该条件 ⇒ 同账户内两种口径。
+                # 后果：A 品种同族未保本持仓会拦截 B 品种新单（跨品种误拦）。
+                # `symbol` 为空时退化为旧口径（不额外过滤），保证向后兼容。
+                _sym_filter = str(symbol or "").strip()
+                _pos_sql = (
+                    "SELECT open_time, open_price, sl, magic FROM hcm_trading.positions "
                     "WHERE account_id=$1 AND direction=$2 "
                     "AND direction IN ('BUY','SELL') "
                     "AND status='open' "
                     "AND mt5_ticket IS NOT NULL AND mt5_ticket > 0 AND lot > 0 "
                     "AND open_price IS NOT NULL "
-                    "ORDER BY open_time DESC LIMIT 1",
-                    account_id, direction,
                 )
-                if row is not None:
-                    entry = float(row["open_price"])
-                    sl = row["sl"]
+                _pos_args: list = [account_id, direction]
+                if _sym_filter:
+                    _pos_args.append(_sym_filter)
+                    _pos_sql += f" AND symbol=${len(_pos_args)}"
+                _pos_sql += " ORDER BY open_time DESC"
+                rows = await self._db.fetch(_pos_sql, *_pos_args)
+                for _r in (rows or []):
+                    if _fam and _magic_family(_r["magic"]) != _fam:
+                        continue
+                    entry = float(_r["open_price"])
+                    sl = _r["sl"]
+                    break
             except Exception as exc:
                 # DB 故障 fail-open（已拍板），但必须可观测
                 logger.critical(
@@ -718,14 +753,14 @@ class RuleChain:
                     message="cooldown DB error — fail-open",
                 )
 
-        # 无同向 open 持仓（flat）→ 放行
+        # 无**同族** open 持仓（flat / 该族首笔）→ 放行
         if entry is None:
             return RuleResult(
                 rule_name="risk_cool_minutes",
                 passed=True,
                 actual_value=0.0,
                 threshold=0.0,
-                message="no same-direction open position — passed",
+                message=f"no same-family open position (magic_fam={_fam}) — passed",
             )
 
         # sl 未知 → fail-open（已拍板；备选更安全：视为未达保本拦截）
@@ -745,53 +780,61 @@ class RuleChain:
                 passed=True,
                 actual_value=round(float(sl), 2),
                 threshold=round(float(entry), 2),
-                message=f"最新同向持仓SL={sl:.2f} 已达保本(entry={entry:.2f})，放行",
+                message=f"最新同族(magic_fam={_fam})持仓SL={sl:.2f} 已达保本"
+                        f"(entry={entry:.2f})，放行",
             )
         return RuleResult(
             rule_name="risk_cool_minutes",
             passed=False,
             actual_value=round(float(sl), 2),
             threshold=round(float(entry), 2),
-            message=f"最新同向持仓SL={sl:.2f} 未达保本(entry={entry:.2f})，禁止开新单",
+            message=f"最新同族(magic_fam={_fam})持仓SL={sl:.2f} 未达保本"
+                    f"(entry={entry:.2f})，禁止开新单",
         )
 
 
-    async def _account_be_from_db(self, account_id: int, direction: str, tol: float):
-        """查 PG positions 判定账户最新同向持仓是否已达保本（extreme_pending 回退真值源）。
+    async def _account_be_from_db(self, account_id: int, direction: str, tol: float,
+                                  family: int = 0):
+        """查 PG positions 判定账户最新**同族**同向持仓是否已达保本。
+
+        `family=0` → 旧口径（不按 magic 族过滤；`_check_reverse_order` 等既有调用
+        行为逐位不变）；`family≠0` → 只取 magic 族相同的最新一笔
+        （按 Magic 归口的保本追单闸门，见 `_check_cooldown`）。
 
         Returns:
             (at_be, err):
-              at_be=True   → 有同向持仓且 SL 已达保本；
-              at_be=False  → 有同向持仓但 SL 未达保本；
-              at_be=None   → 无同向持仓 / sl 未知（无法确认保本）；
+              at_be=True   → 有同族持仓且 SL 已达保本；
+              at_be=False  → 有同族持仓但 SL 未达保本；
+              at_be=None   → 无同族持仓 / sl 未知（无法确认保本）；
               err=True     → DB 查询异常（调用方应从严处理）。
-        与 _check_cooldown 正常路径的 PG 查询同口径（同 SQL、同 tol 判定）。
         """
         if self._db is None or not self._db.is_initialized or account_id <= 0:
             return (None, False)
         try:
-            row = await self._db.fetchrow(
-                "SELECT open_price, sl FROM hcm_trading.positions "
+            rows = await self._db.fetch(
+                "SELECT open_time, open_price, sl, magic FROM hcm_trading.positions "
                 "WHERE account_id=$1 AND direction=$2 "
                 "AND direction IN ('BUY','SELL') "
                 "AND status='open' "
                 "AND mt5_ticket IS NOT NULL AND mt5_ticket > 0 AND lot > 0 "
                 "AND open_price IS NOT NULL "
-                "ORDER BY open_time DESC LIMIT 1",
+                "ORDER BY open_time DESC",
                 account_id, direction,
             )
-            if row is None:
-                return (None, False)
-            entry = float(row["open_price"])
-            sl = row["sl"]
-            if sl is None:
-                return (None, False)
-            at_be = (sl >= entry - tol) if direction == "BUY" else (sl <= entry + tol)
-            return (at_be, False)
+            for row in (rows or []):
+                if family and _magic_family(row["magic"]) != family:
+                    continue
+                sl = row["sl"]
+                if sl is None:
+                    return (None, False)
+                entry = float(row["open_price"])
+                at_be = (sl >= entry - tol) if direction == "BUY" else (sl <= entry + tol)
+                return (at_be, False)
+            return (None, False)
         except Exception as exc:
             logger.critical(
-                "DB FAILED in _account_be_from_db(BE gate, account=%s, dir=%s): %s",
-                account_id, direction, exc,
+                "DB FAILED in _account_be_from_db(BE gate, account=%s, dir=%s, fam=%s): %s",
+                account_id, direction, family, exc,
             )
             return (None, True)
 
@@ -1070,14 +1113,25 @@ class RuleChain:
         """
         if self._config is None:
             logger.critical(
-                "RuleChain: ConfigProviderV3 unavailable — DEGRADED, "
-                "evaluate() will PASS all signals (no risk control)"
+                "RuleChain: ConfigProviderV3 unavailable — thresholds NEVER loaded. "
+                "evaluate() FAILS CLOSED and REJECTS all signals "
+                "(config_unloaded; no risk control possible). "
+                "[2026-09-17 修正：原日志误写 'PASS all signals'，与 evaluate() 中 "
+                "config_unloaded 分支的实际行为（REJECT）完全相反，会误导运维]"
             )
             self._config_loaded = False
             return
 
         try:
             new_min_conf = await self._config.get_float("risk_min_confidence")
+            # 【2026-09-17 量纲隔离】FSM 子模式独立阈值（见 _check_confidence 注释）：
+            #   trend 默认 0.0（实测该闸门对 trend 无筛选力、仅错杀）；
+            #   box 默认沿用全局 risk_min_confidence ⇒ 零行为变化。
+            # 键名沿用同目录既有 `risk_min_confidence` 的**无前缀**风格，便于运维并排查看。
+            new_min_conf_trend = await self._config.get_float(
+                "risk_min_confidence_fsm_trend", 0.0)
+            new_min_conf_box = await self._config.get_float(
+                "risk_min_confidence_fsm_box", new_min_conf)
             new_max_lot = await self._config.get_float("risk.max_lot_per_trade")
             new_total = await self._config.get_float("risk.max_total_exposure")
             # [2026-07-24 修复] 默认改 10（原 get_int 默认 0 → 缺失即禁用检查 → 7-20 爆炸式开单）。
@@ -1086,15 +1140,9 @@ class RuleChain:
             new_max_pos = await self._config.get_int("risk.max_concurrent_signals", 10)
             new_daily = await self._config.get_float("risk.max_daily_loss")
             new_margin = await self._config.get_float("risk.margin_call_level")
-            new_spread = await self._config.get_float("risk_spread_max_multiplier", 999.0)
             new_cool = await self._config.get_int("risk.cooldown_minutes", 5)
             # [2026-08-22] 同向保本闸门容差（价格单位，默认 0）
             new_be_tol = await self._config.get_float("risk.cool_be_tolerance", 0.0)
-            try:
-                spread_mult = await self._config.get_float("risk_spread_max_multiplier", 0)
-                new_spread_enabled = spread_mult > 0
-            except Exception:
-                new_spread_enabled = False
 
             # ── 分值驱动最大持仓数（2026-08-11 v2.5）──
             new_score_pos_enabled = await self._config.get_bool("risk.score_driven_positions_enabled", False)
@@ -1106,15 +1154,15 @@ class RuleChain:
 
             # All reads succeeded → commit atomically.
             self._min_confidence = new_min_conf
+            self._min_conf_fsm_trend = new_min_conf_trend
+            self._min_conf_fsm_box = new_min_conf_box
             self._max_lot_single = new_max_lot
             self._max_total_lot = new_total
             self._max_open_positions = new_max_pos
             self._max_daily_loss = new_daily
             self._min_margin = new_margin
-            self._max_spread_pips = new_spread
             self._cool_minutes = new_cool
             self._be_tolerance = new_be_tol
-            self._spread_check_enabled = new_spread_enabled
             self._score_driven_positions_enabled = new_score_pos_enabled
             self._score_tier_low_positions = new_score_tier_low
             self._score_tier_mid_positions = new_score_tier_mid
@@ -1125,12 +1173,11 @@ class RuleChain:
             logger.info(
                 "RuleChain config loaded: confidence=%.2f, single_lot=%.2f, "
                 "total_exposure=%.2f, max_pos=%d, daily_loss=%.2f, min_margin=%.2f, "
-                "max_spread=%.1f, cool_min=%d, be_tol=%.2f, spread_check=%s, "
+                "cool_min=%d, be_tol=%.2f, "
                 "score_pos_enabled=%s tier_low=%.2f tier_mid=%.2f pos_low=%d pos_mid=%d pos_high=%d",
                 self._min_confidence, self._max_lot_single, self._max_total_lot,
                 self._max_open_positions, self._max_daily_loss, self._min_margin,
-                self._max_spread_pips, self._cool_minutes, self._be_tolerance,
-                self._spread_check_enabled,
+                self._cool_minutes, self._be_tolerance,
                 self._score_driven_positions_enabled, self._score_tier_low_positions,
                 self._score_tier_mid_positions, self._max_positions_low,
                 self._max_positions_mid, self._max_positions_high,

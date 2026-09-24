@@ -491,6 +491,8 @@ def main():
     ap.add_argument("--horizon", type=int, default=None, help="覆盖 ai.lm.label_horizon_bars")
     ap.add_argument("--ds-calibrate", action="store_true",
                     help="设计文档 1.3：用 DeepSeek 票为样本加权 ds_calib_weight（不改 label）")
+    ap.add_argument("--since-days", type=int, default=None,
+                   help="仅抽取最近 N 天的信号（离线长窗口对照用，默认全表）")
     ap.add_argument("--sl-source", choices=["prefer_real", "real", "atr_fallback"], default=None,
                     help="【2026-08-28 标签口径统一】R(风险距离)来源：real=仅保留真实 sl_price 的信号"
                          "（标签与入场质量挂钩）；atr_fallback=统一用 atr×倍数（默认，向后兼容）")
@@ -566,6 +568,11 @@ def main():
         # indicator_values 口径一致(均含 rsi_14/adx_14/macd/atr_14/h1_*)，可安全并入。
         modes = [m.strip() for m in (args.mode or "").split(",") if m.strip()] or ["HEXP:%"]
         _mode_clause = " OR ".join(["s.signal_mode LIKE %s"] * len(modes))
+        _since_clause = ""
+        _params = tuple(modes)
+        if args.since_days is not None:
+            _since_clause = " AND s.created_at >= now() - make_interval(days => %s)"
+            _params = _params + (int(args.since_days),)
         with conn.cursor() as cur:
             cur.execute(
                 f"""
@@ -576,10 +583,10 @@ def main():
                 FROM hcm_signal.signals s
                 WHERE ({_mode_clause})
                   AND s.signal_dir IN ('BUY','SELL')
-                  AND s.entry_price IS NOT NULL AND s.entry_price > 0
+                  AND s.entry_price IS NOT NULL AND s.entry_price > 0{_since_clause}
                 ORDER BY s.created_at
                 """,
-                tuple(modes),
+                _params,
             )
             cols = [d[0] for d in cur.description]
             rows = cur.fetchall()

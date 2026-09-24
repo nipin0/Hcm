@@ -7,8 +7,9 @@
   4. 冻结箱体生命周期：离开 S1 → 解冻（此前永不成立 → 旧箱体永久沿用）
   5. 梯度手数：档位读自桥侧计数器 `hcm:state:osc_loss_count`
   6. 4ATR 锁止清锁：S5→S0 必须把双计数器**落 Redis**（否则下一根立即复锁）
-  7. 计数器推进纯函数 `apply_osc_close`（桥侧回写调用的同一实现）：tp 归零 / sl 累加 /
-     其它（be/manual/expert/stop_out）不计入
+  7. 计数器推进纯函数 `apply_osc_close`（桥侧回写调用的同一实现）：
+     `tp` → 双计数器归零；`sl` → `atr_loss` 累加且 `count`+1；
+     其余（be/manual/expert/stop_out，含未知/空）→ **只把 `count` 归零**、`atr_loss` 原样保留
   8. 端到端：2 次 2×ATR 止损 → 累计 4.0ATR → S1 判为 S5 锁止
 
 用法：python verify_state_strategy_osc.py
@@ -111,15 +112,20 @@ async def main() -> None:
     ck("触上沿 → reason", it4.reason, "osc_at_box_upper")
 
     print("\n=== 4) 冻结箱体：TP 锚点锁定当轮中值，不随新箱体滑动 ===")
-    # SYM 在第 1 步已开仓 → 箱体已冻结（mid=106.5）。现在把箱体整体上移 100 点。
-    h5, l5, c5 = bars(213.0, 200.0)
-    c5[-1] = 200.1
-    it5 = await strat.decide(SYM, "S1_OSC", high=h5, low=l5, close=c5,
+    # SYM 在第 1 步已开仓 → 箱体已冻结（mid=106.5）。现在把**滚动箱**整体上移 100 点。
+    # 【2026-09-17 C 修订本用例】原用 `c5[-1]=200.1`（远在冻结箱 [100,113] **之外**）触发入场
+    # — 那正是 C 新增的双侧判据要拦的"箱外"情形 ✗（旧单边判据 `c >= up-tol` 会放行）。
+    # 改用**冻结箱上沿以内**的 112.9：对本用例反而**更严格** —— 若代码误用滚动箱 [200,213]，
+    # 112.9 会落在该箱**下方**（`_at_lower` 要求 c≥200 不成立）⇒ 不触发入场 ⇒ 用例即失败。
+    h5, l5, _c5 = bars(213.0, 200.0)
+    c4 = [112.9] * len(h5)
+    it5 = await strat.decide(SYM, "S1_OSC", high=h5, low=l5, close=c4,
                              atr=ATR, slope=0.0)
     ck("冻结后 box_mid 仍为当轮值", round(it5.box_mid, 2), 106.5)
     ck("冻结后 tp_anchor 仍为当轮值", round(it5.tp_anchor, 2), 106.5)
 
-    print("\n=== 5) 离开 S1 → 解冻（规格 §7.1：状态切换结束本轮）===")
+    print("\n=== 5) 离开箱体入场态且无持仓 → 解冻（规格 §7.1；B 修追加该条件）===")
+    c5 = [200.1] * len(h5)          # 贴**滚动箱**下沿（解冻后应改用新箱体）
     it6 = await strat.decide(SYM, "S2_TREND_INIT", high=h5, low=l5, close=c5,
                              atr=ATR, slope=0.5, direction="up")
     ctx = await strat.get_ctx(SYM)
@@ -156,11 +162,30 @@ async def main() -> None:
     print("\n=== 8) 计数器推进纯函数 apply_osc_close（桥侧回写调用的同一实现）===")
     ck("tp → 双计数器归零", SM.apply_osc_close("tp", 99.0, 3.5, 2), (0.0, 0))
     ck("sl → 累加 ATR 且计数+1", SM.apply_osc_close("sl", 2.0, 1.5, 1), (3.5, 2))
-    ck("be → 不计入", SM.apply_osc_close("be", 2.0, 1.5, 1), (1.5, 1))
-    ck("manual → 不计入", SM.apply_osc_close("manual", 2.0, 1.5, 1), (1.5, 1))
-    ck("expert → 不计入", SM.apply_osc_close("expert", 2.0, 1.5, 1), (1.5, 1))
-    ck("stop_out → 不计入", SM.apply_osc_close("stop_out", 2.0, 1.5, 1), (1.5, 1))
+    # 【2026-09-21 语义变更】非 sl 平仓 ⇒ 只归零 count（打断"连续"），atr_loss 原样保留
+    ck("be → count 归零、atr_loss 不动", SM.apply_osc_close("be", 2.0, 1.5, 1), (1.5, 0))
+    ck("manual → count 归零、atr_loss 不动",
+       SM.apply_osc_close("manual", 2.0, 1.5, 1), (1.5, 0))
+    ck("expert → count 归零、atr_loss 不动",
+       SM.apply_osc_close("expert", 2.0, 1.5, 1), (1.5, 0))
+    ck("stop_out → count 归零、atr_loss 不动",
+       SM.apply_osc_close("stop_out", 2.0, 1.5, 1), (1.5, 0))
+    ck("未知/空归因 → 同样只归零 count（规则全域，无静默特例）",
+       SM.apply_osc_close("", 2.0, 1.5, 1), (1.5, 0))
     ck("sl 的 sl_atr 负值被夹到 0", SM.apply_osc_close("sl", -5.0, 1.5, 1), (1.5, 2))
+
+    # 【2026-09-21 新增不变式 · "连续"语义】`sl` 累进；任意非 `sl` 打断 ⇒ `count` 回 0；
+    # 而 `atr_loss` **只在 `tp` 归零** —— 两种语义必须各自独立（不可混用）。
+    _a_, _c_ = 0.0, 0
+    for _r_ in ("sl", "sl"):
+        _a_, _c_ = SM.apply_osc_close(_r_, 1.0, _a_, _c_)
+    ck("sl,sl → 连续 2 次、累计 2.0ATR", (_c_, round(_a_, 3)), (2, 2.0))
+    _a_, _c_ = SM.apply_osc_close("expert", 1.0, _a_, _c_)
+    ck("再遇 expert → count 归零（连续被打断）", _c_, 0)
+    ck("再遇 expert → atr_loss 保留（预算未被误清）", round(_a_, 3), 2.0)
+    _a_, _c_ = SM.apply_osc_close("sl", 1.0, _a_, _c_)
+    ck("expert 后再 sl → count 从 0 重新计为 1", _c_, 1)
+    ck("直到 tp → atr_loss 才归零", SM.apply_osc_close("tp", 0.0, _a_, _c_), (0.0, 0))
 
     print("\n=== 9) 端到端：2 次 2×ATR 止损 → 累计 4.0ATR → S1 锁止 ===")
     fsm2 = SM.MarketStateMachine(config_provider=None, redis_client=redis)
@@ -455,6 +480,106 @@ async def main() -> None:
        strat._pullback_level("UP", hT[:3], lT[:3], W, ATR, 111.9), 0.0)
 
     strat._entry_mode = "close_check"      # 复原默认，避免污染后续断言
+
+    print("\n=== 19) 马丁补仓：SL 后同向补下一档（不等箱体重建/不等状态）===")
+    # 场景：箱体 [100,113]、ATR=1。首单仍走箱体下沿 BUY；随后模拟桥侧写回的**止损**
+    #   （`osc_loss_count` 0→1、`osc_atr_loss` 0→1.5），下一根 bar **价格在箱体中部
+    #   （远不贴边）、且状态为 S0_IDLE（非箱体入场态）** ⇒ 若仍需箱体条件就绝不会开仓；
+    #   马丁补仓应在此**直接同向 BUY 补下一档**（证明与箱体/状态均已解耦）。
+    _MAL = SM.OSC_LOSS_COUNT_KEY_TMPL
+    _LOK = SM.OSC_LOSS_KEY_TMPL
+    _SY = SYM + "MA"
+    redis.kv[_MAL.format(symbol=_SY)] = "0"
+    redis.kv[_LOK.format(symbol=_SY)] = "0.0"
+    _itM0 = await strat.decide(_SY, "S1_OSC", high=high, low=low,
+                               close=[100.1] * len(high), atr=ATR, slope=0.0)
+    ck("马丁·首单仍走箱体（触下沿 BUY）", _itM0.reason, "osc_at_box_lower")
+    ck("马丁·首单档位=ladder[0]", _itM0.lot_multiplier, ladder[0])
+    _ctxM = await strat.get_ctx(_SY)
+    ck("马丁·已记录本轮入场方向", _ctxM.osc_last_dir, "BUY")
+
+    # 桥侧写回止损：count +1、atr_loss 累加（真值由 `apply_osc_close` 给出，见 §8）
+    redis.kv[_MAL.format(symbol=_SY)] = "1"
+    redis.kv[_LOK.format(symbol=_SY)] = "1.5"
+    _itM1 = await strat.decide(_SY, "S0_IDLE", high=high, low=low,
+                               close=[106.0] * len(high), atr=ATR, slope=0.0,
+                               positions_open=0)
+    ck("马丁·止损后同向补 → action", _itM1.action, "open")
+    ck("马丁·止损后同向补 → 方向=本轮方向", _itM1.direction, "BUY")
+    ck("马丁·止损后同向补 → reason", _itM1.reason, "osc_martingale_sl")
+    ck("马丁·止损后同向补 → 档位=ladder[1]", _itM1.lot_multiplier, ladder[1])
+    ck("马丁·止损后同向补 → 无视状态（S0 也补）", _itM1.action, "open")
+    # 幂等：同一笔止损只补一次（快照已更新 ⇒ 再评估不得重复补）
+    _itM2 = await strat.decide(_SY, "S0_IDLE", high=high, low=low,
+                               close=[106.0] * len(high), atr=ATR, slope=0.0,
+                               positions_open=0)
+    ck("马丁·同一止损不重复补", _itM2.reason != "osc_martingale_sl", True)
+    # 4ATR 预算为**硬刹车**：预算用尽 ⇒ 不补（不放宽既有防爆仓闸门）
+    _SY2 = SYM + "MA2"
+    redis.kv[_MAL.format(symbol=_SY2)] = "0"
+    redis.kv[_LOK.format(symbol=_SY2)] = "0.0"
+    await strat.decide(_SY2, "S1_OSC", high=high, low=low,
+                       close=[100.1] * len(high), atr=ATR, slope=0.0)
+    redis.kv[_MAL.format(symbol=_SY2)] = "3"
+    redis.kv[_LOK.format(symbol=_SY2)] = "5.0"          # ≥ state.osc_atr_loss_limit(4.0)
+    _itM3 = await strat.decide(_SY2, "S0_IDLE", high=high, low=low,
+                               close=[106.0] * len(high), atr=ATR, slope=0.0,
+                               positions_open=0)
+    ck("马丁·4ATR 预算用尽 → 不补（刹车）",
+       _itM3.reason != "osc_martingale_sl", True)
+    # 未平仓（positions_open>0）时也不补 —— 不制造超仓
+    _SY3 = SYM + "MA3"
+    redis.kv[_MAL.format(symbol=_SY3)] = "0"
+    redis.kv[_LOK.format(symbol=_SY3)] = "0.0"
+    await strat.decide(_SY3, "S1_OSC", high=high, low=low,
+                       close=[100.1] * len(high), atr=ATR, slope=0.0)
+    redis.kv[_MAL.format(symbol=_SY3)] = "1"
+    redis.kv[_LOK.format(symbol=_SY3)] = "1.5"
+    _itM4 = await strat.decide(_SY3, "S0_IDLE", high=high, low=low,
+                               close=[106.0] * len(high), atr=ATR, slope=0.0,
+                               positions_open=1)
+    ck("马丁·未平仓 → 不补", _itM4.reason != "osc_martingale_sl", True)
+
+    print("\n=== 20) 连续根数**同 bar 去重**（P1-7：防重复评估把 N 根虚增）===")
+    # 破界：同一 bar_id 被评估两次 → 只推进 1 根（无去重会 +2 ⇒ `break_confirm=2`
+    #   被 1 根满足 ⇒ 提前 1 根离场。实证：2026-09-18 ticket 426224111）。
+    _bc_save = strat._break_confirm
+    strat._break_confirm = 2       # 与生产一致（DEFAULTS=0 关闭，离线需显式打开）
+    _SYB = SYM + "BK"
+    _itbk0 = await strat.decide(_SYB, "S1_OSC", high=high, low=low,
+                                close=[100.1] * len(high), atr=ATR, slope=0.0,
+                                bar_id="B1")
+    ck("同bar去重·B1 开仓", _itbk0.action, "open")
+    _itbk1 = await strat.decide(_SYB, "S1_OSC", high=high, low=low,
+                                close=[99.0] * len(high), atr=ATR, slope=0.0,
+                                positions_open=1, bar_id="B2")
+    ck("同bar去重·B2 破界=1", _itbk1.break_streak, 1)
+    _itbk2 = await strat.decide(_SYB, "S1_OSC", high=high, low=low,
+                                close=[99.0] * len(high), atr=ATR, slope=0.0,
+                                positions_open=1, bar_id="B2")
+    ck("同bar去重·B2 重复评估仍=1", _itbk2.break_streak, 1)
+    ck("同bar去重·B2 重复评估不触发离场", _itbk2.exit_now, False)
+    _itbk3 = await strat.decide(_SYB, "S1_OSC", high=high, low=low,
+                                close=[99.0] * len(high), atr=ATR, slope=0.0,
+                                positions_open=1, bar_id="B3")
+    ck("同bar去重·B3 破界=2 → 触发离场", _itbk3.exit_now, True)
+    strat._break_confirm = _bc_save
+    # 贴边防抖同理（`entry_confirm` 调大到 3 才可见；默认 1 时无行为差异）
+    _ec_save = strat._entry_confirm
+    strat._entry_confirm = 3
+    _SYE = SYM + "EG"
+    _ite1 = await strat.decide(_SYE, "S1_OSC", high=high, low=low,
+                               close=[100.1] * len(high), atr=ATR, slope=0.0, bar_id="E1")
+    ck("同bar去重·E1 贴边=1（未达 3）", _ite1.edge_streak, 1)
+    _ite2 = await strat.decide(_SYE, "S1_OSC", high=high, low=low,
+                               close=[100.1] * len(high), atr=ATR, slope=0.0, bar_id="E1")
+    ck("同bar去重·E1 重复评估仍=1", _ite2.edge_streak, 1)
+    await strat.decide(_SYE, "S1_OSC", high=high, low=low,
+                       close=[100.1] * len(high), atr=ATR, slope=0.0, bar_id="E2")
+    _ite4 = await strat.decide(_SYE, "S1_OSC", high=high, low=low,
+                               close=[100.1] * len(high), atr=ATR, slope=0.0, bar_id="E3")
+    ck("同bar去重·E3 贴边=3 → 开仓", _ite4.action, "open")
+    strat._entry_confirm = _ec_save
 
     print("\n" + "=" * 70)
     print(f"共 {CHECKS} 项，失败 {len(FAILED)} 项"

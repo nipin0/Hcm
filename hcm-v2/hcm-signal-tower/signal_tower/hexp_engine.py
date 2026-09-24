@@ -311,6 +311,15 @@ _DEFAULTS: dict[str, Any] = {
     "hexp.range_hurst_max": 0.50,              # hurst 均值回归阈值：<此视为均值回归态(反持续)
     "hexp.range_hurst_hi": 0.80,               # 高位分界：BUY pos>此 / SELL pos<(1-此) 视为极值区追单
     "hexp.range_hurst_regimes": "NEUTRAL,RANGE",  # 启用本校验的体制（逗号分隔）
+    # 【2026-09-18 用户拍板·微动量追单否决】|mm| ≥ 此值 → 拒单（0 = 关闭）。
+    # 归因依据（XAUUSD M5 45 天 / 1433 条 hexp 方向信号；tools/_scratch/range_trend_attrib.py）：
+    #   |mm| ≥ 0.5 档（n=35）：Rprod=-0.614、胜率 45.7%、**MAE 中位 17.46×ATR**（总体 3.35 的 5.2 倍）、
+    #   nat24=-3.13×ATR；其中 TREND 子集 Rprod=-0.851 / nat24=-6.29 —— 是全部判据中
+    #   "进场即逆势"最强的一档。语义：微动量已冲到极值 ⇒ 行情已走出大半，
+    #   此时顺势进场 = 追顶/追底。与之互补而非重复：momentum_flip 拦"动量**逆向**"，
+    #   本闸拦"动量**同向但已极端**"（后者此前无任何闸门覆盖）。
+    # 默认 0 = 关闭（零行为变更）；置 0.5 启用，置 0 秒级回退。
+    "hexp.mm.veto_abs": 0.0,
     # 防抵消（方案1·位置调制权重）：NEUTRAL/RANGE 均值回归态消除 dir_sum 因子抵消。
     "hexp.anti_cancel.enabled": True,   # 总开关；False→关闭(向后兼容)
     "hexp.anti_cancel.curve": 1.0,      # 位置调制强度(指数)：越大越极端时越放大反向/压缩趋势
@@ -419,6 +428,12 @@ _DEFAULTS: dict[str, Any] = {
     "hexp.trend_start_order_enabled": True,
     "hexp.trend_start.new_mode_order_allowed": True,
     "hexp.trend_start_min_grade": "ANY",
+    # 【2026-09-17 变更·A1 方案乙·用户拍板】趋势启动覆写是否豁免函数末尾的
+    # min_grade 兜底（该兜底会把覆写结果打回 NO_TRADE/False，使本功能对其设计
+    # 场景"grade 未达 hexp.min_grade"永不生效）：
+    #   true （默认）= 豁免 ⇒ 只要满足 trend_start_min_grade 即放行（方案乙）
+    #   false        = 不豁免 ⇒ 覆写被回滚，等价改造前行为（方案甲，可秒级回退）
+    "hexp.trend_start.min_grade_exempt": True,
     # ── 【2026-09-08 用户拍板·续】待拍板清单剩余 3 键全启动 ──
     # reverse_order_enabled / zone.block_enabled / zone.penalty_enabled 配置中心
     # 自部署起已是 true / true / true（键名带 hexp. 前缀），但 _DEFAULTS 未登记
@@ -709,6 +724,52 @@ class HexpEngine:
             changed = [f"{k}: {prev.get(k)}→{v}" for k, v in snapshot.items() if prev.get(k) != v]
             if changed:
                 logger.info("HexpEngine config hot-reloaded | %s", "; ".join(changed))
+
+        # ── 【2026-09-17 P0 自检 · A1】趋势启动覆写门槛 vs 全局 min_grade 一致性 ──
+        # 事实（审计 A1）：produce() 的趋势启动覆写（约 2829 行）会把 direction 翻回
+        # BUY/SELL 并置 threshold_passed=True，但**同一函数末尾**的 min_grade 兜底
+        # （`if not _grade_ok:`，约 2948 行）会无条件再把两者打回 NO_TRADE / False。
+        # 而覆写的设计触发场景恰是"grade 未达 min_grade"（`_grade_ok=False`）⇒ 只要
+        # `hexp.trend_start_min_grade` 比 `hexp.min_grade` **更松**，覆写就会在末尾被
+        # 回滚，该功能对目标信号永不生效（"配置了却不生效"）。
+        # 本块**仅告警、不改变任何行为**；是否放行属策略口径，须走变更说明（A1 方案乙）。
+        # 仅首次加载、或这两键发生变化时评估一次，避免每 30s 热重载刷屏。
+        _a1_touched = (
+            prev is None
+            or prev.get("hexp.min_grade") != snapshot.get("hexp.min_grade")
+            or prev.get("hexp.trend_start_min_grade") != snapshot.get("hexp.trend_start_min_grade")
+            or prev.get("hexp.trend_start.min_grade_exempt")
+            != snapshot.get("hexp.trend_start.min_grade_exempt")
+        )
+        if _a1_touched:
+            try:
+                _mg = str(snapshot.get("hexp.min_grade") or "C").strip().upper()
+                _tsg = str(snapshot.get("hexp.trend_start_min_grade") or "").strip().upper()
+                _mg_rank = _GRADE_RANK.get(_mg, 1)
+                _ts_rank = _GRADE_RANK.get(_tsg, 1)
+                _a1_exempt = bool(snapshot.get("hexp.trend_start.min_grade_exempt", True))
+                if _tsg and _ts_rank < _mg_rank:
+                    if _a1_exempt:
+                        # 方案乙已启用：覆写豁免末尾兜底，属**预期状态**，非缺陷
+                        logger.info(
+                            "HexpEngine A1 状态: trend_start_min_grade=%s(rank=%d) 比 "
+                            "min_grade=%s(rank=%d) 更松，且 min_grade_exempt=true（A1 方案乙）"
+                            "⇒ 趋势启动覆写豁免 produce() 末尾的 min_grade 兜底，"
+                            "'评级不足但满足趋势启动门槛'的信号可放行。",
+                            _tsg, _ts_rank, _mg, _mg_rank,
+                        )
+                    else:
+                        logger.warning(
+                            "HexpEngine 配置不一致(A1): hexp.trend_start_min_grade=%s(rank=%d) "
+                            "比 hexp.min_grade=%s(rank=%d) 更松，且 "
+                            "hexp.trend_start.min_grade_exempt=false ⇒ 趋势启动覆写会在 "
+                            "produce() 末尾被 min_grade 兜底回滚，对'评级不足'的信号永不生效。"
+                            "如需放行请把 min_grade_exempt 置 true（方案乙）。",
+                            _tsg, _ts_rank, _mg, _mg_rank,
+                        )
+            except Exception:
+                # 自检失败绝不影响配置加载主流程
+                pass
 
     async def _load(self) -> dict[str, Any]:
         """返回当前配置快照（热路径）。
@@ -1179,6 +1240,12 @@ class HexpEngine:
                 logger.warning("hexp fetch %s %s failed: %s", symbol, p, exc)
                 continue
             if not ks or len(ks) < 60:
+                # 【2026-09-17 B15-2】原为**静默 continue**：该周期被丢弃后，共振权重
+                # 分母 `wsum_r` 随之少算 ⇒ `verdict` 静默漂移，且无任何日志可查。
+                # 补 WARNING（不改行为，仅可观测）。
+                logger.warning(
+                    "hexp %s | 周期 %s K线不足（got=%s, need>=60）→ 该周期不参与共振，"
+                    "verdict 权重分母将少算", symbol, p, 0 if not ks else len(ks))
                 continue
             closes = np.array([k["close"] for k in ks], dtype=np.float64)
             highs = np.array([k["high"] for k in ks], dtype=np.float64)
@@ -1205,7 +1272,15 @@ class HexpEngine:
                 f_mm = self._mm_signal(
                     np.array([k["close"] for k in m1], dtype=np.float64), cfg)
         except Exception as exc:
-            logger.debug("hexp mm fetch failed: %s", exc)
+            # 【2026-09-17 B15-1】原为 `logger.debug`（生产 INFO 级**不可见**）⇒ `f_mm`
+            # 静默置 0，而 `f_mm=0` 会让 **4 道 mm 类护栏同时放宽**：
+            #   · 周期位置硬守护拿到"动量未反向"的豁免（`_mm_against_obs=False`）；
+            #   · `momentum_flip` / `pullback_gate` / `momentum_drain` 恒不触发。
+            # 提升为 WARNING 并写明后果，杜绝"塔在跑但护栏消失"而无痕。
+            logger.warning(
+                "hexp %s | mm(%s) fetch failed → f_mm=0，本轮 mm 类护栏将不生效"
+                "（momentum_flip / momentum_drain / pullback_gate / 周期位置豁免）: %s",
+                symbol, mm_period, exc)
 
         # 3) 每周期状态机 + TrendScore（五因子加权和，运行时归一）
         # 3) 体制感知因子权重（BUG-3）：依 M5 regime_result 在趋势/震荡/中性三方案间连续混合。
@@ -2177,6 +2252,17 @@ class HexpEngine:
         _dir_sign = 1.0 if direction == "BUY" else (-1.0 if direction == "SELL" else 0.0)
         # 微动量对齐度（与方向同号=仍朝原方向）：用 mm 平滑值，避免单根 mm 脉冲误触发护栏
         _mm_aligned = f_mm_s * _dir_sign
+        # 【2026-09-17 P0 修复·B6】`_er_now` / `_drain_er` 原先只在下方"动量枯竭"分支内赋值，
+        # 而该分支的门是 `direction in ("BUY","SELL") and passed and not _in_extreme`；
+        # 但**反向候选确认**区块（见下方 `if direction == "NO_TRADE" and _flip_block:`）
+        # 也引用这两个变量 ⇒ 二者门条件互斥：
+        #   · `passed == False`（grade 低于 hexp.min_grade，生产 min_grade=A/B 时很常见），或
+        #   · `hexp.momentum_drain_enabled == false`
+        # 时，`_er_now` 从未被赋值 ⇒ 触发点抛 UnboundLocalError ⇒ 该 bar 生产中断、无信号。
+        # 修法：提前到此处**无条件取值**（单一取数点），下方分支不再重复定义（反冗余，铁律十三）。
+        # 取值口径与原来完全一致（`_er_raw` 来自主周期因子），故本修复**零行为变化**。
+        _er_now = float(pf.get("_er_raw", 0.0))
+        _drain_er = float(cfg.get("hexp.momentum_drain_er", 0.20))
         # 长影线比（用主周期最新收盘 bar 的 open/high/low/close）
         _pdata = period_data[primary]
         _o, _h, _l, _c = float(_pdata["opens"][-1]), float(_pdata["highs"][-1]), \
@@ -2240,9 +2326,8 @@ class HexpEngine:
         _drain_enabled = bool(cfg.get("hexp.momentum_drain_enabled", True))
         if _drain_enabled and not _in_extreme and direction in ("BUY", "SELL") and passed:
             _drain_hi = float(cfg.get("hexp.momentum_drain_hi", 0.65))
-            _drain_er = float(cfg.get("hexp.momentum_drain_er", 0.20))
             _drain_mm = float(cfg.get("hexp.momentum_drain_mm", 0.15))
-            _er_now = float(pf.get("_er_raw", 0.0))
+            # `_er_now` / `_drain_er` 已在上方（`_mm_aligned` 处）无条件取值，此处不再重复定义
             _drained = False
             if direction == "BUY" and _pos_pct > _drain_hi and _er_now < _drain_er and _mm_aligned < _drain_mm:
                 _drained = True
@@ -2508,6 +2593,24 @@ class HexpEngine:
                 sr.range_hurst_blocked = True
                 if not sr.fallback_reason:
                     sr.fallback_reason = _rh_block
+        # ── A-4) 微动量追单否决（2026-09-18 用户拍板：|mm| ≥ hexp.mm.veto_abs 拒单）──
+        # 与上面四道硬护栏同栈（故也被 _ts_guard_blocked 覆盖 → 趋势启动覆写不得复活）。
+        # 归因（45 天 / 1433 条）：|mm|≥0.5 档 MAE 中位 17.46×ATR、nat24 -3.13×ATR、
+        # Rprod -0.614（TREND 子集 -0.851）—— "动量已极端仍顺势进场"= 追顶/追底。
+        # 互补性：momentum_flip 拦"动量逆向"，本闸拦"动量同向但已极端"（此前无覆盖）。
+        _mm_veto_abs = float(cfg.get("hexp.mm.veto_abs", 0.0) or 0.0)
+        if _mm_veto_abs > 0 and direction in ("BUY", "SELL") and abs(f_mm) >= _mm_veto_abs:
+            _mm_veto = (f"hexp_mm_chase_veto(mm={f_mm:.3f} |mm|>={_mm_veto_abs:.2f} "
+                        f"dir={direction} 动量已极端视为追单)")
+            logger.info("hexp %s %s | BLOCK %s (momentum already extreme → chase veto)",
+                        symbol, primary, _mm_veto)
+            direction = "NO_TRADE"
+            passed = False
+            sr.threshold_passed = False
+            sr.direction = "NO_TRADE"
+            sr.mm_chase_blocked = True
+            if not sr.fallback_reason:
+                sr.fallback_reason = _mm_veto
         # B) 回踩支撑位诊断（独立于 A 的封单判定，仅作再评估标记/日志）
         if direction in ("BUY", "SELL"):
             _pivot = self._get_recent_pivot(period_data[primary], direction, cfg)
@@ -2784,6 +2887,8 @@ class HexpEngine:
             or getattr(sr, "momentum_drain_blocked", False)
             or getattr(sr, "momentum_flip_blocked", False)
             or getattr(sr, "range_hurst_blocked", False)
+            # 【2026-09-18】微动量极端追单否决同样属硬护栏 → 趋势启动覆写不得复活
+            or getattr(sr, "mm_chase_blocked", False)
         )
         if _ts_guard_blocked and _ts_order_enabled and not _ts_order_blocked \
                 and _trend_start is not None:
@@ -2791,6 +2896,12 @@ class HexpEngine:
                 "hexp %s %s | TREND START ORDER SUPPRESSED dir=%s (安全护栏已拦截，"
                 "趋势启动覆写不放行) grade=%s", symbol, primary,
                 _trend_start.get("dir"), grade)
+        # 【2026-09-17 变更·A1 方案乙】`_ts_override_applied` 记录"趋势启动覆写是否真的
+        # 施加过"，供函数末尾的 min_grade 兜底判断是否豁免（见第 11 步）。
+        # `_ts_min_grade_exempt` 读 `hexp.trend_start.min_grade_exempt`（默认 true = 方案乙）；
+        # 置 false 即秒级回退为改造前行为（方案甲），无需改码/重启。
+        _ts_min_grade_exempt = bool(cfg.get("hexp.trend_start.min_grade_exempt", True))
+        _ts_override_applied = False
         if (_ts_order_enabled and not _ts_order_blocked and not _ts_guard_blocked
                 and _trend_start is not None and not passed):
             _ts_dir = _trend_start["dir"]
@@ -2817,6 +2928,7 @@ class HexpEngine:
                     _ts_rr = float(cfg["hexp.exec.rr_min"])
                 sr.direction = _ts_dir
                 sr.threshold_passed = True
+                _ts_override_applied = True   # A1 方案乙：标记覆写已施加，供末尾兜底豁免
                 sr.pre_score = round(total / 100.0, 4)
                 sr.co_exec_lot_mult = round(float(sr.co_exec_lot_mult) * _ts_lot_mult, 4)
                 sr.co_exec_sl_atr_mult = round(float(_ts_sl_mult), 4)
@@ -2847,9 +2959,12 @@ class HexpEngine:
                      f"verdict={verdict:+.2f} state={main_state} "
                      f"transition={transition} reversal={_rev_tag} lot×{red_mult:.2f}")
 
+        # 【2026-09-17 B15-7】`passed` 是**局部变量**，趋势启动覆写（A1）只改
+        # `sr.threshold_passed` 不回写局部 ⇒ 日志会出现"dir=BUY passed=False"的自相矛盾。
+        # 统一以输出契约 `sr.threshold_passed` 为准。
         logger.info(
             "hexp %s: dir=%s hp=%.1f k=%.2f grade=%s verdict=%+.2f total=%.1f passed=%s",
-            symbol, sr.direction, hp_100, k, grade, verdict, total, passed)
+            symbol, sr.direction, hp_100, k, grade, verdict, total, sr.threshold_passed)
 
         # ── 10.5) grade 与闸门同步观测（2026-09-01，纯观测·零裁决影响）──
         # grade 在 step9(1578) 先评出，而 A11-A16 等安全护栏全部跑在其后，只改
@@ -2915,7 +3030,9 @@ class HexpEngine:
                         "lot_reduction": round(red_mult, 3),
                         "lot_mult": sr.co_exec_lot_mult,
                         "close": close_v, "atr": round(atr, 5),
-                        "passed": bool(passed),
+                        # 【2026-09-17 B15-7】与日志同口径：改用输出契约 `sr.threshold_passed`
+                        # （含 A1 趋势启动覆写的放行结果），避免快照 "passed" 与 sr.direction 矛盾。
+                        "passed": bool(sr.threshold_passed),
                         # 2026-09-01：grade 被安全护栏否决标记。面板须据此区分
                         # 「A/S 级可交易」与「A/S 级但已被护栏封成 NO_TRADE」。
                         "grade_vetoed": bool(getattr(sr, "grade_vetoed", False)),
@@ -2934,7 +3051,14 @@ class HexpEngine:
         # 法路径把 direction 翻回 BUY/SELL 或 threshold_passed 置 True，此处强制回落，
         # 保证「评级低于 hexp.min_grade 的信号永不进入下单链路」。与 step9 的 min_grade
         # 闸门（1034-1053）双重保险，杜绝单点遗漏导致的「弱评级漏过」回归。
-        if not _grade_ok:
+        # 【2026-09-17 变更·A1 方案乙·用户拍板】唯一例外：趋势启动覆写。
+        # 该覆写的设计场景**恰是** grade 未达 min_grade，故若在此处照常回落，
+        # 覆写对其目标信号永不生效（实测生产 min_grade=B / trend_start_min_grade=ANY）。
+        # 当 `_ts_override_applied` 且 `hexp.trend_start.min_grade_exempt=true`（默认）时
+        # 豁免本兜底；安全边界不变 —— `_ts_guard_blocked` 已在上游拦住
+        # extreme_reversal / momentum_drain / momentum_flip / range_hurst 四道硬护栏，
+        # 且 RED 级在覆写条件里即被排除（`grade != "RED"`）。
+        if not _grade_ok and not (_ts_override_applied and _ts_min_grade_exempt):
             if sr.direction != "NO_TRADE" or sr.threshold_passed:
                 logger.warning(
                     "hexp %s | min_grade override: grade=%s < min_grade=%s forced NO_TRADE "
@@ -2944,6 +3068,11 @@ class HexpEngine:
             sr.direction = "NO_TRADE"
             if not sr.fallback_reason:
                 sr.fallback_reason = f"hexp_grade_below_min({grade}<{_min_grade})"
+        elif not _grade_ok and _ts_override_applied and _ts_min_grade_exempt:
+            logger.info(
+                "hexp %s | TREND START min_grade EXEMPT(A1 方案乙): grade=%s < min_grade=%s "
+                "但满足趋势启动门槛 → 放行 dir=%s passed=%s reason=%s",
+                symbol, grade, _min_grade, sr.direction, sr.threshold_passed, sr.fallback_reason)
 
         return sr
 

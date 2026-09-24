@@ -1169,8 +1169,10 @@ def create_dashboard_router(
         返回 co_source 评分引擎对当前行情的最终判定：
           pre_score        0-1 尺度的最终评分
           direction        BUY / SELL / NO_TRADE
-          threshold        自适应评分门槛（随行情带/风险/顺H1 动态变化）
-          threshold_passed 评分是否越过门槛（能否下单的核心布尔）
+          threshold        参考分档下界（随行情带/风险/顺H1 动态变化）；**非**放行判据
+          threshold_passed 能否下单的**唯一**放行布尔（= hexp `_grade_ok and
+                           direction != "NO_TRADE"`，与 `pre_score >= threshold` **无因果**，
+                           勿据 threshold 判读能否下单）
           adx / close / ts 行情上下文与更新时间
         """
         try:

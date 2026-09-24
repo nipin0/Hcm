@@ -25,10 +25,10 @@ DECISION_DEGRADE = "DEGRADE"
 # Rules that are considered "soft" — failure → DEGRADE instead of REJECT
 # [2026-07-24 修复] risk_cool_minutes（同向开仓冷却）已移出软规则，改为硬规则：
 # 冷却是时间闸门，降级放行会让"冷却期内仍开仓→同向连开"，故冷却失败必须 REJECT 阻断。
-# 仅点差(risk_max_spread_pips)保留为软规则（点差偏大时降级缩手数，而非完全阻断）。
-SOFT_RULES = {
-    "risk_max_spread_pips",
-}
+# [2026-09-17 C9 下架] 唯一剩余的软规则 risk_max_spread_pips（最大点差）已随规则本体
+# 一并移除（该规则因 signal 载荷无 spread 字段而恒跳过）⇒ 当前**无软规则**，
+# 所有规则失败一律 REJECT。保留空集合以维持既有 `in SOFT_RULES` 调用语义。
+SOFT_RULES: set[str] = set()
 
 # Rules that trigger DEGRADE when value is within a warning band
 DEGRADE_WARN_RATIO = 0.80  # If actual >= 80% of threshold, consider DEGRADE
@@ -146,12 +146,11 @@ class DecisionEngine:
                 continue
 
             # For rules where lower is better (confidence/margin): pass means actual >= threshold
-            # The ratio rules only apply for upper-bound checks (lot/spread etc.)
+            # The ratio rules only apply for upper-bound checks (lot etc.)
             upper_bound_rules = {
                 "risk_max_lot_single",
                 "risk_max_total_lot",
                 "risk_max_open_positions",
-                "risk_max_spread_pips",
             }
 
             # 【2026-09-08 审计修复 P1】risk_max_daily_loss 不属于 upper-bound 语义：

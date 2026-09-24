@@ -36,6 +36,7 @@ except Exception as exc:  # pragma: no cover
     print(f"[fatal] lightgbm unavailable: {exc}", file=sys.stderr)
     raise
 
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import (
     classification_report, confusion_matrix, f1_score,
     precision_recall_fscore_support, roc_auc_score,
@@ -43,7 +44,16 @@ from sklearn.metrics import (
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.utils.class_weight import compute_class_weight
 
-MODELS_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+# ⚠ 【2026-09-19 晋升纪律修复】默认输出目录**不再是生产目录**。
+#   此前 `MODELS_DIR_DEFAULT = <tools>/models`，而该目录是容器 `/app/review_models`
+#   的 **bind mount 源**（生产模型目录）⇒ **不带 `--outdir` 训练即等于"训练即上线"**。
+#   真实风险：`state_infer` 按 `max(version)` 隐式选版 ⇒ 一次误训练会被**立刻采纳**。
+#   现**复用本仓库既有的版本四态规范**（见 `auto_retrain.MODEL_STAGING_DIR`）：
+#     TRAIN（产物落 `_staging`，**不占版本号**）→ ACCEPT（人工确认）→ promote 到 `models/`
+#   为什么用**子目录**而非并列目录：`state_infer._discover` 是**非递归 glob**
+#   ⇒ `_staging/` 内文件**天然不会被发现**，无需改动任何加载逻辑（零风险）。
+MODELS_DIR_PROD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+MODELS_DIR_DEFAULT = os.path.join(MODELS_DIR_PROD, "_staging")
 
 # 类别顺序即 label_id（与 build_state_labels.STATE_NAMES 严格一致，契约）
 #
@@ -68,9 +78,34 @@ DEFAULTS = {
     "reg_lambda": 1.0,
     "max_depth": -1,
 }
-# 类别权重 boost（需求二.3：提升 trend_fade 召回；键=类别名）
+# 类别权重 boost（键=类别名；乘在 `balanced` 权重之上）
+#
+# 【2026-09-21 依据实测下调 `trend_fade`: 1.5 → 1.0】
+# 触发：生产报告"未出现 oscillation / trend_mid"，逐根对照**真值**发现
+#   `trend_mid` 被模型系统性误判为 `trend_fade`（本窗口 4/4，OOF `mid→fade` = 33.7%，
+#   且这些 bar 的**未来** `adx_slope` 为正 = ADX 在**上升**，按定义不可能是 fade）。
+# 归因（三级隔离，全部离线 OOF，base27 / 400 树 / 5 折 / gap=12）：
+#   ① 加"过去 12 根 ADX 变化"特征 ⇒ **无效**（`mid-vs-fade` AUC +0.0006，误判率 −0.4pt）
+#      ；且诊断显示 **过去 ADX 变化对未来 ADX 变化的符号一致率仅 0.4744**（≈随机）
+#   ② `adx_slope ≤ −3` 本身 AUC 0.7992，但**几乎全靠单特征 `adx_14`（0.7774）**
+#      ⇒ 模型学到的是"**ADX 高 ⇒ 会下降**"（均值回归），而非 ADX 走向
+#   ③ **改变本权重即显著改变 `mid→fade`**（见下表）⇒ **本项才是主因**
+#
+#   | fade_boost | macro_F1 | mid→fade | osc rec | init rec | mid rec | fade rec |
+#   |---|---|---|---|---|---|---|
+#   | 1.5（原值） | 0.3312 | 0.3374 | 0.1459 | 0.1542 | 0.4111 | 0.7908 |
+#   | **1.0（现值）** | **0.3337** | **0.2885** | **0.1546** | **0.1629** | **0.4414** | 0.7043 |
+#   | 0.7 | 0.3354 | 0.2381 | 0.1751 | 0.1758 | 0.4689 | 0.5965 |
+#
+# 为什么取 1.0 而非 0.7：1.0 = **纯 `balanced`**，是"无需额外假设"的默认；
+#   1.5 与 0.7 都需论证。1.0 已实现"三类 recall 全升 + macro_F1 升"的帕累托改善，
+#   代价仅 fade recall −8.7pt（而 fade 的 precision 原本只有 0.357、被过预测 2.22×，
+#   其假阳性正是"过度禁单 ⇒ 状态饥饿"的成因）。
+# ⚠ 诚实边界：以上均为**离线判别力指标**；fade recall 下降会减少"衰竭收紧止损"的触发，
+#   属实盘行为变化 ⇒ 晋升前须以 `replay_state_chain` / 前向复核，不可只看本表。
+# 回滚：把本值改回 1.5 并重训（或用版本钉切回 v5）。
 CLASS_WEIGHT_BOOST_DEFAULT = {"oscillation": 1.0, "trend_init": 1.0,
-                              "trend_mid": 1.0, "trend_fade": 1.5}
+                              "trend_mid": 1.0, "trend_fade": 1.0}
 
 
 def load_csv(path: str, cols: list[str]) -> pd.DataFrame:
@@ -112,9 +147,17 @@ def sample_weight_for(cw: dict, labels: np.ndarray) -> np.ndarray:
     return np.asarray([cw.get(int(c), 1.0) for c in labels])
 
 
-def oof_time_series(X: pd.DataFrame, y: np.ndarray, n_splits: int, cw: dict):
-    """时序 OOF 概率（手写循环：TimeSeriesSplit 首段不进测试集，cross_val_predict 会报错）。"""
-    tss = TimeSeriesSplit(n_splits=n_splits)
+def oof_time_series(X: pd.DataFrame, y: np.ndarray, n_splits: int, cw: dict,
+                    gap: int = 0):
+    """时序 OOF 概率（手写循环：TimeSeriesSplit 首段不进测试集，cross_val_predict 会报错）。
+
+    【2026-09-19 泄漏修复】`gap` = 训练折与验证折之间**丢弃**的 bar 数。
+    为什么必须 >0：标签是**前瞻**的（`label_metrics(i)` 用 `close[i+1 : i+horizon]`），
+    而 `TimeSeriesSplit` 默认让两折**首尾相接** ⇒ 训练折末尾 `horizon` 根的标签
+    用到了验证折开头 `horizon` 根的价格 ⇒ **折边界标签重叠**（轻度泄漏）。
+    取 `gap = horizon` 即可消除。默认 0 = 既有行为（调用方须显式给值）。
+    """
+    tss = TimeSeriesSplit(n_splits=n_splits, gap=gap)
     oof = None
     for tr, te in tss.split(X):
         m = build_model(42)
@@ -163,7 +206,157 @@ def report(tag: str, y_true: np.ndarray, proba: np.ndarray) -> dict:
             "samples": int(len(y_true))}
 
 
+# ── 【2026-09-19 阶段1】校准 + conformal（弃权闸的两块产物）────────────────────
+# 为什么需要：`state_infer` 的 `margin` 是 **top1−top2 的原始差**，不是概率，也没有绝对含义
+#   （生产实测：margin p50=0.128、≥0.60 仅 3.4%）。任何"概率闸门"都必须先有可解释的尺度。
+# 诚实边界（必须写明）：校准是**单调映射** ⇒ **不改变排序**。故它**不会**把
+#   "margin 与经济指标负相关"变成正相关（实测见 docs/方案_状态机判别力改进_20260919.md §8.2-D3、§8.4）。
+#   它做的是：让 p 有绝对含义（0.6 真的意味着 ~60% 正确），这是"弃权/路由"可被审计的前提。
+CONFORMAL_ALPHAS = (0.05, 0.10, 0.20)
+
+
+# 【2026-09-21 去重】此处原为 ECE 的**第 4 份**实现（数学等价，但参数序为 (p, hit)）。
+# 逻辑已收敛到 _calib_common.ece（唯一真源），本处只保留一层**参数序适配**，
+# 使本文件内 6 处调用（_cross_fitted_ece:256、evaluate:282/283/313/314）零改动。
+from _calib_common import ece as _ece_impl  # noqa: E402
+
+
+def _ece(p: np.ndarray, hit: np.ndarray, bins: int = 10) -> float:
+    """期望校准误差（等宽分箱，按样本数加权）。0 = 完美校准。实现见 _calib_common.ece。"""
+    return _ece_impl(hit, p, bins)
+
+
+def _cross_fitted_ece(p: np.ndarray, hit: np.ndarray, n_splits: int = 5) -> float:
+    """**交叉拟合**的"校准后 ECE" —— 校准验收门里**唯一有信息量**的那个数。
+
+    为什么必须交叉拟合（本项修复的缺陷）：isotonic 能**精确**拟合它自己见过的样本
+    ⇒ 在同一批 OOF 上同时"拟合校准器"并"报告校准后 ECE"，必然得到 ≈0
+    （**构造性结果，不含泛化信息**）。此前 meta 里的 `ece_cal = 0.0000` 就是这样来的，
+    它**不能**作为"校准良好"的证据。
+
+    做法：按**时间顺序**切 K 折（`oof_p` 本就按时间排），每折用其余 K−1 折拟合校准器、
+    在该折上评估 ECE，再按样本数加权汇总 ⇒ 得到**样本外**的 ECE。
+    分层：**不做随机洗牌**（时序数据洗牌会把未来折的信息带进过去折的校准器）。
+    """
+    n = len(p)
+    if n < n_splits * 20:
+        return float("nan")
+    idx = np.arange(n)
+    num, den = 0.0, 0.0
+    for f in np.array_split(idx, n_splits):
+        rest = np.setdiff1d(idx, f)
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+        try:
+            iso.fit(p[rest], hit[rest])
+            cal_f = iso.predict(p[f])
+        except Exception:  # noqa: BLE001
+            continue
+        num += float(len(f)) * _ece(cal_f, hit[f])
+        den += float(len(f))
+    return (num / den) if den > 0 else float("nan")
+
+
+def fit_confidence_calibrator(oof_p: np.ndarray, y: np.ndarray) -> dict:
+    """在 **OOF** 上拟合「top-1 置信 → 经验正确率」的 isotonic 校准。
+
+    为什么必须用 OOF：训练集内概率是**过度自信**的（模型见过这些样本），
+    用它拟合出的校准器在前向是错的。OOF 是生产口径的最近似。
+    产物以 `(x, y)` 阈值对落 meta，推理侧用 `np.interp` 复现（**不依赖 sklearn**）。
+
+    ⚠ 读 meta 时的纪律：**`ece_cal` 是样本内（构造性 ≈0），只有 `ece_cal_cv` 有信息量。**
+    验收门请用 `ece_cal_cv`（以及 Brier 的样本外版本）。
+    """
+    top = oof_p.max(axis=1)
+    hit = (oof_p.argmax(axis=1) == y).astype(float)
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    iso.fit(top, hit)
+    cal = iso.predict(top)
+    return {
+        "kind": "isotonic_top1",
+        "x": [float(v) for v in np.atleast_1d(iso.X_thresholds_)],
+        "y": [float(v) for v in np.atleast_1d(iso.y_thresholds_)],
+        "n": int(len(y)),
+        # ⚠ 样本内（构造性 ≈0，**不得**当作"校准良好"的证据）
+        "ece_raw": float(_ece(top, hit)),
+        "ece_cal": float(_ece(cal, hit)),
+        # ✅ 样本外（**这才是验收门该看的数**）
+        "ece_cal_cv": _cross_fitted_ece(top, hit),
+        "brier_raw": float(np.mean((top - hit) ** 2)),
+        "brier_cal": float(np.mean((cal - hit) ** 2)),
+    }
+
+
+def fit_binary_prob_calibrator(p: np.ndarray, y: np.ndarray) -> dict:
+    """二分类**正类概率**的 isotonic 校准（x = raw p，y = 校正后的 P(y=1)）。
+
+    为什么与 `fit_confidence_calibrator` 分开：后者校准的是**多分类 top-1 置信**
+    （x = max prob、y = argmax 是否正确），语义不同、产物不可互换 ——
+    属"两个不同语义"，不是"同语义两份实现"（本仓库红线针对后者）。
+
+    用途（P2 波动路由）：`vol` 头需要一个**可比的 P(波动扩张)** 才能与阈值比较；
+    未校准的原始概率在不同波动 regime 下尺度会漂移，直接比阈值等于用错尺子。
+    """
+    pf = np.asarray(p, dtype=float)
+    yf = np.asarray(y, dtype=float)
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.0, y_max=1.0)
+    iso.fit(pf, yf)
+    cal = iso.predict(pf)
+    return {
+        "kind": "isotonic_binary_prob",
+        "x": [float(v) for v in np.atleast_1d(iso.X_thresholds_)],
+        "y": [float(v) for v in np.atleast_1d(iso.y_thresholds_)],
+        "n": int(len(yf)),
+        "pos_rate": float(yf.mean()),
+        # ⚠ 样本内（构造性 ≈0，**不得**当作"校准良好"的证据；见 `_cross_fitted_ece`）
+        "ece_raw": float(_ece(pf, yf)),
+        "ece_cal": float(_ece(cal, yf)),
+        # ✅ 样本外（**验收门该看这个**）
+        "ece_cal_cv": _cross_fitted_ece(pf, yf),
+        "brier_raw": float(np.mean((pf - yf) ** 2)),
+        "brier_cal": float(np.mean((cal - yf) ** 2)),
+    }
+
+
+def conformal_quantiles(oof_p: np.ndarray, y: np.ndarray,
+                        alphas=CONFORMAL_ALPHAS) -> dict:
+    """split-conformal：非一致性分数 `s = 1 − p̂(真实类)`，取 ⌈(n+1)(1−α)⌉ 分位 `q̂`。
+
+    保证（有限样本、分布无关）：`P(真实类 ∈ {k : p̂_k ≥ 1 − q̂}) ≥ 1 − α`。
+    ⇒ **当预测集合是单元素时，其错误率 ≤ α** —— 这是"高置信度"唯一能拿到**证书**的形态，
+    也是本项交付的核心：把"置信度"从"一个说不清含义的数"变成"一个有覆盖率保证的集合"。
+    """
+    n = len(y)
+    s = 1.0 - oof_p[np.arange(n), y]
+    out: dict = {"kind": "split_conformal_lac", "n": n}
+    for a in alphas:
+        k = int(np.ceil((n + 1) * (1.0 - a)))
+        if k > n:
+            out[f"{a:.2f}"] = None
+            continue
+        q = float(np.sort(s)[k - 1])
+        thr = 1.0 - q
+        in_set = oof_p >= thr
+        sizes = in_set.sum(axis=1)
+        single = sizes == 1
+        out[f"{a:.2f}"] = {
+            "qhat": q, "thr": thr, "k": k,
+            "coverage": float(in_set[np.arange(n), y].mean()),
+            "singleton_rate": float(single.mean()),
+            "singleton_acc": (float((oof_p[single].argmax(axis=1) == y[single]).mean())
+                              if int(single.sum()) else None),
+        }
+    return out
+
+
 def main() -> None:
+    # 【2026-09-19 实测踩到】Windows 控制台默认 cp936，stdout 被管道重定向时按
+    # locale 编码 ⇒ `⇒`（U+21D2）等**非 GBK 字符**会抛 UnicodeEncodeError，且异常走
+    # stderr（常被 `2>$null` 吞掉）⇒ 表现为"脚本中途静默死掉、产物不落地"。
+    # 与本仓库既有工具（eval_state_separability / eval_anticipation_bound）同款防护。
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True, help="build_state_labels.py 的产物")
     ap.add_argument("--feature-set", default="base", choices=["base", "l1"],
@@ -174,10 +367,20 @@ def main() -> None:
     ap.add_argument("--version", type=int, required=True, help="模型版本号（vN）")
     ap.add_argument("--seeds", type=int, default=5, help="bagging 随机种子数 K")
     ap.add_argument("--cv-splits", type=int, default=5, help="TimeSeriesSplit 折数")
+    ap.add_argument("--gap", type=int, default=12,
+                    help="训练/验证折之间丢弃的 bar 数（消除前瞻标签在折边界的重叠）。"
+                         "默认 12 = 标签主窗口 `state.horizon_bars`；0 = 旧行为（含泄漏）。")
     ap.add_argument("--test-ratio", type=float, default=0.2, help="末端留出测试比例")
     ap.add_argument("--outdir", default=MODELS_DIR_DEFAULT)
     ap.add_argument("--report", default=None, help="评估报告输出路径（json）")
     args = ap.parse_args()
+
+    # 【2026-09-19 晋升纪律守卫】显式指向生产目录时**必须可见**：
+    # 该目录是容器 `/app/review_models` 的 bind mount 源，且 `state_infer` 按
+    # `max(version)` 隐式选版 ⇒ 写入即被采纳（无人工确认环节）。
+    if os.path.abspath(args.outdir) == os.path.abspath(MODELS_DIR_PROD):
+        print("[warn] --outdir 指向**生产模型目录** ⇒ 产物会被立刻采纳"
+              "（max(version) 隐式选版）。建议用默认 `_staging`，验收后再显式晋升。")
 
     # 特征列顺序从特征契约导入（单一真值）
     feat_path = os.path.join(
@@ -205,10 +408,25 @@ def main() -> None:
     print(f"[class_weight] { {STATE_NAMES[k]: round(v, 3) for k, v in cw.items()} }")
 
     # ── 评估 1：全量时序 OOF（最接近线上口径）──
-    oof_p, oof_y = oof_time_series(X, y, args.cv_splits, cw)
+    oof_p, oof_y = oof_time_series(X, y, args.cv_splits, cw, gap=args.gap)
     if oof_p is None:
         raise SystemExit("[fatal] OOF 失败（样本不足或类别缺失）")
     oof_metrics = report(f"TimeSeriesSplit OOF ({args.cv_splits} folds)", oof_y, oof_p)
+
+    # ── 【2026-09-19 阶段1】校准 + conformal（产物落 meta；消费方 = state_infer 的弃权闸）──
+    calib = fit_confidence_calibrator(oof_p, oof_y)
+    conf = conformal_quantiles(oof_p, oof_y)
+    print("\n===== 校准（OOF；isotonic top-1）=====")
+    print(f"  ECE    原始={calib['ece_raw']:.4f} → 校准后(样本内)={calib['ece_cal']:.4f}"
+          f" → **校准后(交叉拟合)={calib.get('ece_cal_cv', float('nan')):.4f}**")
+    print(f"  Brier  原始={calib['brier_raw']:.4f} → 校准后={calib['brier_cal']:.4f}")
+    print("===== conformal（OOF；集合为单例 ⇒ 可决策，错误率 ≤ α）=====")
+    for _a, _v in conf.items():
+        if not isinstance(_v, dict):
+            continue
+        print(f"  alpha={_a}: qhat={_v['qhat']:.4f} 阈值={_v['thr']:.4f} "
+              f"覆盖率={_v['coverage']:.1%} 单例率={_v['singleton_rate']:.1%} "
+              f"单例准确率={_v['singleton_acc']}")
 
     # ── 评估 2：末端留出测试集（bagging 平均口径 = 线上推理口径）──
     # 注意：留出集模型只能用训练段拟合并评估；这与下面的"全量最终模型"是两批不同的模型。
@@ -255,6 +473,11 @@ def main() -> None:
         "eval_oof": oof_metrics,
         "eval_holdout": holdout_metrics,
         "feature_importance": {c: float(v) for c, v in zip(cols, imp)},
+        # 【2026-09-19 阶段1】弃权闸（abstain）所需的校准与 conformal 产物。
+        # 消费方：`signal_tower/state_infer.py`。**缺这两块 ⇒ 该模型不支持弃权**
+        # （`abstain` 恒 False，逐位退回既有行为，不会因产物缺失而改变任何现状）。
+        "calibration": calib,
+        "conformal": conf,
     }
     meta_path = os.path.join(args.outdir, f"lgbm_state_{args.tf}_v{args.version}_meta.json")
     with open(meta_path, "w", encoding="utf-8") as fh:

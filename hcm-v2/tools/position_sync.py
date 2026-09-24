@@ -678,7 +678,13 @@ async def _pg_update_position(pool, pos, current_price, float_profit, trail_stat
     """更新或插入持仓行到 PostgreSQL。
 
     先执行 UPDATE，若 rowcount==0（持仓未在 PG 中）则 INSERT 兜底。
-    写入字段: sl, tp, current_price, float_profit, trail_state, snapshot_time, updated_at
+    写入字段: sl, tp, current_price, float_profit, trail_state, snapshot_time, updated_at, magic
+
+    【2026-09-17】magic 取 **MT5 持仓对象的真值**（`pos.magic`）：
+      · 风控「同向保本闸门」按 magic 族判定"保本后可否追单"（rule_chain._check_cooldown），
+        要求持仓侧有可靠的 magic；
+      · 每轮同步都写 → 存量持仓（本列新增前开的单）在桥重启后**自动回填**，无需回填脚本；
+      · 只在风控侧做族归并（_magic_family），此处**不做任何族逻辑**（避免同一规则两份实现）。
 
     Args:
         pool: asyncpg connection pool.
@@ -702,7 +708,8 @@ async def _pg_update_position(pool, pos, current_price, float_profit, trail_stat
                 trail_state = $5,
                 snapshot_time = $6,
                 updated_at = $6,
-                status = 'open'
+                status = 'open',
+                magic = $8
             WHERE mt5_ticket = $7
             RETURNING position_id
             """,
@@ -713,6 +720,7 @@ async def _pg_update_position(pool, pos, current_price, float_profit, trail_stat
             trail_state_json,
             now,
             pos.ticket,
+            int(getattr(pos, "magic", 0) or 0),
         )
 
         if row is None:
@@ -733,8 +741,8 @@ async def _pg_update_position(pool, pos, current_price, float_profit, trail_stat
                 INSERT INTO hcm_trading.positions
                     (account_id, symbol, direction, open_price, current_price, lot,
                      sl, tp, float_profit, trail_state, open_time, snapshot_time, updated_at,
-                     mt5_ticket, status, signal_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, 'open', $14)
+                     mt5_ticket, status, signal_id, magic)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, 'open', $14, $15)
                 """,
                 account_id,  # 真实交易账户（active master，生产=6），不再硬编码
                 pos.symbol,
@@ -750,6 +758,7 @@ async def _pg_update_position(pool, pos, current_price, float_profit, trail_stat
                 now,
                 pos.ticket,
                 getattr(pos, "signal_id", None),
+                int(getattr(pos, "magic", 0) or 0),
             )
             log.info(f"Pos sync #{pos.ticket}: UPSERT (was not in PG)")
 
@@ -883,8 +892,57 @@ def _load_fsm_modules(logger=None):
     return sm, sf
 
 
+_OSC_SL_REASON = "sl"
+
+
+def _effective_osc_reason(close_reason, profit) -> str:
+    """把「成交原因 + 已实现盈亏」归一为**计数器语义**的归因（纯函数，可离线断言）。
+
+    【D1 2026-09-17 治本·`0.02 档结构性不可达`复发根因】
+    缺陷：桥按**成交原因**判归因（`_CLOSE_REASON_BY_DEAL`：`DEAL_REASON_SL=4` → `"sl"`），
+      而"移动止损被推过保本后成交"或"保本锁成交"在 MT5 里**同样报 reason=4** ⇒ 一律记
+      `sl` ⇒ 被 `state_machine.apply_osc_close` 当"策略性止损"计入。两个后果：
+        ① `osc_loss_count` 只增不减（仅 `tp` 归零）⇒ 梯度档位虚高
+           ⇒ **新轮首单直接 1.5 档（0.02×1.5=0.03），1.0 档（0.02）结构性不可达**；
+        ② `osc_atr_loss` 被盈利单占用 ⇒ 4ATR 预算提前耗尽、S5 误锁止。
+    实测（桥日志 `bridge_711679.log`，本地时间 = UTC+8；账号 9）：
+      · 09-16 18:08 `reason=sl` **pnl=+16.33** → 累计 0.914ATR / 连续 **1** 次
+      · 09-16 18:23 `reason=sl` **pnl=+2.80**  → 累计 1.037ATR / 连续 **2** 次
+      ⇒ 两次**盈利**出场被记成"连续止损"；随后 09-17 07:15 入场取到 `ladder[2]=1.5`
+      ⇒ 0.03 手（本函数的修复对象）。
+
+    正解：计数只看**是否真的亏了** —— `sl` 且已实现盈亏 `>= 0` ⇒ 按 `be`（保本/移动止损
+      出场）处理，不计入。理由与 `apply_osc_close` 对 `be` 的既有口径**完全一致**：
+      "be 没有亏损 —— 规格说的是'累计**止损**'；若计入会让'连续止损'计数虚高、
+       梯度手数无端放大"。
+
+    | 输入 | 输出 | 语义 |
+    |---|---|---|
+    | `sl` 且 `profit < 0` | `sl` | 真止损（计 `atr_loss` + 计 `count`） |
+    | `sl` 且 `profit >= 0` | `be` | 盈利出场（移动止损/保本）⇒ 不计入止损预算；**【2026-09-21 起】并归零 `count`** |
+    | `sl` 且 `profit` 未知（None/非法） | `sl` | **宁可高估**（与 ATR 兜底同取向，防锁止失效） |
+    | 其它（tp/be/manual/expert/stop_out） | 原样 | 本函数不改写；下游 `apply_osc_close` 按各自规则处理（见其语义表） |
+
+    ⚠ 【2026-09-21】本函数只负责"按盈亏**改写归因**"，**不决定**两个计数器怎么动。
+    计数器规则**全在** `signal_tower.state_machine.apply_osc_close`（唯一真源）。
+
+    为什么放在**写入侧**而不改 `apply_osc_close`：判据是"已实现盈亏"这一**桥侧成交事实**，
+    只有写入侧拿得到；纯函数保持"只看 reason"的稳定契约（可离线单测）。
+    """
+    r = str(close_reason or "").strip().lower()
+    if r != _OSC_SL_REASON:
+        return r
+    if profit is None:
+        return r
+    try:
+        return "be" if float(profit) >= 0.0 else r
+    except (TypeError, ValueError):
+        return r
+
+
 async def _fsm_osc_counter_writeback(conn, redis_conn, log, row, signal_id,
-                                     close_reason, tf: str = "M5") -> None:
+                                     close_reason, tf: str = "M5",
+                                     profit: float | None = None) -> None:
     """FSM 模式下按平仓归因推进震荡风控双计数器。
 
     **幂等**：调用点被放在 `UPDATE ... WHERE close_time IS NULL RETURNING order_id`
@@ -895,6 +953,9 @@ async def _fsm_osc_counter_writeback(conn, redis_conn, log, row, signal_id,
         signal_id: 该笔订单的 signal_id（用于判定是否 FSM 模式）。
         close_reason: `_infer_close_reason` 的结果（sl / tp / be / manual / ...）。
         tf: 计算"开仓时 ATR"所用周期（默认 M5 = 首期主周期，见方案 Q2）。
+        profit: 该 ticket 的**已实现盈亏**（`_infer_close_reason` 的第三个返回值，
+            缺省回退 `float_profit`）。【D1 2026-09-17】用于区分"真止损"与
+            "以 SL 方式成交但**盈利**"的移动止损/保本出场，见 `_effective_osc_reason`。
     """
     if conn is None or redis_conn is None:
         return
@@ -932,7 +993,10 @@ async def _fsm_osc_counter_writeback(conn, redis_conn, log, row, signal_id,
 
     # ── 【2026-09-16 修 be-不解冻缺口：显式「轮次结束」事件】────────────────────
     # 为什么必须与两个计数器**分开**：`apply_osc_close` 对 `be`/`manual`/`expert`/
-    #   `stop_out` **原样返回（不计入）** —— 对「止损预算」这是对的（保本没亏损）；
+    #   `stop_out` **不计入止损预算**（`atr_loss` 原样保留）—— 对「预算」这是对的（保本没亏损）。
+    #   【2026-09-21 语义变更】这些归因现在还会**把 `count` 归零**（打断"连续止损"），
+    #   但这并**不**使"轮次标记"变得多余：轮次结束还必须覆盖 **`sl`**（真止损同样结束本轮），
+    #   而 `sl` 恰恰是**推进** `count` 的那个归因 ⇒ 两种语义仍必须各自独立推进，不可合并；
     #   但策略侧判「本轮是否结束」（决定**冻结箱体是否解冻**）若也只看这两个数，
     #   那么**一轮的平仓全是保本/人工/桥移动止损时，计数器不变 ⇒ 判不出轮次结束
     #   ⇒ 冻结箱体永久不解**，此后每根 bar 都拿过期 mid 当 TP 锚点。
@@ -971,7 +1035,11 @@ async def _fsm_osc_counter_writeback(conn, redis_conn, log, row, signal_id,
     #   策略层，账户数一变（增/减 follower）就再次错位 —— 违反单一真值原则。
     #   必须在**写入侧**按轮次归一。
     # TTL 7 天：足以覆盖重复对账/补跑，且不会永久占键。
-    _is_sl = (str(close_reason or "").strip().lower() == "sl")
+    # 【D1 2026-09-17】"是否占本轮名额"也按**有效归因**判：只有"真亏损的止损"才占。
+    #   若用原始 reason，则"盈利的 sl"会白占名额 ⇒ 同轮 follower 的**真亏损**被误跳过
+    #   （漏计，预算偏低 → 锁止更晚 → 风险更大）。用有效归因后与计数口径一致。
+    _eff_reason = _effective_osc_reason(close_reason, profit)
+    _is_sl = (_eff_reason == _OSC_SL_REASON)
     if _is_sl and signal_id:
         _rkey = f"hcm:state:osc_counted_sig:{signal_id}"
         try:
@@ -1010,12 +1078,14 @@ async def _fsm_osc_counter_writeback(conn, redis_conn, log, row, signal_id,
     except Exception as e:  # noqa: BLE001
         log.warning(f"FSM 计数器：开仓 ATR 还原失败 #{ticket}（将用兜底 {_SL_ATR_FALLBACK}）：{e}")
 
-    if str(close_reason).lower() == "sl" and sl_atr <= 0.0:
+    if _eff_reason == _OSC_SL_REASON and sl_atr <= 0.0:
         sl_atr = _SL_ATR_FALLBACK
         log.warning(f"FSM 计数器 #{ticket} {symbol}: 无法还原开仓 ATR → "
                     f"止损按兜底 {_SL_ATR_FALLBACK}×ATR 计入（宁可高估，避免锁止失效）")
 
     # 3) 推进（语义在纯函数里）+ 落 Redis
+    # 【D1 2026-09-17】传入**有效归因**（盈利的 sl → be，不计入）；原始归因与盈亏进日志，
+    #   便于事后审计"这笔为什么计/不计"。
     key_a = f"hcm:state:osc_atr_loss:{symbol}"
     key_c = f"hcm:state:osc_loss_count:{symbol}"
     try:
@@ -1023,15 +1093,21 @@ async def _fsm_osc_counter_writeback(conn, redis_conn, log, row, signal_id,
         cur_c = int(float(redis_conn.get(key_c) or 0))
     except (TypeError, ValueError):
         cur_a, cur_c = 0.0, 0
-    new_a, new_c = sm.apply_osc_close(close_reason, sl_atr, cur_a, cur_c)
+    _pnl_txt = "?" if profit is None else f"{float(profit):+.2f}"
+    _shift = "" if _eff_reason == str(close_reason or "").strip().lower() else \
+        f"【原始 reason={close_reason} 但 pnl={_pnl_txt}≥0 ⇒ 按保本出场处理、不计入】"
+    new_a, new_c = sm.apply_osc_close(_eff_reason, sl_atr, cur_a, cur_c)
     if (new_a, new_c) == (cur_a, cur_c):
-        log.info(f"FSM 计数器 #{ticket} {symbol}: reason={close_reason} → 不计入"
-                 f"（累计 {cur_a:.3f}ATR / 连续 {cur_c} 次）")
+        # 【2026-09-21】语义变更后本分支只在"非 `sl` 且 `count` 本已为 0"时进入
+        # （`sl` 必然推进 `count`；非 `sl` 必然归零 `count` ⇒ 若本已 0 则无变化）。
+        # 故文案由"不计入"改为"无变化"，避免与 `apply_osc_close` 的新语义表冲突。
+        log.info(f"FSM 计数器 #{ticket} {symbol}: reason={_eff_reason} (pnl={_pnl_txt}) "
+                 f"{_shift}→ 无变化（累计 {cur_a:.3f}ATR / 连续 {cur_c} 次）")
         return
     try:
         redis_conn.set(key_a, f"{new_a:.6f}")
         redis_conn.set(key_c, str(new_c))
-        log.info(f"FSM 计数器 #{ticket} {symbol}: reason={close_reason} "
+        log.info(f"FSM 计数器 #{ticket} {symbol}: reason={_eff_reason} (pnl={_pnl_txt}) "
                  f"sl_atr={sl_atr:.3f} → 累计 {new_a:.3f}ATR / 连续 {new_c} 次")
     except Exception as e:  # noqa: BLE001
         log.error(f"FSM 计数器写入失败 #{ticket} {symbol}: {e}")
@@ -1166,8 +1242,12 @@ async def _close_stale_positions(pool, account_id: int, live_tickets: set[int], 
                         # 【2026-09-15 §37.5】FSM 震荡风控计数器回写。
                         # 放在 `_oid` 非空分支内 = **每个 ticket 只推进一次**（幂等）：
                         # 重复对账时 UPDATE 因 close_time 非空不再命中 → _oid 为 None。
+                        # 【D1 2026-09-17】必须把**已实现盈亏**一起传下去：桥按成交原因
+                        # 把"移动止损/保本出场（盈利）"也标成 `sl`，若照原样计入会把
+                        # 梯度手数档位与 4ATR 预算一起算错（实测 0.03 手事故）。
                         await _fsm_osc_counter_writeback(
-                            conn, redis_conn, log, r, _sid, _close_reason)
+                            conn, redis_conn, log, r, _sid, _close_reason,
+                            profit=_profit)
                     else:
                         # ──【2026-09-09 幂等修复·根因】──────────────────────────
                         # 兜底 INSERT 原为【无条件写入】：只要持仓仍被判为 open，

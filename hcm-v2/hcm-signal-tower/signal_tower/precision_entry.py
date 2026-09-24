@@ -94,17 +94,17 @@ class PrecisionEntryScorer:
         _atr = max(float(getattr(indicators, "atr_14", 0.0) or 0.0), 1e-6)
         _upper = float(getattr(indicators, "boll_upper", _entry) or _entry)
         _lower = float(getattr(indicators, "boll_lower", _entry) or _entry)
+        # 【2026-09-17 B15-6】删除两道**恒假**护栏（死代码）：
+        #   BUY 的 `_entry <= _stop` 与 SELL 的 `_stop <= _entry` 永不成立 ——
+        #   因为 `_stop = min(_lower, _entry - 1ATR)` 必 < _entry（分母 ≥ 1ATR > 0），
+        #   而 `_stop = max(_upper, _entry + 1ATR)` 必 > _entry。保留分母即可。
         if score_direction == "BUY":
             _stop = min(_lower, _entry - _atr * 1.0)
             _target = max(_upper, _entry + _atr * 1.5)
-            if _entry <= _stop:
-                return 0.0, 0.0
             _rr = (_target - _entry) / (_entry - _stop)
         elif score_direction == "SELL":
             _stop = max(_upper, _entry + _atr * 1.0)
             _target = min(_lower, _entry - _atr * 1.5)
-            if _stop <= _entry:
-                return 0.0, 0.0
             _rr = (_entry - _target) / (_stop - _entry)
         else:
             return 0.5, 1.5  # 无方向中性

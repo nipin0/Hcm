@@ -349,6 +349,23 @@ async def main() -> None:
 
     redis = FakeRedis()
     fsm = MarketStateMachine(config_provider=None, redis_client=redis)
+    # ── 【2026-09-19 保真修复】FSM 是**唯一**没走 `load_config()` 的组件 ─────────────
+    # 此前 `config_provider=None` ⇒ 回放里 FSM 只跑**代码 DEFAULTS**，`--cfg` 对它完全无效
+    #   （与 StateInferer(:331-336) / StateStrategy(:383-388) 的既有修法不一致 —— 那两处
+    #    早已改为"吃 --cfg"，本处遗漏）。
+    # 后果：任何**后加的 FSM 配置键**（例：③-B 的 `state.fsm.non_fade_target`）都无法做 A/B，
+    #   而"用同一沙盘验证生产配置"正是本脚本存在的理由。
+    # 修法：与另两处同源 —— 有 `--cfg` 就走**生产同一条** `load_config()`
+    #   （含枚举白名单校验与非法值回退告警）；随后下方 `--flat-reset / --low-conf /
+    #   --require-trigger / --k-*` 这些**显式诊断开关**照旧覆盖。
+    #   优先级不变：显式开关 > --cfg > 代码 DEFAULTS。
+    if _CFG:
+        fsm._config = FakeConfig(_CFG)
+        await fsm.load_config()
+        print(f"[cfg-fsm] 走生产 load_config 路径 → k_enter={fsm._k_enter} "
+              f"k_exit={fsm._k_exit} k_fade={fsm._k_fade} "
+              f"require_trigger={fsm._require_trigger} flat_reset={fsm._flat_reset} "
+              f"low_conf={fsm._low_conf_policy} non_fade_target={fsm._non_fade_target!r}")
     # ── 【2026-09-15 保真修复：伪交付根因】──
     # 此前**硬编码 True**，而生产 `state.fsm.flat_reset_enabled = false`（模块默认，从未开启）
     # ⇒ 回放与生产的 FSM 语义不同，两者结论不可比：
@@ -536,10 +553,14 @@ async def main() -> None:
                 _r = str(rec["reason"]).strip().lower()
                 if _is_sl:
                     osc_rounds += 1
-                elif _r == "tp":
-                    # `tp` = 一轮成功结束 ⇒ **两计数器都归零**（`apply_osc_close` 语义表）。
+                else:
+                    # 【2026-09-21 语义变更同步】`apply_osc_close` 现在对**任何非 `sl` 归因**
+                    # （`tp`/`be`/`manual`/`expert`/`stop_out`）都把 `count` 归零 ——
+                    # `count` 的语义是「**连续**止损次数」，非 `sl` 平仓即打断"连续"。
+                    # 旧实现**仅 `tp` 归零**；而生产止盈由桥侧主动平仓实现 ⇒ 归因是 `expert`
+                    # ⇒ `tp` 路径**实际不可达** ⇒ `count` 单调不减、档位长期顶格（实测 0.03）。
                     # 期望值必须同步归零，否则会把**合法重置**误判为缺陷
-                    # （本断言第一版即如此：两种语义下都误报 4~5 次）。
+                    # （与 I10 第一版把 `tp` 的合法清零误报为缺陷属同型错误）。
                     osc_rounds = 0
                 # 【新不变式 I10】轮次计数一致：`count` 必须等于"上次归零以来的止损轮次数"。
                 # 若桥侧幂等被改坏（回到"每笔 ticket 各 +1"）⇒ 此处立刻失败

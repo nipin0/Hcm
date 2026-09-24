@@ -43,30 +43,14 @@ ALERT_KEY = "hcm:ai:review:calib_alert"
 GATE_MIN_LEVELS = int(os.environ.get("REVIEW_RECALIB_MIN_LEVELS", "8"))
 
 
-def _ece(y: np.ndarray, p: np.ndarray, bins: int = 10) -> float:
-    edges = np.linspace(0.0, 1.0, bins + 1)
-    tot = max(len(y), 1)
-    e = 0.0
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        m = (p >= lo) & (p < hi if hi < 1.0 else p <= hi)
-        if m.sum() == 0:
-            continue
-        e += (m.sum() / tot) * abs(float(p[m].mean()) - float(y[m].mean()))
-    return float(e)
-
-
-def _monotonicity(y: np.ndarray, p: np.ndarray, bins: int = 10) -> float:
-    q = pd.qcut(pd.Series(p), bins, labels=False, duplicates="drop")
-    xs, ys = [], []
-    for b in sorted(pd.unique(q.dropna())):
-        m = (q == b).values
-        if m.sum() < 3:
-            continue
-        xs.append(float(p[m].mean()))
-        ys.append(float(y[m].mean()))
-    if len(xs) < 3:
-        return 0.0
-    return float(np.corrcoef(xs, ys)[0, 1])
+# 【2026-09-21 去重】_ece / _monotonicity / _fit_platt 已抽到 _calib_common.py（唯一真源）。
+# 以别名 import，保持下方所有调用点（_ece / _monotonicity / _fit_platt）零改动。
+# 理由：本脚本与 recalibrate_quality.py 此前**各复制了一份逐字节相同**的实现；
+#   两条链本应只在"数据源 + 写盘目标"上不同（hcm_ai.review_log vs hcm_ai.ai_pred_raw），
+#   而**校准质量的评估口径必须一致**，否则两个 calib_health 键的差异无法归因。
+from _calib_common import ece as _ece  # noqa: E402
+from _calib_common import fit_platt as _fit_platt  # noqa: E402
+from _calib_common import monotonicity as _monotonicity  # noqa: E402
 
 
 def _load_true_labels(labels_csv: str) -> pd.DataFrame:
@@ -124,15 +108,7 @@ def _reliability(y: np.ndarray, p: np.ndarray, bins: int = 10) -> list:
     return out
 
 
-def _fit_platt(raw: np.ndarray, y: np.ndarray) -> PlattCalibrator:
-    """与离线层同式（train_review_model._fit_platt）：logit 上近无正则 logistic 回归。"""
-    from sklearn.linear_model import LogisticRegression
-    _eps = 1e-6
-    _p = np.clip(np.asarray(raw, float), _eps, 1.0 - _eps)
-    z = np.log(_p / (1.0 - _p)).reshape(-1, 1)
-    lr = LogisticRegression(C=1e6, solver="lbfgs", max_iter=2000)
-    lr.fit(z, np.asarray(y).astype(int))
-    return PlattCalibrator(float(lr.coef_[0][0]), float(lr.intercept_[0]))
+# _fit_platt 已于 2026-09-21 移入 _calib_common.py（见文件上方 import）
 
 
 def _fit_one(head: str, raw: np.ndarray, y: np.ndarray, model_dir: str,

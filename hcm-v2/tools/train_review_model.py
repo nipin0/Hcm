@@ -111,49 +111,17 @@ def _set_model_dir(container_path: str) -> None:
         print(f"[promote] Redis write failed: {e}", file=sys.stderr)
 
 
-def _ece(y: np.ndarray, p: np.ndarray, bins: int = 10) -> float:
-    """期望校准误差：Σ (n_b/N)·|mean(p_b) − mean(y_b)|。"""
-    edges = np.linspace(0.0, 1.0, bins + 1)
-    tot = len(y)
-    e = 0.0
-    for lo, hi in zip(edges[:-1], edges[1:]):
-        m = (p >= lo) & (p < hi if hi < 1.0 else p <= hi)
-        if m.sum() == 0:
-            continue
-        e += (m.sum() / tot) * abs(float(p[m].mean()) - float(y[m].mean()))
-    return float(e)
-
-
-def _monotonicity(y: np.ndarray, p: np.ndarray, bins: int = 10) -> float:
-    """10 分桶「桶内预测均值 vs 桶内实测胜率」的 Pearson 相关（方案 §6.2，须 >0）。"""
-    q = pd.qcut(pd.Series(p), bins, labels=False, duplicates="drop")
-    xs, ys = [], []
-    for b in sorted(pd.unique(q.dropna())):
-        m = (q == b).values
-        if m.sum() < 3:
-            continue
-        xs.append(float(p[m].mean()))
-        ys.append(float(y[m].mean()))
-    if len(xs) < 3:
-        return 0.0
-    return float(np.corrcoef(xs, ys)[0, 1])
-
-
-def _fit_platt(p: np.ndarray, y: np.ndarray) -> PlattCalibrator:
-    """【2026-09-11 B 方案】拟合 Platt scaling（参数化 sigmoid，2 参数）。
-
-    在 `logit(p_raw)` 上做（近）无正则 logistic 回归（MLE）得到 (a, b)：
-        p_cal = sigmoid(a · logit(p_raw) + b)
-    相比 isotonic：参数少、小样本不退化、输出连续（不受「档位数」门槛约束）。
-    返回的 `PlattCalibrator` 仅依赖 numpy，生产容器可直接反序列化（同 calib_np 约定）。
-    """
-    from sklearn.linear_model import LogisticRegression
-    _eps = 1e-6
-    _p = np.clip(np.asarray(p, float), _eps, 1.0 - _eps)
-    z = np.log(_p / (1.0 - _p)).reshape(-1, 1)
-    lr = LogisticRegression(C=1e6, solver="lbfgs", max_iter=2000)
-    lr.fit(z, np.asarray(y).astype(int))
-    return PlattCalibrator(float(lr.coef_[0][0]), float(lr.intercept_[0]))
+# 【2026-09-21 去重】_ece / _monotonicity / _fit_platt 已抽到 _calib_common.py（唯一真源）。
+# 以别名 import，使本文件内调用点（_fit_platt / _ece / _monotonicity）零改动。
+# 本处原实现与 recalibrate_quality.py / review_recalibrate.py 的副本**逐字节相同**
+# （唯一差别：原 _ece 用 tot = len(y)，缺零长保护；共用版为 max(len(y), 1)，
+#   对任何非空输入结果一致，空输入时不再 ZeroDivisionError）。
+# 为什么必须收敛：这三个函数是"校准质量"这一**验收指标**的定义，
+#   散落在两个每日重校准链 + 一个离线训练器里，任何一处被单边修改，
+#   离线与在线的校准结论就失去可比性（而 ai_health 的两个 calib_health 键正是靠它判定）。
+from _calib_common import ece as _ece  # noqa: E402
+from _calib_common import fit_platt as _fit_platt  # noqa: E402
+from _calib_common import monotonicity as _monotonicity  # noqa: E402
 
 
 def _fit_calibrator(mdl, X_calib: pd.DataFrame, y_calib: np.ndarray,

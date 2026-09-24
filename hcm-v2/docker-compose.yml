@@ -175,6 +175,12 @@ services:
       # 单仓不加仓（实证：对称1:1胜率70~81%；递增摊平需66.7%而实测50~65%→负期望）。
       # 开关 range.enabled 默认 false（影子），绑定挂载跨 recreate 持久。
       - ./hcm-signal-tower/signal_tower/range_strategy.py:/app/signal_tower/range_strategy.py
+      # [2026-09-18] RANGE 态箱体（新增文件，非镜像烘焙；scheduler 顶部
+      # `from signal_tower import range_box`，缺则 import 直接崩溃 → 必须挂载且跨 recreate 持久）：
+      # 箱体几何**唯一实现**（三线/宽度/位置/触碰/漂移/质量），供 RANGE MR 门控与面板观测。
+      # 默认 range.box.width_source/break_source=legacy ⇒ 门控行为与改前逐字节一致；
+      # 切 box 需显式改配置（标定证据见 docs/方案_RANGE态箱体_hexp_20260918.md）。
+      - ./hcm-signal-tower/signal_tower/range_box.py:/app/signal_tower/range_box.py
       # [P1] 轻量 DeepSeek 客户端：供校准诊断生成自然语言报告（shared 包镜像内置，单文件挂载跨 recreate 持久）
       - ./shared/llm_client.py:/app/shared/llm_client.py
       # [2026-08-17 B7] RedisClient 封装类补 exists 方法（DeepSeek run_loop 检测触发标志依赖），
@@ -205,6 +211,12 @@ services:
       # 教训同 state_* 系列：新增模块必须同步本清单，否则容器内 import 静默失败。
       - ./hcm-signal-tower/signal_tower/trend_direction.py:/app/signal_tower/trend_direction.py
       - ./hcm-signal-tower/signal_tower/trend_trigger.py:/app/signal_tower/trend_trigger.py
+      # 【2026-09-22】特征分布漂移（PSI）监控 —— 中立模块，被 **scheduler 顶层 import**
+      # （`from signal_tower import feature_drift as FD`）⇒ 缺挂载则 **整塔启动即崩**
+      # （不是上一类"静默降级"，而是进程级失败）。
+      # 注意：`lgbm_fsm/` 子包**刻意不挂载** —— 它是阶段 A 的研究影子包，
+      # 生产不依赖它（PSI 实现已中立化到本文件）。这正是"实现放中立位置"的原因。
+      - ./hcm-signal-tower/signal_tower/feature_drift.py:/app/signal_tower/feature_drift.py
 
   hcm-market-intel:
     build:
@@ -273,6 +285,16 @@ services:
       # risk.max_daily_loss / risk.margin_call_level → 真实阈值误配为 0 时自检不拦。
       # shared 包是镜像内置的，须单文件挂载才进容器（与 signal-tower 同模式）。
       - ./shared/redis_client.py:/app/shared/redis_client.py
+      # 【2026-09-17】Magic 族公式的**跨服务单一实现**（同 redis_client.py 模式）：
+      # 主机桥 mt5_bridge 按绝对路径加载同一文件，容器内由此挂载导入
+      # → 不存在第二份族实现（铁律第十三章）。缺此挂载则 rule_chain 导入失败，
+      # 会 CRITICAL 告警并回退"仅按方向"的旧口径（更严，不会静默放宽）。
+      - ./shared/magic_family.py:/app/shared/magic_family.py
+      # 【2026-09-17 B16 修复】ConfigProviderV3 空值归一化(08-22)+strip(08-25)+get_current(08-21)
+      # 与读取侧「空串视为未设置」防御：shared 包为镜像内置旧版(443行/Jul-18, 无 get_current)，
+      # 缺此挂载则风控侧配置读取无空串防御(空串穿透→float(" ")抛错→静默回退默认)，
+      # 且一旦调用 get_current 会 AttributeError。与 signal-tower(:189)/hcm-web(:429) 同模式。
+      - ./shared/config_provider.py:/app/shared/config_provider.py
       # 风控决策引擎：同向冷却(risk_cool_minutes)移出软规则改为硬规则 REJECT，绑定挂载跨 recreate 持久
       - ./hcm-risk-engine/risk_engine/decision.py:/app/risk_engine/decision.py
 
@@ -409,6 +431,11 @@ services:
       #    缺本行则容器 restart 后 main.py 在该 import 处 ImportError → hcm-web **整体起不来**
       #    （不是"新接口 404"这么轻），故新增 web/api/*.py 一律要在此处补挂载。
       - ./hcm-web/web/api/state.py:/app/web/api/state.py
+      # [2026-09-17] AI 体检表 API（TimesFM / LightGBM / 状态机 三块健康聚合，只读）。
+      # ⚠️ 同上面 state.py 的规矩：本行必须与 main.py 的
+      #    `from web.api.ai_health import create_ai_health_router` 同时生效，
+      #    缺本行则容器 restart 后 main.py 在该 import 处 ImportError → hcm-web 整体起不来。
+      - ./hcm-web/web/api/ai_health.py:/app/web/api/ai_health.py
       # [2026-08-08] hcm-web 主入口：注册 hexp 等新增路由；绑定挂载使路由注册跨 recreate 持久（否则容器重建回退镜像版丢失 hexp 路由）
       - ./hcm-web/main.py:/app/main.py
       # 仪表盘 API：新增 live-score 端点（暴露信号塔实时评分快照：评分 vs 自适应门槛 vs 能否下单）；绑定挂载跨 recreate 持久

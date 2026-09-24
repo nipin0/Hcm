@@ -10,8 +10,12 @@
   - 特征装配与训练脚本 quality_features.py 同构（train/inference 一致）。
 
 用法:
-  DB_URL=... python quality_scorer.py --symbol XAUUSD --model lgbm_quality_final.txt \
-    --calib calib_final.pkl --interval 5
+  DB_URL=... python quality_scorer.py --symbol XAUUSD --model lgbm_quality_v108.txt \
+    --calib calib_v108.pkl --interval 5
+
+  注：--model / --calib 缺省即读 ai.lm.model_path / ai.lm.calib_path（PG 为唯一真值），
+  故正常无需显式传参。此处的 v108 只是示例；旧示例里的 lgbm_quality_final.txt /
+  calib_final.pkl 属老 39 维契约（已移出 models/），照抄会加载失败。
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ from quality_features import (  # noqa: E402
 # 【阶段2·数据契约单一真值】FEATURE_COLS 来自共享模块 _model_feature_cols，
 # 训练侧(train_signal_quality.py)与推理侧必须严格一致，消除双份数据源导致的
 # 列错位风险（详见 _model_feature_cols.py 注释）。
-from _model_feature_cols import MODEL_FEATURE_COLS, TMF_FEATURE_COLS  # noqa: E402
+from _model_feature_cols import MODEL_FEATURE_COLS  # noqa: E402
 
 import faulthandler  # noqa: E402
 import logging  # noqa: E402
@@ -276,94 +280,19 @@ def _num(v, default=0.0):
         return float(default)
 
 
-# 【TimesFM 特征 2026-08-30】按当前 M5 bar 从 hcm_ai.timesfm_features 读取离线时序特征，
-# 供 build_features 注入。缺失(调度滞后/未覆盖)→ {}，build_features 填 0.0 降级，
-# 与训练侧缺省严格一致，保证训练-推理同分布。60s 缓存按 bar_time 避免每 5s 打 PG。
-_TMF_CACHE = {"bar_time": None, "vals": {}, "at": 0.0}
-_TMF_VERSION = "tfm25_pca_v1_sig"
-# 【2026-09-08 审计修复 P0】TimesFM 线上恒 0 —— 根因与修复：
-# 特征表只在**部分 bar** 有行（实测 2281 行 / 1371 个不同 bar_time，相对 8/01~9/07
-# 的约 1.1 万根 M5 覆盖率仅 ~12%），且由日级调度 T+1 产出；原 SQL 用
-# `bar_time = 当前bar` **等值匹配** → 当前 bar 几乎必然无行 → 13 维 tmf_* 线上恒
-# 0.0，而训练侧有真值 = 典型 train-serve skew（模型在训练时学到的 tmf 分裂阈值
-# 线上全部落空，48 维里 27% 无信息）。
-# 改为 **as-of**（取 <= 当前 bar 的最近一行），并加"最大可用年龄"保护：
-# 超过 ai.lm.tmf_max_age_min（默认 30 分钟）的陈旧特征一律降级 0（与训练缺省
-# 一致），避免把几小时前的时序特征喂给实时打分（修 A 不能坏 B）。
-# 开关 ai.lm.tmf_asof_enabled=false 可秒级回退到原等值匹配行为。
-_TMF_ASOF = True
-_TMF_MAX_AGE_MIN = 30.0
-_TMF_STATS = {"hit": 0, "miss": 0, "stale": 0, "logged_at": 0.0}
-
-
-def _load_tmf_for_bar(conn, symbol, bar_time, ttl: float = 60.0) -> dict:
-    """读当前 M5 bar 的 TimesFM 离线特征；返回 13 列 dict，缺失→{}。"""
-    if bar_time is None:
-        return {}
-    bt = _as_naive_utc(bar_time)
-    if bt is None:
-        return {}
-    _now = time.time()
-    if _TMF_CACHE["bar_time"] == bt and (_now - _TMF_CACHE["at"]) < ttl:
-        return _TMF_CACHE["vals"]
-    vals: dict = {}
-    try:
-        with conn.cursor() as cur:
-            if _TMF_ASOF:
-                # as-of：取"截至当前 bar"最近的一行（含 bar_time 以便判年龄）
-                cur.execute(
-                    "SELECT bar_time, tmf_pc00,tmf_pc01,tmf_pc02,tmf_pc03,tmf_pc04,tmf_pc05,"
-                    "tmf_pc06,tmf_pc07,tmf_trend_cont,tmf_rev_prob,tmf_vol_cycle,"
-                    "tmf_mtf_resonance,tmf_hist_sim "
-                    "FROM hcm_ai.timesfm_features "
-                    "WHERE symbol=%s AND time_frame='M5' AND tmf_version=%s AND bar_time<=%s "
-                    "ORDER BY bar_time DESC LIMIT 1",
-                    (symbol, _TMF_VERSION, bt),
-                )
-            else:
-                cur.execute(
-                    "SELECT bar_time, tmf_pc00,tmf_pc01,tmf_pc02,tmf_pc03,tmf_pc04,tmf_pc05,"
-                    "tmf_pc06,tmf_pc07,tmf_trend_cont,tmf_rev_prob,tmf_vol_cycle,"
-                    "tmf_mtf_resonance,tmf_hist_sim "
-                    "FROM hcm_ai.timesfm_features "
-                    "WHERE symbol=%s AND time_frame='M5' AND tmf_version=%s AND bar_time=%s",
-                    (symbol, _TMF_VERSION, bt),
-                )
-            r = cur.fetchone()
-            if r:
-                _stale = False
-                if _TMF_ASOF:
-                    try:
-                        _row_bt = _as_naive_utc(r[0])
-                        _age_min = (bt - _row_bt).total_seconds() / 60.0 if _row_bt else None
-                        if _age_min is not None and _age_min > _TMF_MAX_AGE_MIN:
-                            _stale = True  # 陈旧特征 → 降级 0（与训练缺省一致）
-                    except Exception:
-                        _stale = False
-                if _stale:
-                    _TMF_STATS["stale"] += 1
-                    vals = {}
-                else:
-                    for c, v in zip(TMF_FEATURE_COLS, r[1:]):
-                        vals[c] = float(v) if v is not None else 0.0
-    except Exception:
-        pass
-    _TMF_STATS["hit" if vals else "miss"] += 1
-    # 观测：每 10 分钟打印一次命中率（"tmf 是否真的在生效"此前完全不可度量）
-    if (_now - _TMF_STATS["logged_at"]) > 600.0:
-        _tot = max(1, _TMF_STATS["hit"] + _TMF_STATS["miss"] + _TMF_STATS["stale"])
-        try:
-            print("[tmf] hit=%d miss=%d stale=%d 非零率=%.1f%% asof=%s max_age=%.0fmin"
-                  % (_TMF_STATS["hit"], _TMF_STATS["miss"], _TMF_STATS["stale"],
-                     100.0 * _TMF_STATS["hit"] / _tot, _TMF_ASOF, _TMF_MAX_AGE_MIN),
-                  file=sys.stderr)
-        except Exception:
-            pass
-        _TMF_STATS["logged_at"] = _now
-    _TMF_CACHE["bar_time"] = bt
-    _TMF_CACHE["vals"] = vals
-    _TMF_CACHE["at"] = _now
-    return vals
+# 【2026-09-21 TimesFM 卸载】原 `_load_tmf_for_bar()` 及 `_TMF_*` 全局（60s 缓存、
+# ASOF 匹配、陈旧保护、命中率统计）**已整体移除**。
+#
+# 移除依据（2026-09-21 实测，非推测）：
+#   ① 消费者为零 —— 扫全部 76 个模型文件的 `feature_name()`，**没有任何在线模型含 tmf**；
+#      唯一消费者 `LEGACY_FEATURE_COLS` 已于同日删除。
+#   ② 增量不显著 —— 配对时序 OOF（n=1676，3 seed×5 fold）：修复 qf_* 读取后
+#      全 17 维 ΔAUC = −0.0019，95%CI [−0.0149,+0.0111] 跨 0 ⇒ 中性、不值得接入。
+#   ③ `tmf_qf_*` 单变量 AUC 0.62 系**时间代理伪影**（非零 ⟺ 日期 ≥ 09-07），非预测力。
+#   ④ 产出溯源可疑 —— 权重目录 `D:/models` 实测不存在，而特征表仍在按 M5 写入。
+# ⇒ 本函数此前**每 M5 bar 向 PG 发一次查询**，结果**无人消费** ⇒ 纯热路径死代码。
+# 归档：`tools/_attic_timesfm_20260921/`（抽取器/调度器/检索库/PCA 全量保留，可完整回退，
+#   回退步骤见该目录 README）。
 
 
 # 用 127.0.0.1 而非 localhost：Windows 解析 localhost 优先命中 ::1(IPv6)，会被
@@ -409,8 +338,22 @@ FEATURE_COLS = MODEL_FEATURE_COLS
 #
 # 处理：本列表继续产出真实值。新模型按 feature_name() 取不到 → 自然忽略；
 #   旧模型仍能拿到真实值 → 行为不变。
-# 【TODO】待线上模型重训并切换到与契约同维的版本后，可整体删除本列表。
-LEGACY_FEATURE_COLS = ["event_proximity_min"] + list(TMF_FEATURE_COLS)
+#
+# 【2026-09-21 清理：TODO 条件已满足 ⇒ LEGACY_FEATURE_COLS 已删除】
+#   核实依据（实测 tools/models 中全部在线模型维度）：
+#     lgbm_quality/direction/entry_{v106,v107,v108}.txt = 36 维（= MODEL_FEATURE_COLS）
+#     lgbm_quality/direction/entry_pinned.txt           = 36 维
+#     lgbm_review_{quality,entry,direction}.txt         = 37 维（= MODEL + dir_sign）
+#   ⇒ 无任何模型再按 feature_name() 索取 tmf_* / event_proximity_min。
+#   （孤儿文件 lgbm_quality_final.txt 为 39 维老契约、无任何代码/配置引用，已移出。）
+#
+#   替代护栏（比"维护白名单"更根本）：score_one 现对"模型索取但 build_features
+#   未产出"的列**显式告警**（见 score_one 内 _missing 检查，每进程每种缺失只报一次）。
+#   白名单只能覆盖已知的这一次漂移；告警能点亮**任何**未来的 train/serve 契约漂移。
+#
+#   ⚠ TMF_FEATURE_COLS 本身**保留**：仍被 quality_features(:399,:600) 与
+#     quality_scorer(:347,:870) 用于 hcm_ai.timesfm_features 的读写（审计/追溯），
+#     与"是否入模"是两件事，勿一并删除。
 
 
 def load_config(conn, redis_cli=None) -> dict:
@@ -476,6 +419,80 @@ def _cfg_float(cfg, key, default: float) -> float:
         return float(default)
 
 
+def _calib_min_iqr() -> float:
+    """【F5 2026-09-18】校准器"有效分辨率"下限（**均匀网格**输出的四分位距）。
+
+    默认 0.15；环境变量 `CALIB_MIN_IQR` 可覆盖，≤0 = 关闭本判据。
+    定位：**加载期**的粗筛（能在启动时就抓住"整段压常数"型退化）。
+    局限：探针在**均匀的 raw 概率网格**上跑，不知道模型的实际质量落在哪 ——
+    故对"支撑域宽、质量集中"的校准器（v108 实测：8 档 / 跨度 0.80，但 6 档挤在
+    0.29~0.44）可能漏判。**真正决定性的判据是下面基于真实分数分布的
+    `_realized_calib_degenerate()`**（滚动窗口实测），二者互补。
+    """
+    try:
+        return float(os.environ.get("CALIB_MIN_IQR", "0.15"))
+    except (TypeError, ValueError):
+        return 0.15
+
+
+# ── 【F5 v2 2026-09-18】基于"已发生真实分数分布"的退化判定（滚动窗口）───────────
+# 为什么必须补这一条（根因实证）：
+#   冠军 v108 的 calib_v108.pkl 有 8 档（≥ CALIB_MIN_LEVELS=8 ⇒ 逃过档位判据）、
+#   支撑域 0.15~0.95（跨度 0.80 ⇒ 逃过跨度判据），但**质量集中**在 0.29~0.44：
+#   上线后 ai_score 从 [3,100] 坍缩为 [20.00, 42.04]（n=67,434 实测）
+#   ⇒ 闸门阈值 0.60/0.70 数学上不可达（HOLD/UPGRADE 归零，只剩 DOWNGRADE），
+#      且 ai_score→SL 缩放（scheduler.py:4162-4185）被压成近常数 ⇒ AI 自适应失效。
+#   上面两个判据都是"看校准器本身"，看不到"它在真实输入下产出什么" —— 本函数
+#   直接看**近 N 次真实校准输出**的 P10–P90 跨度，是对症的那把尺子。
+# 自愈/自恢复：缓冲是 deque(maxlen=_CAL_BUF_N)，换回好校准器后旧样本自然淘汰，
+#   跨度回升 ⇒ 自动停止 blending，无需人工干预。
+_CAL_BUF_N = 300
+_CAL_BUF: "deque[float]" = deque(maxlen=_CAL_BUF_N)
+_REALIZED_DEGENERATE_STATE: dict = {"flag": None}
+
+
+def _calib_min_span() -> float:
+    """真实分数分布"有效跨度"下限（P10–P90）。默认 0.30；`CALIB_MIN_SPAN` 可覆盖，≤0 关闭。"""
+    try:
+        return float(os.environ.get("CALIB_MIN_SPAN", "0.30"))
+    except (TypeError, ValueError):
+        return 0.30
+
+
+def _realized_calib_degenerate() -> bool:
+    """近 N 次**真实**校准输出的 P10–P90 跨度 < 阈值 ⇒ 校准器分辨率已坍缩。
+
+    样本不足（< _CAL_BUF_N // 2）时返回 False（**不轻易判定**：宁可不混合，
+    也不用噪声触发恒定 raw 混合）。
+    """
+    _min_span = _calib_min_span()
+    if _min_span <= 0.0 or len(_CAL_BUF) < max(50, _CAL_BUF_N // 2):
+        return False
+    try:
+        _arr = np.asarray(_CAL_BUF, dtype=float)
+        _p10, _p90 = np.percentile(_arr, [10, 90])
+        return float(_p90 - _p10) < _min_span
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _realized_calib_note(deg: bool, p_cal: float) -> None:
+    """状态翻转时**只打一次**日志（供运维确认判据已生效，避免每 5s 刷屏）。"""
+    if _REALIZED_DEGENERATE_STATE["flag"] == deg:
+        return
+    _REALIZED_DEGENERATE_STATE["flag"] = deg
+    try:
+        _arr = np.asarray(_CAL_BUF, dtype=float)
+        _span = float(np.percentile(_arr, 90) - np.percentile(_arr, 10)) \
+            if len(_arr) else float("nan")
+    except Exception:  # noqa: BLE001
+        _span = float("nan")
+    print(f"[info] realized-calib degeneracy -> {deg}（近 {len(_CAL_BUF)} 次校准输出 "
+          f"P10–P90 跨度={_span:.4f}，阈值={_calib_min_span():.2f}，当前 p_cal={p_cal:.4f}）"
+          + ("；已启用 raw 混合以恢复分辨率" if deg else "；已恢复纯校准输出"),
+          file=sys.stderr)
+
+
 def _calib_is_degenerate(iso, min_levels: int | None = None) -> bool:
     """判断等温校准器是否退化成粗阶梯（小样本过拟合的典型症状）。
 
@@ -519,6 +536,16 @@ def _calib_is_degenerate(iso, min_levels: int | None = None) -> bool:
                     if len(_oset) < _min:
                         return True
                     if (max(_outs) - min(_outs)) < 0.10:
+                        return True
+                    # 【F5 2026-09-18】增补「**质量集中**」判据（跨度判据的漏洞）：
+                    #   v108 实测 8 档、支撑域 0.15~0.95（跨度 0.80 ⇒ 上面那条放行），
+                    #   但 **6 档挤在 0.29~0.44** ⇒ 生产 ai_score 被压进 [20,42]
+                    #   （上线前是 [3,100]）⇒ 闸门阈值 0.60/0.70 数学上不可达、
+                    #   AI 恒降级（2026-09-18 审计实证）。
+                    #   故用**四分位距**衡量"有效分辨率"：跨度宽但质量集中 = 仍退化。
+                    #   阈值 `ai.lm.calib_min_iqr`（默认 0.15，可热配；≤0 关闭本判据）。
+                    _q1, _q3 = _np.percentile(_np.asarray(_outs, dtype=float), [25, 75])
+                    if (float(_q3) - float(_q1)) < _calib_min_iqr():
                         return True
                 except Exception:
                     pass
@@ -642,7 +669,8 @@ def build_features(snapshot: dict, kl: pd.DataFrame,
                    h1_feats: dict | None = None, env_feats: dict | None = None,
                    align_m5: bool = False, audit: bool = False,
                    ds_out: dict | None = None,
-                   tmf_out: dict | None = None) -> dict:
+                   # 【2026-09-21 TimesFM 卸载】原 `tmf_out: dict | None = None` 入参已移除
+                   ) -> dict:
     """从 hexp 快照 + 已 enrich 的 M5 K 线装配单条特征行（与训练同构）。
 
     【B5 修复 2026-08-14】此前 macd/h1_adx/h1_trend_strength/event_proximity_min/
@@ -707,7 +735,7 @@ def build_features(snapshot: dict, kl: pd.DataFrame,
                   "spread_num", "spread_atr",
                   # 多任务状态头原始结构因子（enrich_klines 已 shift(1) 写入，含历史值）
                   "donchian_q", "dev_z_ema20", "dev_z_ema60", "dev_z_ema200",
-                  "macd_slope3", "body_wick_ratio", "extreme_reversal"]:
+                  "macd_slope3", "macd_norm", "body_wick_ratio", "extreme_reversal"]:
             row[c] = bar.get(c)
         # MACD 柱状（EMA12-26 差值的 9 周期信号线之差）
         try:
@@ -780,16 +808,23 @@ def build_features(snapshot: dict, kl: pd.DataFrame,
     row["ds_fake_prob"] = _num(_ds.get("fake_prob"), 0.0) if _ds.get("fake_prob") is not None else 0.0
     row["ds_sl_coeff"] = _num(_ds.get("ai_sl_coeff"), 0.0) if _ds.get("ai_sl_coeff") is not None else 0.0
     row["ds_continuity"] = _num(_ds.get("continuity_score"), 0.0) if _ds.get("continuity_score") is not None else 0.0
-    # 【TimesFM 特征 2026-08-30】注入 tmf_* 13 列：推理侧主循环按当前 M5 bar 查
-    # hcm_ai.timesfm_features，缺失→全 0.0，与训练侧缺省严格一致(保证训练-推理同分布)。
-    _tmf = tmf_out or {}
-    for c in TMF_FEATURE_COLS:
-        row[c] = _tmf.get(c, 0.0)
+    # 【2026-09-21 TimesFM 卸载】原在此注入 tmf_* 17 列（取自 hcm_ai.timesfm_features）。
+    # 已移除：无任何模型索取这些列（见文件上方 `_load_tmf_for_bar` 移除说明）。
     # 所有特征缺则补 0.0，避免 LightGBM 因 None/object dtype 抛错（被 score_one 顶层 except 吞）
-    # 【2026-09-10 下线兼容】额外带上 LEGACY_FEATURE_COLS：旧模型仍会按
-    # feature_name() 索取这些列，缺失会被 score_one 填成恒 0（训练域外）→ 静默错判。
-    feats = {c: (row.get(c) if row.get(c) is not None else 0.0)
-             for c in (list(FEATURE_COLS) + list(LEGACY_FEATURE_COLS))}
+    # 【2026-09-21 去重】原在此额外挂 LEGACY_FEATURE_COLS（旧模型列白名单）已删除：
+    #   在线模型已全部 36/37 维，白名单无人索取；改由 score_one 的契约漂移告警兜底。
+    feats = {c: (row.get(c) if row.get(c) is not None else 0.0) for c in FEATURE_COLS}
+    # 【2026-09-21 修复 v108 train/serve skew —— 由本轮新增的"契约漂移护栏"首次报出】
+    # 09-18 的 `macd → macd_norm` 替换**只改了 `MODEL_FEATURE_COLS`**，而没有把 `macd`
+    # 一并纳入 `feats`（尽管 `_model_feature_cols.py:158` 注释明确承诺
+    # "macd 仍保留产出以兼容旧 v108"——只兑现了一半：`row` 有算，`feats` 没收）。
+    # 实测后果：线上 champion `lgbm_quality_v108.txt`（36 维，**含 `macd`、不含 `macd_norm`**）
+    #   的 `macd` 列**线上恒 0** ⇒ 落在训练域外 ⇒ 模型在该列的 splits 永远走同一支
+    #   = **静默劣化**（护栏于 2026-09-21 12:00:35 首次报出 `['macd']`）。
+    # 修法：`build_features` 一直在算 `row["macd"]`（见上方 MACD 柱状计算），只需补入 `feats`。
+    #   新模型按 `feature_name()` 取不到 `macd` ⇒ 自然忽略 ⇒ **零副作用**。
+    for _lc in ("macd",):
+        feats[_lc] = row.get(_lc) if row.get(_lc) is not None else 0.0
     # 【C·特征口径对齐审计】开启 ai.lm.feature_audit 时打印 FEATURE_COLS 顺序与当前样本，
     # 供与训练脚本(train_signal_quality.py --audit)输出 diff，确认推理与训练同构
     # （列顺序/数值范围一致，杜绝训练-推理分布偏移这一 LightGBM 部署头号风险）。
@@ -955,6 +990,24 @@ def score_one(model, iso, feats: dict, state_model=None, state_classes=None,
     _entry_raw_p = None
     try:
         names = model.feature_name()
+        # 【2026-09-21 契约漂移护栏 —— 替代已删除的 LEGACY_FEATURE_COLS 白名单】
+        # 原实现对"模型索取但 build_features 未产出"的列**静默填 0**（下方 to_numeric.fillna），
+        # 0 往往落在训练域外 ⇒ 树把所有样本强推到单一分支 ⇒ 静默劣化、无日志、重启才暴露
+        # （2026-09-10 真的发生过：线上 v97 是 50 维而契约已降到 36 维）。
+        # 白名单只能覆盖"已知的这一次"；此处改为告警，可点亮任何未来的契约漂移。
+        # 节流：同一进程内"同一种缺失签名"只报一次，避免每 M5 棒刷屏。
+        _missing = [k for k in names if feats.get(k) is None]
+        if _missing:
+            _sig = tuple(sorted(_missing))
+            _warned = getattr(score_one, "_missing_warned", None)
+            if _warned is None:
+                _warned = set()
+                score_one._missing_warned = _warned  # type: ignore[attr-defined]
+            if _sig not in _warned:
+                _warned.add(_sig)
+                print(f"[warn] feature-contract drift: 模型索取 {len(_missing)} 列但 "
+                      f"build_features 未产出 → 将填 0.0（训练域外，静默劣化风险）： "
+                      f"{_missing}", file=sys.stderr)
         row = {k: feats.get(k) for k in names}
         # 状态头仅作诊断(预测 predicted_state)，不拼回质量头特征
         predicted_state = None
@@ -982,7 +1035,13 @@ def score_one(model, iso, feats: dict, state_model=None, state_classes=None,
             # 【B5 真凶修复】退化校准器（粗阶梯）会把整段 raw 概率压成同一常数，
             # 使 ai_score 恒定、模型形同摆设。此时按 blend_w 与 raw 概率混合，
             # 既保留校准的单调排序信息，又恢复分辨率（随行情波动）。
-            if _calib_is_degenerate(iso):
+            # 【F5 v2 2026-09-18】判据由**单看校准器**扩展为"校准器退化 **或**
+            #   近 N 次真实输出跨度坍缩"（后者是 v108 型"支撑域宽但质量集中"的唯一
+            #   可检出路径，见 _realized_calib_degenerate 注释）。
+            _CAL_BUF.append(p_cal)
+            _realized_deg = _realized_calib_degenerate()
+            _realized_calib_note(_realized_deg, p_cal)
+            if _calib_is_degenerate(iso) or _realized_deg:
                 w = CALIB_BLEND_W
                 p = w * p_cal + (1.0 - w) * p_raw
             else:
@@ -1219,9 +1278,18 @@ _value_booster = None
 _value_loaded = False
 _value_last_ts = 0.0
 _value_last_out = None
-_VALUE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "models", "lgbm_value_v1.txt")
 _VALUE_TTL = 60.0
+# 【2026-09-21 修复 train/serve skew：删除本地硬编码的 _VALUE_PATH】
+#   原值 = models/lgbm_value_v1.txt；而本模块经 value_features → value_pipeline 取特征，
+#   value_features.py 的注释与 DEFAULT_MODEL 明确要求"必须配套同口径的 v3 模型"：
+#     v1 = 旧管线；v2 = 修复管线但未做坏棒治理、仍含 ema20、spread_atr 量纲错；
+#     v3 = 坏棒治理 + 剔除 ema20 + spread_atr 修正 + 无泄漏训练。
+#   ⇒ 原实现 = 用 v3 口径特征喂 v1 模型（特征-模型错配）。
+#   现改为**引用唯一真源** value_features.DEFAULT_MODEL（见 _value_poll），
+#   消除"同一个版本号在两个 .py 各写一份"这一重叠项。
+#   影响面：ai.lm.value_enabled 未出现在配置表（默认关 ⇒ _value_poll 立即 return None），
+#   故本修复对实盘零行为变更。
+
 
 
 def _value_poll(conn, symbol, r):
@@ -1240,16 +1308,19 @@ def _value_poll(conn, symbol, r):
     if now - _value_last_ts < _VALUE_TTL:
         return _value_last_out
     try:
+        import value_features as _vf_imp
         if not _value_loaded:
-            if not os.path.exists(_VALUE_PATH):
+            # 唯一真源：value_features.DEFAULT_MODEL（禁在此再写一份版本号）
+            _path = _vf_imp.DEFAULT_MODEL
+            if not os.path.exists(_path):
                 _value_loaded = True   # 已探测过，避免每轮 stat（后续放文件需重启才加载）
+                print(f"[warn] value head absent: {os.path.basename(_path)} → 不启用",
+                      file=sys.stderr)
                 return None
-            import value_features as _vf_imp
-            _value_booster = _vf_imp.load_model(_VALUE_PATH)
+            _value_booster = _vf_imp.load_model(_path)
             _value_loaded = True
-            print(f"[info] value head loaded: {os.path.basename(_VALUE_PATH)}", file=sys.stderr)
-        import value_features as _vf
-        _value_last_out = _vf.compute(conn, symbol, _value_booster)
+            print(f"[info] value head loaded: {os.path.basename(_path)}", file=sys.stderr)
+        _value_last_out = _vf_imp.compute(conn, symbol, _value_booster)
         _value_last_ts = now
         return _value_last_out
     except Exception as _ve:
@@ -1481,7 +1552,7 @@ def main():
             # 【2026-09-08 审计修复 P0】TimesFM 接入开关与最大可用年龄（见 _load_tmf_for_bar
             # 注释）：tmf_asof_enabled=false 秒级回退到原等值匹配；tmf_max_age_min 控制
             # as-of 允许回溯的最大分钟数，超龄降级 0（防陈旧特征污染实时打分）。
-            global _TMF_ASOF, _TMF_MAX_AGE_MIN
+            # 【2026-09-21 TimesFM 卸载】原 `global _TMF_ASOF, _TMF_MAX_AGE_MIN` 已移除
             nonlocal _cfg_reloaded_at, _period_match, _align_m5, enabled, _ai_mode
             nonlocal _model_path, _calib_path, model, iso, _feature_audit, _health_ttl
             nonlocal state_model, state_classes, _raw_fallback
@@ -1523,8 +1594,8 @@ def main():
                 _score_smooth = 0.0
             CALIB_BLEND_W = _cfg_float(cfg, "ai.lm.calib_blend_w", CALIB_BLEND_W)
             CALIB_MIN_LEVELS = int(_cfg_float(cfg, "ai.lm.calib_min_levels", CALIB_MIN_LEVELS))
-            _TMF_ASOF = _bool(cfg, "ai.lm.tmf_asof_enabled", _TMF_ASOF)
-            _TMF_MAX_AGE_MIN = _cfg_float(cfg, "ai.lm.tmf_max_age_min", _TMF_MAX_AGE_MIN)
+            # 【2026-09-21 TimesFM 卸载】原在此读 `ai.lm.tmf_asof_enabled` /
+            # `ai.lm.tmf_max_age_min` 两键（供 `_load_tmf_for_bar` 使用），已随该函数移除。
             _persist_hb = max(0.0, _cfg_float(cfg, "ai.lm.persist_heartbeat_sec", 60.0))
             # 【B 项·2026-09-11】三头原始分落库开关（校准闭环数据源）。默认开；关=不写 ai_pred_raw。
             _raw_record = _bool(cfg, "ai.lm.raw_record_enabled", True)
@@ -1705,11 +1776,15 @@ def main():
                                         _ds_out = None
                         except Exception:
                             _ds_out = None
-                        # 【TimesFM 特征 2026-08-30】按当前 M5 bar 查离线特征；缺失→{}→0.0 降级。
+                        # 【2026-09-21 TimesFM 卸载 · 修正】原在此有三行：
+                        #   `_bar_time = ...` / `_tmf_out = _load_tmf_for_bar(...)` / `tmf_out=_tmf_out`
+                        # ⚠ 我最初把三行**一并删除**，导致下游 `_record_raw(conn, ..., _bar_time, ...)`
+                        #   抛 `NameError: name '_bar_time' is not defined`（scoring loop 每 5s 报错）。
+                        #   教训：`_bar_time` 与 TimesFM **无关** —— 它是"当前 M5 bar 的 open_time"，
+                        #   供 ai_pred_raw 落库定位，**必须保留**；只有后两行（tmf 专有）该删。
                         _bar_time = kl.iloc[-1]["open_time"] if (kl is not None and not kl.empty) else None
-                        _tmf_out = _load_tmf_for_bar(conn, args.symbol.upper(), _bar_time)
                         feats = build_features(snap, kl, _h1f, _envf, align_m5=_align_m5,
-                                               audit=_feature_audit, ds_out=_ds_out, tmf_out=_tmf_out)
+                                               audit=_feature_audit, ds_out=_ds_out)
                         _raw, _pred_state, _ai_dir, _ai_dir_prob, _ai_entry, _ai_dir_raw, \
                             _q_raw, _d_raw_p, _e_raw_p = score_one(
                             model, iso, feats, state_model, state_classes, dir_model, dir_calibs,

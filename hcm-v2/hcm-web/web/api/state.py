@@ -280,7 +280,10 @@ def create_state_router(db_pool=None, config_provider=None, auth_handler=None, r
             "       s.prob_oscillation, s.prob_trend_init, s.prob_trend_mid, s.prob_trend_fade, "
             "       s.margin, s.age_bars, s.direction, s.hold_only, s.model_version, "
             "       s.intent_action, s.intent_direction, s.intent_lot_mult, s.intent_reason, "
-            "       s.trigger_on, s.trigger_reason, s.note "
+            "       s.trigger_on, s.trigger_reason, s.note, "
+            # 【2026-09-17 D4】逐 bar 箱体（前端按真实序列分段绘制箱体三线）；
+            #   NULL = 该 bar 无可算箱体（K 线/ATR 不足或策略层未就绪），前端应断线不补。
+            "       s.box_upper, s.box_lower, s.box_mid, s.box_frozen "
             "FROM (SELECT * FROM hcm_market.klines_xauusd "
             "      WHERE symbol = $1 AND time_frame = $2 "
             "      ORDER BY open_time DESC LIMIT $3) k "
@@ -302,12 +305,22 @@ def create_state_router(db_pool=None, config_provider=None, auth_handler=None, r
         if db_pool is None:
             return _not_ready("db")
         sym = symbol.upper()
+        # 【2026-09-17 面板口径修复】补 `magic` + 关联 signals 的 signal_mode / _fsm.lot_multiplier。
+        # 为什么必须补：面板原先只显示"方向 + 手数"，而同一手数可能来自**震荡阶梯**
+        # （ladder 0.5/1.0/1.5）或**趋势恒 1.0**（规格 10.2）—— 实测被读成
+        # "震荡态首单下了 0.02 手"（那其实是一笔 state_trend 单）。
+        # 真值来源：magic 只在 hcm_trading.positions（orders 无该列 ⇒ 订单行只给 mode/倍率）。
         pos_rows = await _fetch(
             db_pool,
-            "SELECT position_id, mt5_ticket, direction, lot, open_price, current_price, "
-            "       sl, tp, float_profit, open_time, signal_id "
-            "FROM hcm_trading.positions "
-            "WHERE status = 'open' AND symbol = $1 ORDER BY open_time DESC",
+            "SELECT p.position_id, p.mt5_ticket, p.direction, p.lot, p.open_price, p.current_price, "
+            "       p.sl, p.tp, p.float_profit, p.open_time, p.signal_id, p.magic, "
+            "       s.signal_mode, "
+            "       (s.indicator_values->'_fsm'->>'lot_multiplier') AS fsm_lot_mult, "
+            "       (s.indicator_values->'_fsm'->>'state') AS fsm_state, "
+            "       (s.indicator_values->>'fsm_reason') AS fsm_reason "
+            "FROM hcm_trading.positions p "
+            "LEFT JOIN hcm_signal.signals s ON s.signal_id = p.signal_id "
+            "WHERE p.status = 'open' AND p.symbol = $1 ORDER BY p.open_time DESC",
             sym,
         )
         positions = _rows_to_dicts(pos_rows)
@@ -322,11 +335,14 @@ def create_state_router(db_pool=None, config_provider=None, auth_handler=None, r
         order_limit = max(1, min(int(order_limit or 60), 300))
         ord_rows = await _fetch(
             db_pool,
-            "SELECT order_id, mt5_ticket, signal_id, direction, lot, open_price, close_price, "
-            "       profit, open_time, close_time, close_reason "
-            "FROM hcm_trading.orders "
-            "WHERE symbol = $1 AND order_status = 2 "
-            "ORDER BY open_time DESC LIMIT $2",
+            "SELECT o.order_id, o.mt5_ticket, o.signal_id, o.direction, o.lot, o.open_price, "
+            "       o.close_price, o.profit, o.open_time, o.close_time, o.close_reason, "
+            "       s.signal_mode, "
+            "       (s.indicator_values->'_fsm'->>'lot_multiplier') AS fsm_lot_mult "
+            "FROM hcm_trading.orders o "
+            "LEFT JOIN hcm_signal.signals s ON s.signal_id = o.signal_id "
+            "WHERE o.symbol = $1 AND o.order_status = 2 "
+            "ORDER BY o.open_time DESC LIMIT $2",
             sym, order_limit,
         )
 

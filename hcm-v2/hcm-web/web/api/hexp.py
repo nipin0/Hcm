@@ -314,6 +314,10 @@ HEXP_KEYS: dict[str, Any] = {
     "hexp.trend_start_pos_high": 0.8,
     "hexp.trend_start_pos_low": 0.2,
     "hexp.trend_start_min_grade": "B",
+    # 【2026-09-17 变更·A1 方案乙】趋势启动覆写是否豁免 produce() 末尾的 min_grade 兜底：
+    #   true （默认）= 放行"grade 低于 hexp.min_grade 但满足趋势启动门槛"的信号；
+    #   false        = 回退改造前行为（覆写被兜底回滚），可秒级热调、无需重启。
+    "hexp.trend_start.min_grade_exempt": True,
     # 手数：链动风控动态手数，禁用硬编码固定折减。
     # lot_tier 只选档(low/mid/high)，实际倍率由风控 risk.lot_multiplier_* 决定；
     # lot_mult 默认 1.0 = 完全不干预，仅在确需微调时才配置。
@@ -327,6 +331,11 @@ HEXP_KEYS: dict[str, Any] = {
     #     热改需重启进程（P1c 已修）。此处仅补白名单使其可经面板管理。
     "hexp.entry_gate_enabled": True,       # 入场闸门总开关（scheduler 消费；关=跳过 θ 裁决）
     "hexp.entry_gate_force_pass": False,   # 强制放行（调试/影子验证用）
+    # 【2026-09-17 A2】下游三处方向注入（micro_state / value_drive / range_mr）允许覆盖的
+    # hexp 否决原因**前缀白名单**（逗号分隔）。默认仅 `hexp_no_direction`（= hexp 自身
+    # 没方向这一软原因）；`"*"` = 不设限（等价改造前行为，可秒级回退）。
+    # 目的：禁止注入绕过 zone/extreme/flip/drain/hurst/pole/pullback 等**硬护栏**否决。
+    "hexp.entry_gate.overridable_reasons": "hexp_no_direction",
     "hexp.entry.theta.TREND_PULLBACK": 0.30,   # 状态门槛 θ（趋势回踩最低）
     "hexp.entry.theta.TREND_ACCEL": 0.45,
     "hexp.entry.theta.TREND_EXHAUST": 0.55,    # 衰竭最高（最谨慎）

@@ -34,8 +34,8 @@ import numpy as np
 import pandas as pd
 import psycopg2
 
-# 【TimesFM 特征 2026-08-30】契约单一真值：tmf 列名与训练/推理侧共享
-from _model_feature_cols import TMF_FEATURE_COLS  # noqa: E402
+# 【2026-09-21 TimesFM 卸载】原 `from _model_feature_cols import TMF_FEATURE_COLS` 已移除
+# （随 `load_tmf_features` / `_row_tmf` 一并下线，见下方同名注释）。
 
 DB_URL_DEFAULT = "postgresql://hcm:hcm_dev_pwd@localhost:5432/hcm_v2"
 
@@ -58,7 +58,7 @@ MISSING_HEXP = ["hp_score", "hp_strength", "dir_sum", "k"]
 
 
 def load_signals(conn, mode: str, require_ds_align: bool = True,
-                 ds_align_sec: int = 1800) -> pd.DataFrame:
+                 ds_align_sec: int = 1800, since_days: int = None) -> pd.DataFrame:
     """加载信号。
 
     【2026-09-11 覆盖率开关】`require_ds_align`：
@@ -83,7 +83,11 @@ def load_signals(conn, mode: str, require_ds_align: bool = True,
     # DeepSeek 语义(ds_nonzero_ratio≈0.16)。对齐后仅训练"有 DS 上下文"
     # 的样本，ds_nonzero_ratio→~1.0，模型开始真正吸收 DS 语义。
     _ds_clause = ""
+    _since_clause = ""
     _params: tuple = tuple(modes)
+    if since_days is not None:
+        _since_clause = " AND s.created_at >= now() - make_interval(days => %s)"
+        _params = _params + (int(since_days),)
     if require_ds_align:
         _ds_clause = (
             " AND EXISTS ("
@@ -91,7 +95,7 @@ def load_signals(conn, mode: str, require_ds_align: bool = True,
             "   WHERE d.symbol = s.symbol"
             "     AND abs(extract(epoch from (s.created_at - d.created_at))) <= %s)"
         )
-        _params = tuple(modes) + (int(ds_align_sec),)
+        _params = _params + (int(ds_align_sec),)
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -101,7 +105,7 @@ def load_signals(conn, mode: str, require_ds_align: bool = True,
             FROM hcm_signal.signals s
             WHERE ({_mode_clause})
               AND s.signal_dir IN ('BUY','SELL')
-              AND s.entry_price IS NOT NULL AND s.entry_price > 0{_ds_clause}
+              AND s.entry_price IS NOT NULL AND s.entry_price > 0{_ds_clause}{_since_clause}
             ORDER BY s.created_at
             """,
             _params,
@@ -234,7 +238,8 @@ def enrich_klines(kl: pd.DataFrame) -> pd.DataFrame:
 
 
 def _add_structure_factors(kl: pd.DataFrame) -> pd.DataFrame:
-    """无阈值原始结构因子：donchian_q / dev_z_multi×3 / macd_slope3 / body_wick_ratio。
+    """无阈值原始结构因子：donchian_q / dev_z_multi(20/60/200) / macd_slope3 /
+    macd_norm（2026-09-18 平稳化采纳）/ body_wick_ratio / extreme_reversal。
 
     设计原则（铁律五·量化红线）：禁止未来数据泄露——所有量均用 shift(1) 后的历史值计算，
     不引用当前未收盘棒的未来信息。全部为 ∈[0,1] 或带符号的原始量，边界由模型自学习。
@@ -261,6 +266,10 @@ def _add_structure_factors(kl: pd.DataFrame) -> pd.DataFrame:
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
+    # 【2026-09-18 平稳化·MACD 幅度尺度不变】裸 macd 线随价级漂移；macd_norm = macd/atr
+    # （价级无关），与既有 macd_slope3(斜率)互补：一个管"幅度大小"、一个管"变化方向"。
+    # 归入结构因子族（随下方 struct_cols 统一 shift(1) 防泄露）。
+    kl["macd_norm"] = (macd / atr.replace(0, np.nan)).fillna(0.0)
     macd_std = macd.rolling(20).std().replace(0, np.nan)
     kl["macd_slope3"] = (macd.diff(3) / macd_std).fillna(0.0)
 
@@ -287,8 +296,11 @@ def _add_structure_factors(kl: pd.DataFrame) -> pd.DataFrame:
     kl["extreme_reversal"] = _rev.fillna(0.0)
 
     # 全部用历史值（防止状态头在训练时偷看当前棒），训练/推理一致
+    # 【2026-09-18 平稳化·仅 macd_norm 采纳】实测（_scratch/_ab*_20260918.py，配对 5×5，
+    # n=952）：macd→macd_norm 替换 quality dAUC=+0.0109(显著)、entry +0.0046(非负)；
+    # 其余候选（atr_rel / bbw_atr / 结构·箱体 4 列）经实测不泛化甚至显著负，已弃用不留死代码。
     struct_cols = ["donchian_q", "dev_z_ema20", "dev_z_ema60", "dev_z_ema200",
-                   "macd_slope3", "body_wick_ratio", "extreme_reversal"]
+                   "macd_slope3", "macd_norm", "body_wick_ratio", "extreme_reversal"]
     kl[struct_cols] = kl[struct_cols].shift(1)
     return kl
 
@@ -363,35 +375,15 @@ def _nearest_ds(ds_list, ts, window_sec: int = 1800):
     return best if best is not None else (0.0, 0.0, 0.0)
 
 
-def load_tmf_features(conn, version: str = "tfm25_pca_v1_sig") -> dict:
-    """加载 TimesFM 离线特征表 hcm_ai.timesfm_features，按 (symbol, bar_time) 精确索引。
-
-    【TimesFM 特征 2026-08-30】与推理侧 quality_scorer.build_features 读同一张表、同口径。
-    特征严格按 bar open_time 对齐(scheduler 用 --at-signal-times 抽取，bar_time 即信号所在
-    M5 bar 的 open_time)，训练侧 _bar['open_time'] 同义 → 精确 join。缺失(调度未覆盖的日期/
-    非 XAUUSD)→ 该 signal 全 0.0，与推理侧缺省一致，保证训练-推理同分布。
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT symbol, bar_time, "
-            "tmf_pc00,tmf_pc01,tmf_pc02,tmf_pc03,tmf_pc04,tmf_pc05,tmf_pc06,tmf_pc07,"
-            "tmf_trend_cont,tmf_rev_prob,tmf_vol_cycle,tmf_mtf_resonance,tmf_hist_sim "
-            "FROM hcm_ai.timesfm_features "
-            "WHERE time_frame='M5' AND tmf_version=%s ORDER BY bar_time",
-            (version,),
-        )
-        rows = cur.fetchall()
-    out = {}
-    for r in rows:
-        sym = r[0]
-        bt = _as_naive_utc(r[1])
-        if bt is None:
-            continue
-        vals = {}
-        for c, v in zip(TMF_FEATURE_COLS, r[2:]):
-            vals[c] = float(v) if v is not None else 0.0
-        out.setdefault(sym, {})[bt] = vals
-    return out
+# 【2026-09-21 TimesFM 卸载】原 `load_tmf_features()` 已移除。
+#
+# 移除依据（实测）：
+#   ① 无消费者 —— 全部 76 个在线模型的 `feature_name()` 无一含 tmf。
+#   ② 增量不显著 —— 配对时序 OOF 修复 qf_* 读取后 ΔAUC = −0.0019，95%CI 跨 0。
+#   ③ 原实现还有一个**静默缺陷**：`SELECT` 只取 13 列而 `TMF_FEATURE_COLS` 已 17 列，
+#      `zip()` 截断 ⇒ 4 个 `tmf_qf_*` 在 features.csv 里**恒 0**（实测非零率 0.0%）。
+#      ⇒ 每一轮重训都在 `features.csv` 里产出 17 列**无人消费、且 4 列恒 0** 的列。
+# 归档：`tools/_attic_timesfm_20260921/`。回退见该目录 README。
 
 
 # ── 【2026-09-02】多周期 MTF 共识分 verdict 重算（与 hexp_engine 同构近似）──
@@ -583,13 +575,7 @@ def _compute_verdict(kl_mtf: dict, kl_m5: pd.DataFrame, created_at) -> float:
     return float(verdict)
 
 
-def _row_tmf(tmf_sym, bar):
-    """返回 tmf_* 13 列：命中则填真实值，未命中(无 bar / 无覆盖)→全 0.0（与推理侧缺省一致）。"""
-    if bar is not None:
-        bt = _as_naive_utc(bar["open_time"])
-        if bt is not None and tmf_sym is not None and bt in tmf_sym:
-            return dict(tmf_sym[bt])
-    return {c: 0.0 for c in TMF_FEATURE_COLS}
+# 【2026-09-21 TimesFM 卸载】原 `_row_tmf()` 已移除（它是 features.csv 里 17 列 tmf 的唯一产出点）。
 
 
 def load_env(conn, symbols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -653,6 +639,8 @@ def main():
                     help="不要求与 DeepSeek 票 ±ds-align-sec 对齐（覆盖全部信号）。"
                          "评审管线用；质量头管线勿用——其 ds_nonzero_ratio 护栏依赖该对齐。")
     ap.add_argument("--ds-align-sec", type=int, default=1800)
+    ap.add_argument("--since-days", type=int, default=None,
+                   help="仅抽取最近 N 天的信号（离线长窗口对照用，默认全表）")
     ap.add_argument("--db-url", default=os.environ.get("DB_URL", DB_URL_DEFAULT))
     ap.add_argument("--period-align", default="none", choices=["none", "m5"],
                     help="none=legacy(读 indicator_values 的 H1 h1_adx/h1_trend_strength); "
@@ -665,7 +653,8 @@ def main():
     try:
         signals = load_signals(conn, args.mode,
                                require_ds_align=not args.no_ds_align,
-                               ds_align_sec=args.ds_align_sec)
+                               ds_align_sec=args.ds_align_sec,
+                               since_days=args.since_days)
         if signals.empty:
             print("[warn] no signals", file=sys.stderr)
             return
@@ -673,9 +662,8 @@ def main():
         events, snaps, liq = load_env(conn, sorted(set(signals["symbol"].tolist())))
         # 【DeepSeek 训练特征增强 2026-08-17】加载 DeepSeek 落库票，与推理侧同构
         ds_by_sym = load_ds_output(conn)
-        # 【TimesFM 特征 2026-08-30】加载 TimesFM 离线特征，按 (symbol, M5 bar_time) 精确索引，
-        # 供下方 per-signal 循环 join（与推理侧 build_features 同表同口径）。
-        tmf_by_sym = load_tmf_features(conn)
+        # 【2026-09-21 TimesFM 卸载】原 `tmf_by_sym = load_tmf_features(conn)` 已移除
+        # （该查询每次重训都全表拉取一次，且产物无人消费）。
 
         # 加载并重算各 symbol M5 指标
         with conn.cursor() as cur:
@@ -759,7 +747,8 @@ def main():
                           "ema20_dist_atr", "body_ratio", "pullback_depth", "atr_pct",
                           "spread_num", "spread_atr",
                           "donchian_q", "dev_z_ema20", "dev_z_ema60", "dev_z_ema200",
-                          "macd_slope3", "body_wick_ratio", "extreme_reversal"]:
+                          "macd_slope3", "macd_norm",
+                          "body_wick_ratio", "extreme_reversal"]:
                     row[c] = _bar[c] if c in _bar else np.nan
                 # 推理侧增强特征（与 build_features 同源）
                 _atr = float(_bar.get("atr") or 0.0) or 1e-9
@@ -770,10 +759,7 @@ def main():
                 _mom = (float(_cl.iloc[idx]) - float(_cl.iloc[max(0, idx - 6)])) if len(_cl) > 6 else 0.0
                 row["close_mom_atr"] = _mom / _atr
                 row["trend_aligned"] = 1.0 if float(_cl.iloc[idx]) >= float(_bar.get("ema20", _cl.iloc[idx])) else 0.0
-            # 【TimesFM 特征 2026-08-30】按 (symbol, M5 bar_time) 精确 join hcm_ai.timesfm_features。
-            # _bar['open_time'] 即该信号所在 M5 bar 的 open_time，与特征表 bar_time 同义(精确对齐)。
-            # 未命中(调度未覆盖的日期/非 XAUUSD)→ 13 列全 0.0，与推理侧缺省同分布。
-            row.update(_row_tmf(tmf_by_sym.get(r["symbol"]), _bar))
+            # 【2026-09-21 TimesFM 卸载】原在此 `row.update(_row_tmf(...))` 注入 13 列 tmf，已移除。
             # 【2026-09-02】verdict 多周期共识分：从多周期 K 线重算（截至信号时刻已收盘 bar，无泄露）。
             # 与 hexp_engine 第 6 步同构近似；HEXP+live_override 全覆盖（落库 verdict 仅 HEXP 有）。
             # 推理侧 build_features 直接读 hexp 实时 snap["verdict"]（同源），两侧分布一致。

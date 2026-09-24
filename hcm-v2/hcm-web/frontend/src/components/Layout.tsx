@@ -49,6 +49,9 @@ const navGroups: NavGroup[] = [
       { label: '外部因子', path: '/dashboard/factors' },
       // [2026-09-15] FSM 行情状态机监控看板（S1~S4 状态 + 概率 + 箱体 + 持仓风控，只读）。
       { label: '状态机看板', path: '/dashboard/fsm' },
+      // [2026-09-17] AI 体检表：TimesFM / LightGBM 质量栈 / FSM 状态机 三块健康聚合（只读，
+      //   一次请求取回全部检查项 + 结论，异常项高亮，无数据源如实标注）。
+      { label: 'AI 体检表', path: '/dashboard/ai-health' },
       // 【2026-08-28】移除「品种对比」(/dashboard/compare) 菜单项（页面已下线）。
       // 【2026-08-29】AI 中枢监控（LightGBM 三头 + DeepSeek 效果，只读）。
       //   注：菜单按用户要求挂在本组，但路由前缀为 /engine，故访问时分组高亮

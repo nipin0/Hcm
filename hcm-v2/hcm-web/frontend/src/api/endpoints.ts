@@ -27,7 +27,8 @@ export const ENDPOINTS = {
     externalFactors: '/api/v1/dashboard/external-factors',
     /** equity-curve stub — backend returns empty data until full implementation */
     equityCurve: '/api/v1/dashboard/equity-curve',
-    /** live score snapshot — 能否下单的核心判定 (pre_score / threshold / threshold_passed) */
+    /** live score snapshot — 放行判据**唯一真源 = threshold_passed**；
+     *  threshold 仅为**参考分档下界**（2026-09-17 A4 口径统一），不得据其判读能否下单 */
     liveScore: '/api/v1/dashboard/live-score',
     /** 全备份触发 + 状态查询（PG dump + Redis RDB + 源码 → D:\HCM_ASST\backup） */
     backup: '/api/v1/system/backup',
@@ -102,6 +103,9 @@ export const ENDPOINTS = {
       monitor: '/api/v1/ai/report/monitor',
       reversal: '/api/v1/ai/report/reversal',
     },
+    // [2026-09-17] AI 体检表（只读）：TimesFM / LightGBM 质量栈 / FSM 状态机 三块健康聚合。
+    // 后端 web/api/ai_health.py；一次请求取回全部检查项 + 健康结论（错误/关注/停用/无数据源）。
+    health: '/api/v1/ai/health',
     // [2026-08-29] AI 中枢监控（只读）：三头实时运作 + DeepSeek 工作效果 + 自愈中心
     ops: {
       live: '/api/v1/ai/ops/live',

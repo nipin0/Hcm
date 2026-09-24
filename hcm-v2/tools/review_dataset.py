@@ -28,7 +28,16 @@ from _review_feature_cols import REVIEW_ATTR_COLS, REVIEW_FEATURE_COLS  # noqa: 
 
 
 def derive_dir_sign(series: pd.Series) -> np.ndarray:
-    """信号方向 → ±1。**训练/推理必须调用同一函数**（reviewer.py 亦 import 本函数）。"""
+    """信号方向 → ±1（BUY→+1 / SELL→-1 / 其他→0）。
+
+    【2026-09-21 文档修正】原文写"**训练/推理必须调用同一函数**（reviewer.py 亦 import 本函数）"，
+    与事实不符：推理侧 `signal_tower/reviewer.py::derive_dir_sign(direction: str)` 是**另写的一份**，
+    并未 import 本函数 —— 因为 reviewer 运行在 signal-tower 容器（/app），
+    本文件在宿主 tools/，**跨容器无法 import**（`tools/models` 才有 bind mount）。
+    ⇒ 这是**架构性重复，不可消除**，只能锁契约。实际契约是"**同式**"而非"同源"：
+      两者都做 `strip().upper()` 后 BUY→+1 / SELL→-1 / 其余→0。
+    修改任一侧的映射规则时，**必须同步另一侧**（本函数对应 reviewer.py 同名函数）。
+    """
     s = series.astype(str).str.upper()
     return np.where(s == "BUY", 1.0, np.where(s == "SELL", -1.0, 0.0))
 

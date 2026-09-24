@@ -95,6 +95,32 @@ RETRAIN_TRIGGER_COOLDOWN_H = float(os.environ.get("RETRAIN_TRIGGER_COOLDOWN_H", 
 # 样本量下限：少于此数训练结果不可靠，仅产模型不切（避免用噪声数据覆盖好模型）
 # 支持环境变量 RETRAIN_MIN_SAMPLES 覆盖（验证时可临时调大，避免误切线上模型）
 MIN_SAMPLES_FOR_SWITCH = int(os.environ.get("RETRAIN_MIN_SAMPLES", "200"))
+
+# ── 【D1 2026-09-17】分步子进程超时（秒）────────────────────────────────────
+# 根因：`quality_features` 一直沿用 `run()` 的默认 600s，而它在大样本下必然超时
+#   （09-01 / 09-11 / 09-17 三次 ABORT 日志**逐字相同**：
+#    `[ABORT] quality_features failed: timeout after 600s`）⇒ 重训链在特征步被截断，
+#   新模型永不落地（`docs/复盘_timesFM_LightGBM_20260912.md` 的 D1）。
+# 修法：① 每步独立超时，不再共用 600s 默认值；② 优先级 = 环境变量 >
+#        配置中心(Redis `hcm:config:v2`) > 本表默认值（运维可热调，无需改码/重启）；
+#       ③ 超时时 `run()` 返回 rc=124 → 调用方 `[ABORT]` → 进程**非 0 退出**（配合 D2）。
+# 配置键：`ai.retrain.{build_labels|quality_features|train}_timeout_s`
+#   （对应环境变量：`BUILD_LABELS_TIMEOUT_S` / `QF_TIMEOUT_S` / `TRAIN_TIMEOUT_S`）
+# 每步对应的**环境变量名**（显式映射，不用 `step.upper()` 机械拼——那会得到
+# `QUALITY_FEATURES_TIMEOUT_S`，与文档/记忆里通用的 `QF_TIMEOUT_S` 不一致，
+# 实测踩到：设了 `QF_TIMEOUT_S=7` 却不生效）。配置中心键则由步骤名直接拼。
+STEP_TIMEOUT_ENVS = {
+    "build_labels": "BUILD_LABELS_TIMEOUT_S",
+    "quality_features": "QF_TIMEOUT_S",
+    "train": "TRAIN_TIMEOUT_S",
+}
+STEP_TIMEOUT_DEFAULTS = {
+    # 标签为全量重建，耗时随信号量线性增长 ⇒ 原 600s 偏紧，给 900s 余量
+    "build_labels": 900,
+    # ★本缺陷主角：实测大样本必超 600s（特征构建含 ds_* 近邻匹配 + 27 维重算）
+    "quality_features": 1800,
+    "train": 900,          # 原已单列 timeout=900，改为可配置、默认不变
+}
 # 【P0-O3 2026-08-22】DeepSeek 三特征非零占比硬门槛：低于此值说明训练集大部分
 # ds_* 列是 0.0 占位（历史缺 DS 票）→ 模型实质未吸收 ds 语义，切上线只会带来
 # "看似重训了、实则没吸收新信号"的假精准。低于阈值 → 只产模型不切换（与样本量
@@ -118,6 +144,24 @@ PSI_EXEMPT_FEATURES = set(
     (os.environ.get("PSI_EXEMPT_FEATURES",
                     "event_proximity_min,ds_continuity,ds_fake_prob,ds_sl_coeff") or "").split(",")
 )
+
+# 【F3(b) 2026-09-18】**硬触发豁免**（只豁免"单特征重度漂移"这一条触发路径；
+#   不影响报表展示，也不改变 psi.max/mean 的统计口径 —— atr_14 仍会出现在 drifted 里）。
+#   为什么需要：`atr_14` 是**绝对价格量纲**的波动率特征（`quality_scorer.py:660`
+#   `row["atr_14"] = snapshot.get("atr")`，未做尺度归一）。波动率制度切换时其 24h PSI
+#   必然飙高（2026-09-18 实测 0.9199 > PSI_HARD_TRIGGER=0.50）⇒ 每轮都靠它单独硬触发
+#   重训；而重训判决又用**最近折**（正是该漂移窗口）⇒ 反复产模型、反复回滚，
+#   fail_streak 累积到 3 熔断停摆。其**尺度不变**对应物 `atr_pct` / `bbw_pct` /
+#   `spread_atr` 仍留在触发集内 ⇒ 真实分布病理不会被漏掉。
+#   环境变量 PSI_HARD_TRIGGER_EXEMPT 可追加（逗号分隔）；置空串 = 关闭本豁免。
+PSI_HARD_TRIGGER_EXEMPT = set(
+    (os.environ.get("PSI_HARD_TRIGGER_EXEMPT", "atr_14") or "").split(",")
+)
+
+# 【F3(b) 2026-09-18】触发窗口（小时）：原为硬编码 24.0。24h 窗内一次波动率脉冲即可
+#   把 atr 族 PSI 推过阈值 ⇒ "瞬时脉冲"被当成"持续漂移"。调大（如 72）可去抖，
+#   代价是检测变慢。默认保持 24.0（**不擅自改灵敏度**），需要时经环境变量热调。
+PSI_WINDOW_HOURS = float(os.environ.get("PSI_WINDOW_HOURS", "24.0"))
 
 PY = sys.executable
 DS_API_DEFAULT = os.environ.get("DEEPSEEK_API_BASE", "https://api.deepseek.com/v1/chat/completions")
@@ -191,6 +235,41 @@ def next_model_version() -> int:
 
 
 # ── 子进程调用 ────────────────────────────────────────────────────────────
+def _cfg_int(cfg_key: str, env_key: str, default: int) -> int:
+    """读整数配置：环境变量 > 配置中心(Redis `hcm:config:v2`) > 默认值。
+
+    fail-safe：任何读取失败都回退默认值 —— 绝不因"配置读不到"而阻断重训主链路
+    （与文件内既有 `_auto_promote_enabled` / `ai.lm.period_match` 的读法一致）。
+    """
+    raw = os.environ.get(env_key)
+    if raw not in (None, ""):
+        try:
+            return int(float(raw))
+        except Exception:  # noqa: BLE001
+            log(f"[cfg] env {env_key}={raw!r} 非法 → 继续读配置中心")
+    try:
+        import redis as _rlib
+        _rc = _rlib.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=3,
+                          decode_responses=True)
+        v = _rc.hget("hcm:config:v2", cfg_key)
+        if v not in (None, ""):
+            return int(float(v))
+    except Exception as e:  # noqa: BLE001
+        log(f"[cfg] {cfg_key} 读取失败({e}) → 用默认 {default}")
+    return default
+
+
+def _step_timeout(step: str) -> int:
+    """【D1 2026-09-17】取某一步的子进程超时（秒），下限 60s 防误配成 0/负数。
+
+    优先级（见 `STEP_TIMEOUT_ENVS/_DEFAULTS` 注释）：环境变量 > 配置中心 >
+    默认表。env 名走**显式映射**（`QF_TIMEOUT_S` 等），不机械拼步骤名。
+    """
+    return max(60, _cfg_int(f"ai.retrain.{step}_timeout_s",
+                            STEP_TIMEOUT_ENVS.get(step, f"{step.upper()}_TIMEOUT_S"),
+                            STEP_TIMEOUT_DEFAULTS.get(step, 600)))
+
+
 def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
     log(f"[run] {' '.join(cmd)}")
     try:
@@ -208,20 +287,53 @@ def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
 
 # ── 回测指标解析 ──────────────────────────────────────────────────────────
 def parse_auc(stdout: str) -> float | None:
-    """从 train_signal_quality.py 输出抓 [split] 或 [tss-summary] 的 AUC。"""
+    """抓**被部署模型自己**的测试段 AUC：[final-model] 优先。
+
+    【D3 2026-09-17 治本】原实现"**优先取 tss-summary 均值**（时序交叉验证更可靠）"，
+    但 `train_signal_quality.py` 落盘的是 **TSS 最后一折**的模型（其 :675-678
+    `_save_model = _tss_model.booster_`），二者根本不是同一个东西：
+      · `[tss-summary]` = 5 折 AUC **均值**（含最早期的 fold1，也含已被行情淘汰的旧 fold）
+      · `[final-model]` = **实际写进 staging 那个模型**在自己测试窗上的 AUC
+    实测 v109（09-17 06:34）：tss_mean=0.516、final(fold5)=**0.477** ⇒ 旧口径比产物更
+    宽松；反之（均值低而产物好）会**误杀**。判决必须对齐"要部署的那个东西"。
+    tss 均值降级为诊断字段（parse_auc_tss_mean），仍落库可看趋势，但**不参与判决**。
+    """
     import re
+    m = re.search(r"\[final-model\]\s*AUC=(\d+\.\d+)", stdout)
+    if m:
+        return float(m.group(1))
+    # 回退链：老版本 trainer / 异常路径 ⇒ 仍按旧口径取，避免指标缺失导致 fail-open
+    m = re.search(r"tss-summary\] AUC mean=(\d+\.\d+)", stdout)
+    if m:
+        return float(m.group(1))
     best = None
     for line in stdout.splitlines():
         m = re.search(r"AUC=(\d+\.\d+)", line)
         if m:
             v = float(m.group(1))
-            if best is None or "tss-summary" in line or "test" in line.lower():
+            if best is None or "test" in line.lower():
                 best = v
-    # 优先 tss-summary 均值（时序交叉验证更可靠）
+    return best
+
+
+def parse_auc_tss_mean(stdout: str) -> float | None:
+    """5 折时序 CV 的 AUC 均值 —— **仅诊断**（波动/time 漂移趋势），不参与判决。"""
+    import re
     m = re.search(r"tss-summary\] AUC mean=(\d+\.\d+)", stdout)
     if m:
         return float(m.group(1))
-    return best
+    m = re.search(r"\[final-model\]\s*AUC=\d+\.\d+[^\n]*?tss_mean=(\d+\.\d+)", stdout)
+    return float(m.group(1)) if m else None
+
+
+def parse_auc_src(stdout: str) -> str:
+    """本次 auc 的取数来源（便于回看"判决依据是什么"）。"""
+    import re
+    if re.search(r"\[final-model\]", stdout):
+        return "final_model"
+    if re.search(r"tss-summary\] AUC mean=", stdout):
+        return "tss_mean_fallback"
+    return "other"
 
 
 def count_samples(stdout: str) -> int:
@@ -268,6 +380,33 @@ def _bump_fail_streak(r, ok: bool) -> int:
         return n
     except Exception:
         return 0
+
+
+def _record_abort(stage: str, error: str) -> None:
+    """【D2 2026-09-17】把 ABORT 显式落一个 Redis 键 —— 原实现**只打日志**。
+
+    为什么必须补：`retrain_once` 在 ABORT 时**提前 return**，跳过 `record_retrain_run`
+    与 `_bump_fail_streak`（二者在正常路径末端）⇒ Redis 里查不到任何痕迹，
+    `hcm:ai:retrain:last` 仍停留在上一次"完整"轮次（实测：09-15 的 v109 拒收记录
+    一直挂到 09-17，把 09-17 01:50 的 ABORT 完全掩盖）⇒ 面板/运维看不到"重训链已断"。
+
+    **刻意不动 `fail_streak`**：它的语义是"**切换失败**计数"（≥3 触发熔断，
+    见 `RETRAIN_FAIL_STREAK_HALT`）。把基础设施 ABORT 计进去会在**修链期间把重训永久
+    熔断**（正是我们在修的场景）⇒ 属误伤。ABORT 单独留痕、职责分离。
+    """
+    try:
+        import redis as _rlib
+        blob = json.dumps({
+            "ok": False, "aborted": True, "stage": stage,
+            "error": str(error)[-500:],
+            "at": datetime.now(timezone.utc).isoformat(),
+        }, ensure_ascii=False)
+        _rlib.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=3,
+                    decode_responses=True).set(
+            "hcm:ai:retrain:last_abort", blob, ex=30 * 24 * 3600)
+        log(f"[abort] 已留痕 hcm:ai:retrain:last_abort (stage={stage})")
+    except Exception as e:  # noqa: BLE001
+        log(f"[abort] 留痕失败（非致命，不影响重训判定）: {e}")
 
 
 def _cleanup_staging(keep: int = 3) -> None:
@@ -963,7 +1102,13 @@ def _compute_trigger(baseline, feat_cols, ai, feats, passed):
     if eval_feats:
         _max = max(eval_feats.values())
         _mean = sum(eval_feats.values()) / len(eval_feats)
-        _n_hard = sum(1 for v in eval_feats.values() if v > PSI_HARD_TRIGGER)
+        # 【F3(b) 2026-09-18】硬触发计数**额外**排除"尺度不稳定特征"
+        # （默认 atr_14，见 PSI_HARD_TRIGGER_EXEMPT 注释）。注意 _max/_mean 仍按
+        # eval_feats 统计 ⇒ 报表与日志里的 psi_max 依然如实反映 atr_14 的漂移值，
+        # 只是**不再由它单独决定是否重训**。
+        _hard_feats = {k: v for k, v in eval_feats.items()
+                       if k not in PSI_HARD_TRIGGER_EXEMPT}
+        _n_hard = sum(1 for v in _hard_feats.values() if v > PSI_HARD_TRIGGER)
     else:
         _max, _mean, _n_hard = 0.0, 0.0, 0
     triggered = collapse or (
@@ -1081,7 +1226,8 @@ def monitor_and_trigger(use_deepseek: bool = True) -> bool:
     """
     baseline = load_live_baseline() or load_baseline()
     feat_cols = baseline.get("features", [])
-    ai, feats, passed = fetch_recent(24.0)
+    # 【F3(b)】窗口改由 PSI_WINDOW_HOURS 控制（默认 24.0 = 原硬编码值，行为不变）
+    ai, feats, passed = fetch_recent(PSI_WINDOW_HOURS)
     if len(feats) < 50:
         log("[trigger] insufficient recent samples, skip")
         return False
@@ -1268,7 +1414,8 @@ def _check_trigger_only():
     """--check-trigger：仅计算并打印触发条件，不重训（安全验证 P3-B）。"""
     baseline = load_live_baseline() or load_baseline()
     feat_cols = baseline.get("features", [])
-    ai, feats, passed = fetch_recent(24.0)
+    # 【F3(b)】与触发路径同窗口口径（默认 24.0 不变）
+    ai, feats, passed = fetch_recent(PSI_WINDOW_HOURS)
     log(f"[check] recent samples={len(feats)}")
     if len(feats) < 50:
         log("[check] insufficient samples"); return
@@ -1290,7 +1437,8 @@ def _run_shadow_eval():
         cand = os.path.join(MODELS_DIR, f"lgbm_quality_v{v}.txt")
     if not champ or not os.path.exists(cand):
         log(f"[shadow-eval] champion={champ} candidate(v{v})={cand} missing"); return
-    ai, feats, passed = fetch_recent(24.0)
+    # 【F3(b)】影子评估与触发路径**必须同窗口**，否则"触发依据"与"验收依据"错位
+    ai, feats, passed = fetch_recent(PSI_WINDOW_HOURS)
     # 【治本 2026-09-09】与 retrain_once 同口径：优先真实成交结果标签。
     _real = fetch_real_eval_set()
     if _real is not None:
@@ -1330,6 +1478,7 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
         if _streak >= RETRAIN_FAIL_STREAK_HALT:
             log(f"[halt] fail_streak={_streak} >= {RETRAIN_FAIL_STREAK_HALT} "
                 f"→ 跳过本轮重训（空转防护）；人工强制请加 --force")
+            _record_abort("fail_streak_halt", f"fail_streak={_streak}")
             return {"ok": False, "stage": "fail_streak_halt", "fail_streak": _streak}
     v = next_model_version()
     # 【P4-a 2026-09-11】候选先落 staging（**不占版本号**）；验收通过后由
@@ -1355,9 +1504,11 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
     # （单模式行为向后兼容）。
     rc, out, err = run([PY, "build_labels.py", "--out", labels_csv,
                         "--mode", "HEXP:%,live_override",
-                        "--ds-calibrate"])
+                        "--ds-calibrate"],
+                       timeout=_step_timeout("build_labels"))
     if rc != 0:
         log(f"[ABORT] build_labels failed: {err[-500:]}")
+        _record_abort("build_labels", err[-500:])
         return {"ok": False, "stage": "build_labels", "error": err[-500:]}
 
     # 2) 特征（自动带 ds_* DeepSeek 特征 = 路径 C）
@@ -1379,20 +1530,29 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
         log(f"[warn] 读取 ai.lm.period_match 失败({_e}) → 回退 none（与线上默认一致）")
     log(f"[align] ai.lm.period_match={_pm or '(empty)'} → quality_features "
         f"--period-align {_period_align}（与推理口径对齐）")
+    # 【D1 2026-09-17】本步超时**独立可配**（默认 1800s，原 600s 恒超时导致链断）：
+    #   配置键 `ai.retrain.quality_features_timeout_s` / env `QF_TIMEOUT_S`。
+    #   逗号后面这行日志是"修复已生效"的直接证据（ABORT 文本会带真实超时值）。
+    _qf_to = _step_timeout("quality_features")
+    log(f"[cfg] step timeout: quality_features={_qf_to}s "
+        f"(ai.retrain.quality_features_timeout_s / QF_TIMEOUT_S)")
     rc, out, err = run([PY, "quality_features.py", "--out", features_csv,
-                        "--mode", "HEXP:%,live_override", "--period-align", _period_align])
+                        "--mode", "HEXP:%,live_override", "--period-align", _period_align],
+                       timeout=_qf_to)
     if rc != 0:
         log(f"[ABORT] quality_features failed: {err[-500:]}")
+        _record_abort("quality_features", err[-500:])
         return {"ok": False, "stage": "quality_features", "error": err[-500:]}
 
     # 3) 训练
     rc, out, err = run(
         [PY, "train_signal_quality.py", "--labels", labels_csv, "--features", features_csv,
          "--model", model_out, "--calib", calib_out, "--outdir", ARTIFACTS],
-        timeout=900,
+        timeout=_step_timeout("train"),
     )
     if rc != 0:
         log(f"[ABORT] train failed: {err[-800:]}")
+        _record_abort("train", err[-800:])
         return {"ok": False, "stage": "train", "error": err[-800:]}
 
     # 【2026-08-24 修复】train 的 ds_diag(DeepSeek 特征吸收率)打印到 stderr，而
@@ -1402,7 +1562,11 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
     auc = parse_auc(_all_out)
     samples = count_samples(_all_out)
     ds_ratio = ds_nonzero_ratio(_all_out)
-    log(f"[train] done: auc={auc} samples={samples} ds_nonzero_ratio={ds_ratio}")
+    # 【D3 2026-09-17】判决口径 = 落盘模型自身指标；5 折均值仅作诊断（见 parse_auc 注释）
+    auc_tss_mean = parse_auc_tss_mean(_all_out)
+    auc_src = parse_auc_src(_all_out)
+    log(f"[train] done: auc={auc} (src={auc_src}, tss_mean={auc_tss_mean}) "
+        f"samples={samples} ds_nonzero_ratio={ds_ratio}")
 
     # 【阶段 2·健康判定 2026-08-29】方向头 / 买点头**独立**健康判定（用户决策 1/2/4）：
     #   - 阈值 0.55（HEAD_METRIC_MIN）
@@ -1437,6 +1601,10 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
         "samples": samples,
         "ds_nonzero_ratio": ds_ratio,
         "baseline_win_rate": None,  # train 输出含，按需扩展解析
+        # 【D3 2026-09-17】判决口径溯源：auc 取自"落盘模型自身"（final_model）；
+        # tss_mean 是 5 折均值，仅诊断（趋势）—— 二者过去混用是本次误判的结构性原因。
+        "auc_src": auc_src,
+        "auc_tss_mean": auc_tss_mean,
         # 质量头【自身】校准器状态 → 这才是裁判该用的"校准器退化"判据
         "quality_calib_degenerate": quality_calib_degenerate,
         # 阶段 2：三头健康指标（本地判定 + 落库追溯；【不交裁判】，见 _judge_payload）
@@ -1447,8 +1615,13 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
     # recalib_required 的 head_health 原样发给裁判；而裁判 prompt 的硬性回滚条件 (1)
     # 写作"校准器退化" → LLM 把"方向头需重校准"误读为"质量头校准器退化" → rollback。
     # v101 实测：AUC=0.677/样本=1496/ds_ratio=1.0 全达标仍被否，即此缺陷所致。
-    _judge_payload = {k: v for k, v in payload.items() if k != "head_health"}
-    log(f"[judge-payload] 已剔除 head_health；"
+    # 【D3 2026-09-17】除 head_health 外，**再把两个诊断字段剔出裁判 payload**：
+    #   `auc_tss_mean` / `auc_src` 是给人看的口径溯源，若一并喂给 LLM，可能被它
+    #   当成"第二个 AUC"去比对 0.55 门槛（历史已发生过 head_health 被误读为
+    #   校准退化）。判决只应看 `auc`（=落盘模型自身指标）。
+    _JUDGE_EXCLUDE = {"head_health", "auc_tss_mean", "auc_src"}
+    _judge_payload = {k: v for k, v in payload.items() if k not in _JUDGE_EXCLUDE}
+    log(f"[judge-payload] 已剔除 {sorted(_JUDGE_EXCLUDE)}；"
         f"quality_calib_degenerate={quality_calib_degenerate}")
 
     # 4) 决策：DeepSeek 裁判（路径 B）或本地 AUC 护栏
@@ -1552,7 +1725,10 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
         except Exception as e:
             log(f"[live-baseline] re-pin failed (non-fatal): {e}")
 
-    payload.update({"adopted": decided_adopt, "switched": switched, "judge": judge})
+    # 【D2 2026-09-17】补 `ok: True` —— 使"本轮是否**完整走完**"成为统一契约。
+    # 原 payload 无该字段，调用方无法区分"ABORT（链断，提前 return）"与
+    # "正常走完但拒收候选"（后者 adopted=False 但 ok=True）⇒ 退出码/状态判定失据。
+    payload.update({"ok": True, "adopted": decided_adopt, "switched": switched, "judge": judge})
 
     # 【阶段 3·自愈闭环 2026-08-29】
     # 决策 5：连续失败告警（switched=True = 复活成功 → 清零；否则 +1；≥3 告警人工）
@@ -1646,8 +1822,25 @@ def main():
         hexp_config_link(force_repin=args.force_repin)
         return
     if args.once:
-        retrain_once(use_deepseek=use_ds, force=args.force)
-        return
+        # 【D2 2026-09-17】原实现**丢弃返回值、恒退出 0** ⇒ TimesFM 调度器只判
+        # `returncode==0` 即报 `status=OK`，把"链断在特征步"盲报成成功
+        # （09-12 复盘 D2；实测 09-17 01:50 的 ABORT 在心跳里完全不可见）。
+        # 现按结果给退出码，语义分工明确：
+        #   0 = 轮次完整走完（**含"正常拒收候选"**：链路健康、只是模型不够好）
+        #       或 fail_streak 主动熔断跳过（保护行为，非故障）
+        #   2 = ABORT（基础设施失败：步骤超时 / 子进程非 0）⇒ 调用方据此判失败
+        # 仅影响 `--once` 调用方（TimesFM 调度器 / 人工）；daemon 分支是**进程内**
+        # 调用 `retrain_once`（:1674），不经过这里，行为不变。
+        _res = retrain_once(use_deepseek=use_ds, force=args.force)
+        _stage = str(_res.get("stage") or "")
+        if _res.get("ok"):
+            log("[exit] 轮次完整走完 → 退出码 0")
+            return
+        if _stage == "fail_streak_halt":
+            log("[exit] fail_streak 主动熔断跳过 → 退出码 0（保护行为，非故障）")
+            return
+        log(f"[exit] 重训 ABORT（stage={_stage or '-'}）→ 退出码 2（供调度器判失败）")
+        sys.exit(2)
 
     # daemon 模式：monitor_and_trigger 高频(≤1h)查数据驱动触发，retrain_once 按 interval 定时全量
     log(f"auto_retrain daemon started: interval={args.interval_hours}h deepseek={use_ds} "

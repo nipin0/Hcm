@@ -32,13 +32,25 @@ TRIGGER_DD_ATR = 0.6     # 触发：浮亏 > 0.6 ATR
 REV_CONT_ATR = 1.0       # 标签：从 T 起逆行再走 1.0 ATR = 反转
 PB_RECOVER_ATR = 0.2     # 标签：浮亏缩回 0.2 ATR = 回踩
 
-# 训练时使用的 22 维特征顺序（模型契约，改动须重训）
+# 训练时使用的特征顺序（模型契约，改动须重训）
+#
+# 【2026-09-21 契约失真修正】此前本列表只写 22 列，与实际产物**不符**：
+#   · assemble() 在下方（原 :228-240）追加 7 列结构/拐点/衰竭特征；
+#   · 线上模型 lgbm_reversal_v1.txt 实测入模 **29 列**；
+#   · reversal_v1_meta.json 的 features 亦为 **29 列**。
+# ⇒ 22 是陈旧声明（既非模型契约也非 assemble 输出），会误导运维与后续重训者。
+# 现补齐为 29 列，**顺序与 meta.features / assemble() 的键序完全一致**（可逐列对照）。
+# 影响面：本常量无任何功能引用（仅本文件声明与 _scratch 注释），补齐为纯文档修正，
+#   零行为变更；训练侧列序真源仍是 meta.features。
 FEATURE_ORDER = [
     "direction", "pos_drawdown_atr", "pos_bars_in_trade", "pos_mfe_atr",
     "pos_mae_atr", "pos_sl_dist_atr", "pos_tp_dist_atr", "session",
     "adx_14", "rsi_14", "macd", "macd_hist", "di_plus", "di_minus",
     "di_net", "er", "bbw", "donchian_q", "close_mom_atr",
     "body_ratio", "upper_wick", "lower_wick",
+    # ── 2026-09-04 结构/拐点/衰竭增强（assemble 追加的 7 列）──
+    "hh20_dist_atr", "ll20_dist_atr", "hh10_mom_atr", "ll10_mom_atr",
+    "uwick_atr", "dwick_atr", "body_atr",
 ]
 
 
@@ -164,7 +176,7 @@ def build_indicators(df):
 
 # ────────────────────────── 特征装配（离线/线上共用）──────────────────────────
 def assemble(pos, df, ind, T, entry_idx):
-    """在触发点 T 装配 22 维特征。
+    """在触发点 T 装配 29 维特征（= FEATURE_ORDER，含 7 列结构/拐点/衰竭增强）。
 
     pos        : dict(direction, open_price, sl, tp)  —— 开仓价/SL/TP 来自持仓快照
     df         : K 线 DataFrame（含 open/high/low/close/open_time）

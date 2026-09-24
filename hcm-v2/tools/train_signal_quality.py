@@ -679,6 +679,52 @@ def main():
     else:
         _save_model = model.booster_
         _save_calib = iso
+
+    # ── 【D3 2026-09-17 治本·判决指标必须与落盘产物一致】─────────────────────
+    # 缺陷：auto_retrain.parse_auc 原**优先取 `[tss-summary] AUC mean`（5 折均值）**，
+    #   但真正落盘的是上面那个 `_tss_model` = **最后一折**的模型 —— 两者不是同一个东西：
+    #     · `[tss-summary]` = 5 折 AUC 均值（含最早期的 fold1，也含已被行情淘汰的旧 fold）
+    #     · 本行 `[final-model]` = **实际写进 staging 的那个模型**在自己测试窗上的 AUC
+    #   实测 v109（09-17 06:34）：tss_mean=0.516 而 final(fold5)=**0.477** ⇒ 旧判决口径
+    #   比产物**更宽松**；方向相反时（均值低、产物好）就会**误杀好模型**。故此处显式
+    #   打印"产物自身的"指标，由 auto_retrain 优先采用（tss 均值降级为诊断字段）。
+    try:
+        if _tss_model is not None and _aucs:
+            # 【F3(a) 2026-09-18】判决口径由「最后一折」改为「**最近 2 折均值**」：
+            #   实测 v109：末折(final)=0.4757 而 5 折均值=0.528 ⇒ 单折只占 ~20% 样本
+            #   （n_te≈335），且该折的 eval_set 就是它自己的测试窗（early_stopping 在
+            #   测试窗上选 best_iteration）⇒ **单点噪声决定模型命运**。
+            #   取最近 2 折均值：样本量翻倍、方差显著下降，同时**仍只反映近期市况**
+            #   （不把已被行情淘汰的最早 fold 拉进来 —— 这是它与 tss_mean 的关键差别）。
+            #   末折值仍打印（`last_fold=`）供诊断，但**不参与判决**。
+            _av_tail = [a for a in _aucs[-2:] if not np.isnan(a)]
+            _final_auc = float(np.mean(_av_tail)) if _av_tail else float("nan")
+            _final_src = "tss_last2_mean"
+            _final_nte = int(len(_te))
+        else:
+            _final_auc = float(roc_auc_score(y_te, p_raw))
+            _final_src = "main_slice"
+            _final_nte = int(len(y_te))
+    except Exception as _fe:  # noqa: BLE001
+        _final_auc, _final_src, _final_nte = float("nan"), "unknown", 0
+        print(f"[final-model] 计算失败: {_fe}", file=sys.stderr)
+    _tss_mean_txt = ""
+    try:
+        if _aucs:
+            _av = [a for a in _aucs if not np.isnan(a)]
+            if _av:
+                _tss_mean_txt = f" tss_mean={np.mean(_av):.3f}"
+    except Exception:  # noqa: BLE001
+        pass
+    # 【F3(a)】末折单独值仅作诊断（判决已改用最近 2 折均值）
+    _last_fold_txt = ""
+    try:
+        if _aucs:
+            _last_fold_txt = f" last_fold={float(_aucs[-1]):.4f}"
+    except Exception:  # noqa: BLE001
+        pass
+    print(f"[final-model] AUC={_final_auc:.4f} src={_final_src} "
+          f"n_te={_final_nte}{_tss_mean_txt}{_last_fold_txt}")
     # 【2026-09-10 修复·"校准器退化"误判】上方 _calib_degenerate 只描述【验证块】
     # isotonic(iso)，而**实际落盘生效**的是 _save_calib（优先 TSS 最后 fold 校准器）。
     # 二者不同：验证块 iso 退化仅影响 [metrics] 校准后概率的展示，并不影响上线模型。

@@ -92,6 +92,20 @@ class H1RegimeClassifier:
         self._m5_confirm_enabled = H1_M5_CONFIRM_ENABLED
         self._m5_confirm_bars = H1_M5_CONFIRM_BARS
         self._m5_confirm_intensity = H1_M5_CONFIRM_INTENSITY
+        # 【B15-5 2026-09-17】H1 阈值 / 动量 / 确认常量（原为模块级硬编码）。
+        # 默认值**逐字等于**原常量 ⇒ 零行为变化；可经 `scoring.h1_*` 热覆盖。
+        # 注意：`H1_STRONG_STRENGTH` **不在其中** —— 它由 `scoring_engine.py:24` 跨模块
+        #   import 消费，若仅在本类登记键而消费者仍读模块常量，就会造出"配置了不生效"
+        #   的假键（本仓库红线）。其配置化须在 `scoring_engine.load_config` 内一并完成。
+        self._regime_adx_up = H1_REGIME_ADX_UP
+        self._regime_adx_down = H1_REGIME_ADX_DOWN
+        self._regime_adx_mid = H1_REGIME_ADX_MID
+        self._adx_strength_floor = H1_ADX_STRENGTH_FLOOR
+        self._adx_strength_ceil = H1_ADX_STRENGTH_CEIL
+        self._momentum_bars = H1_MOMENTUM_BARS
+        self._momentum_mult = H1_MOMENTUM_MULT
+        self._confirm_bars = H1_CONFIRM_BARS
+        self._confirm_mult = H1_CONFIRM_MULT
 
     async def load_config(self) -> None:
         """从 config_provider 热加载 H1 翻转参数（缺省兜底，缺失/异常不报错）。"""
@@ -116,13 +130,39 @@ class H1RegimeClassifier:
                 "scoring.h1_m5_confirm_bars", H1_M5_CONFIRM_BARS)
             self._m5_confirm_intensity = await self._config.get_float(
                 "scoring.h1_m5_confirm_intensity", H1_M5_CONFIRM_INTENSITY)
+            # 【B15-5 2026-09-17】H1 阈值/动量/确认常量登记为配置键（铁律四.3：禁魔法数字）。
+            # 兜底一律用**模块常量**（= 原硬编码值）⇒ 缺键时行为与改动前逐位一致。
+            self._regime_adx_up = await self._config.get_float(
+                "scoring.h1_regime_adx_up", H1_REGIME_ADX_UP)
+            self._regime_adx_down = await self._config.get_float(
+                "scoring.h1_regime_adx_down", H1_REGIME_ADX_DOWN)
+            self._regime_adx_mid = await self._config.get_float(
+                "scoring.h1_regime_adx_mid", H1_REGIME_ADX_MID)
+            self._adx_strength_floor = await self._config.get_float(
+                "scoring.h1_adx_strength_floor", H1_ADX_STRENGTH_FLOOR)
+            self._adx_strength_ceil = await self._config.get_float(
+                "scoring.h1_adx_strength_ceil", H1_ADX_STRENGTH_CEIL)
+            self._momentum_bars = await self._config.get_int(
+                "scoring.h1_momentum_bars", H1_MOMENTUM_BARS)
+            self._momentum_mult = await self._config.get_float(
+                "scoring.h1_momentum_mult", H1_MOMENTUM_MULT)
+            self._confirm_bars = await self._config.get_int(
+                "scoring.h1_confirm_bars", H1_CONFIRM_BARS)
+            self._confirm_mult = await self._config.get_float(
+                "scoring.h1_confirm_mult", H1_CONFIRM_MULT)
             logger.info(
                 "H1RegimeClassifier config loaded | flip fast/mid/slow=%d/%d/%d "
-                "intensity fast/mid=%.1f/%.1f m5_confirm=%s bars=%d inten=%.1f",
+                "intensity fast/mid=%.1f/%.1f m5_confirm=%s bars=%d inten=%.1f | "
+                "adx up/down/mid=%.1f/%.1f/%.1f floor/ceil=%.1f/%.1f "
+                "mom bars/mult=%d/%.2f confirm bars/mult=%d/%.2f",
                 self._flip_bars_fast, self._flip_bars_mid, self._flip_bars_slow,
                 self._flip_intensity_fast, self._flip_intensity_mid,
                 self._m5_confirm_enabled, self._m5_confirm_bars,
                 self._m5_confirm_intensity,
+                self._regime_adx_up, self._regime_adx_down, self._regime_adx_mid,
+                self._adx_strength_floor, self._adx_strength_ceil,
+                self._momentum_bars, self._momentum_mult,
+                self._confirm_bars, self._confirm_mult,
             )
         except Exception as exc:
             logger.warning(
@@ -180,8 +220,8 @@ class H1RegimeClassifier:
             direction_confirmed = False
             if direction in ("UP", "DOWN"):
                 direction_confirmed = (
-                    self._recent_trend_state(recent_closes, H1_CONFIRM_BARS,
-                                             H1_CONFIRM_MULT) == direction
+                    self._recent_trend_state(recent_closes, self._confirm_bars,
+                                             self._confirm_mult) == direction
                 )
             ctx = H1Context(
                 regime=regime,
@@ -273,14 +313,19 @@ class H1RegimeClassifier:
         return ""
 
     # ── 近期收盘斜率动量票（B 方案）──
-    def _momentum_vote(self, recent_closes: list, n: int = H1_MOMENTUM_BARS,
-                       mult: float = H1_MOMENTUM_MULT) -> int:
+    def _momentum_vote(self, recent_closes: list, n: Optional[int] = None,
+                       mult: Optional[float] = None) -> int:
         """近 n 根 H1 收盘的净方向（决定性才投票，权重 ±2）。
 
         仅当斜率幅度 > mult × 棒间均波动（即真实趋势性移动而非噪音）才返回
         ±2，否则返回 0（不引入噪音）。这是打破"长均线 + 价格位置滞后"死锁的
         关键高权重票。
+
+        【B15-5 2026-09-17】`n`/`mult` 默认改为 **None 哨兵** ⇒ 取**实例值**
+        （可经 `scoring.h1_momentum_bars/mult` 热配）；传入显式值时行为不变。
         """
+        n = self._momentum_bars if n is None else int(n)
+        mult = self._momentum_mult if mult is None else float(mult)
         if not recent_closes or len(recent_closes) < n + 1:
             return 0
         seg = recent_closes[-(n + 1):]
@@ -317,12 +362,17 @@ class H1RegimeClassifier:
         return ""
 
     # ── A 方案：H1 动量强度感知 ──
-    def _h1_intensity(self, recent_closes: list, n: int = H1_MOMENTUM_BARS,
-                      mult: float = H1_FLIP_MULT) -> float:
+    def _h1_intensity(self, recent_closes: list, n: Optional[int] = None,
+                      mult: Optional[float] = None) -> float:
         """近 n 根 H1 收盘斜率的归一化强度（|slope|/(mult×vol)，≥1 即决定性）。
 
         用于自适应翻转窗口：行情越急（强度越高），确认根数越少。
+
+        【B15-5 2026-09-17】`n`/`mult` 默认改为 **None 哨兵** ⇒ 取**实例值**
+        （`mult` 取已可热配的 `scoring.h1_flip_mult`，保持原默认语义）。
         """
+        n = self._momentum_bars if n is None else int(n)
+        mult = self._flip_mult if mult is None else float(mult)
         if not recent_closes or len(recent_closes) < n + 1:
             return 0.0
         seg = recent_closes[-(n + 1):]
@@ -348,14 +398,25 @@ class H1RegimeClassifier:
 
     # ── 趋势强度（ADX 归一化）──
     def _strength(self, adx: float) -> float:
-        """ADX → [0,1]：0→20 映射 0→0.5，20→35 映射 0.5→1.0。"""
-        if adx <= H1_ADX_STRENGTH_FLOOR:
+        """ADX → [0,1]：FLOOR(=20.0) 处 0，CEIL(=35.0) 处 1，中点为 FLOOR 取 0.5。
+
+        【2026-09-17 B15-4】删除**恒假分支** `if adx < 20.0:` —— 上方
+        `adx <= H1_ADX_STRENGTH_FLOOR(=20.0)` 已返回，故该分支**永不可达**；
+        且其分母 `20.0 - FLOOR` 为 **0**（一旦 FLOOR 被调成小于 20 会立即
+        ZeroDivisionError）。同时把中点字面量 `20.0` 改为 `H1_ADX_STRENGTH_FLOOR`
+        —— 二者同为 20.0 ⇒ **行为逐位不变**，仅消除"同一含义两处硬编码"。
+        """
+        # 【B15-5 2026-09-17】改用实例值（可经 scoring.h1_adx_strength_floor/ceil 热配）。
+        # 新增 ceil ≤ floor 的守卫：常量时代不可能误配，**配置化后必须防**
+        #   （否则 `ceil - floor == 0` ⇒ ZeroDivisionError，即"改配置把引擎改崩"）。
+        _fl, _ce = self._adx_strength_floor, self._adx_strength_ceil
+        if _ce <= _fl:
+            return 1.0 if adx >= _ce else 0.0
+        if adx <= _fl:
             return 0.0
-        if adx >= H1_ADX_STRENGTH_CEIL:
+        if adx >= _ce:
             return 1.0
-        if adx < 20.0:
-            return round(0.5 * (adx - H1_ADX_STRENGTH_FLOOR) / (20.0 - H1_ADX_STRENGTH_FLOOR), 3)
-        return round(0.5 + 0.5 * (adx - 20.0) / (H1_ADX_STRENGTH_CEIL - 20.0), 3)
+        return round(0.5 + 0.5 * (adx - _fl) / (_ce - _fl), 3)
 
     # ── 4 态判定 + hysteresis ──
     def _regime(self, adx: float, direction: str, symbol: str,
@@ -399,19 +460,19 @@ class H1RegimeClassifier:
 
         # 1) 方向不明确 → 过渡（给趋势态一点惯性避免一票瞬切）
         if direction not in ("UP", "DOWN"):
-            if prev in (H1_BULLISH, H1_BEARISH) and adx >= H1_REGIME_ADX_DOWN:
+            if prev in (H1_BULLISH, H1_BEARISH) and adx >= self._regime_adx_down:
                 return prev  # 惯性保持
             return H1_TRANSITION
 
-        # 2) 强趋势区（ADX ≥ 24）
-        if adx >= H1_REGIME_ADX_UP:
+        # 2) 强趋势区（ADX ≥ `scoring.h1_regime_adx_up`，默认 24）
+        if adx >= self._regime_adx_up:
             return trend_state
 
-        # 3) 弱趋势区（20 ≤ ADX < 24）：hysteresis
-        if adx >= H1_REGIME_ADX_DOWN:
+        # 3) 弱趋势区（down ≤ ADX < up，默认 20~24）：hysteresis
+        if adx >= self._regime_adx_down:
             if prev == trend_state:
                 return prev  # 已处同方向趋势态 → 维持
-            if adx >= H1_REGIME_ADX_MID:
+            if adx >= self._regime_adx_mid:
                 return trend_state  # ADX 接近上沿且方向明确 → 升级
             return H1_RANGE  # 否则视为区间
 

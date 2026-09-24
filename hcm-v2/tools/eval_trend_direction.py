@@ -354,9 +354,11 @@ def main() -> None:
                                                "state.dir.debounce_bars": args.k})
         conf, valid = res["confirmed"], res["valid"]
 
-        def run_one(thr: float, k: int):
+        def run_one(thr: float, k: int, w: int = int(params.get("slope_window", 20))):
+            pp = dict(params)
+            pp["slope_window"] = w
             r = TD.compute_direction_series(
-                high, low, close, ind=ind, params=params,
+                high, low, close, ind=ind, params=pp,
                 cfg={"state.dir.slope_thr_atr": thr, "state.dir.debounce_bars": k})
             return summarize(r["confirmed"], r["valid"], shift)
     else:
@@ -366,7 +368,20 @@ def main() -> None:
         d_epoch = epoch_s(kl_dir["open_time"])
         m_epoch = epoch_s(kl["open_time"])
 
-        def run_one(thr: float, k: int):
+        def run_one(thr: float, k: int, w: int = 0):
+            # 【2026-09-21 修复】签名必须与唯一调用点 `run_one(t, k, w)`（:397）一致。
+            #   原为 `(thr, k)` ⇒ `--sweep --dir-tf H1` **必崩**：
+            #     TypeError: run_one() takes 2 positional arguments but 3 were given
+            #   根因：`w`（拉长回归窗口）**只在同周期分支有语义**（那里能在评估周期上重算
+            #     斜率）；跨周期分支的方向 bar 是 Hn、窗口是 Hn 的根数 ⇒ 无 `w` 维度。
+            #     ⇒ 有人给同周期分支加了 `w`、却漏改跨周期分支
+            #       ⇒ **单一调用点 + 两份签名漂移**（本仓库典型事故模式）。
+            #   ⇒ 后果：**支撑"切 H1"的关键证据当前不可复现** ——
+            #     `scheduler.py:2449` 引「21 组 thr×k 全网格：M5 21/21 为负、H1 21/21 为正」，
+            #     而 21 = 7×3（t×k，**不含 w**）恰是**跨周期路径**的特征签名
+            #     ⇒ 该结论本就出自这条路径，后被改崩 ⇒ 本次为**回归修复**（不动任何口径）。
+            #   修法：统一签名，跨周期**忽略** `w`；grid 构造处同步只出 21 组
+            #     （不把同一份 Hn 结果复制 6 份，否则 `both_edge_max` 会分成 6 个相同的假窗口）。
             r = TD.compute_direction_series(
                 dh, dl, dc, params=params,
                 cfg={"state.dir.slope_thr_atr": thr, "state.dir.debounce_bars": k})
@@ -383,18 +398,33 @@ def main() -> None:
             return summarize(conf, valid, shift)
 
     if args.sweep:
-        grid = [(t, k) for t in (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0) for k in (1, 3, 5)]
-        print(f"\n[sweep] 评估={args.tf} 方向来源={dir_tf} 前视 N={args.horizon}"
-              f"（位移单位 = {args.tf} 的 ATR）")
+        # 窗口维度：**仅同周期**可拉长回归窗口（跨周期时方向 bar 是 Hn，无评估周期窗口可言）。
+        # 【2026-09-21 修复】原实现**无条件**展开 6 个窗口 ⇒ 跨周期时
+        #   ① 与 `run_one` 的 2 参签名冲突（**必崩**，见该函数注释）；
+        #   ② 即便签名修好，也会把同一份 Hn 结果复制 6 份 ⇒
+        #      「各窗口最大双边边缘」按 w 分成 6 个**完全相同**的假窗口，误导读表。
+        # 故跨周期只跑 1 组窗口 ⇒ 共 7×3 = **21 组**，与 `scheduler.py:2449` 引用的
+        #   「21 组 thr×k 全网格」特征签名一致，使该结论**可复现**（本次修复的目的）。
+        _w_applicable = (dir_tf == args.tf)
+        # 同周期：20/30/40/50/60/80 根 ≈ 100/150/200/250/300/400 分钟
+        windows = ([20, 30, 40, 50, 60, 80] if _w_applicable
+                   else [int(params.get("slope_window", 20))])
+        grid = [(w, t, k) for w in windows
+                for t in (0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0) for k in (1, 3, 5)]
+        print(f"\n[sweep] 评估={args.tf} 方向来源={dir_tf} 窗口={windows}(根{args.tf}) "
+              f"前视 N={args.horizon}（位移单位 = {args.tf} 的 ATR）")
+        if not _w_applicable:
+            print(f"[sweep] ⚠ 跨周期（{dir_tf} ≠ {args.tf}）：`w`（拉长回归窗口）**不适用** "
+                  f"⇒ 仅 1 组窗口、共 {len(grid)} 组 thr×k（`w` 列恒定，勿按 w 分窗口读表）")
         rows = []
-        for t, k in grid:
-            r = run_one(t, k)
-            print_summary(r, f"thr={t} k={k}")
+        for w, t, k in grid:
+            r = run_one(t, k, w)
+            print_summary(r, f"w={w} thr={t} k={k}")
             if "error" in r:
                 continue
             up, dn, no = r["stats"].get("up"), r["stats"].get("down"), r["stats"].get("none")
             rows.append({
-                "thr": t, "k": k, "switch": r["switch_rate"],
+                "w": w, "thr": t, "k": k, "switch": r["switch_rate"],
                 "up_n": r["dist"]["up"], "dn_n": r["dist"]["down"],
                 "up_edge": up["up_rate_edge"] if up else np.nan,
                 "dn_edge": dn["up_rate_edge"] if dn else np.nan,
@@ -406,9 +436,16 @@ def main() -> None:
                 "none_abs": no["abs_mean_atr"] if no else np.nan,
             })
         df = pd.DataFrame(rows)
-        print("\n================ 汇总（按双侧合计边际排序）================")
+        print("\n================ 汇总（按双侧合计边际排序，正值=边缘转正）================")
         print(df.sort_values("both_edge", ascending=False)
               .to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+        # 按窗口聚合：每个窗口的最大 both_edge，看边缘何时转正
+        print("\n---- 各窗口最大双边边缘（按窗口排序）----")
+        agg = df.dropna(subset=["both_edge"]).groupby("w")["both_edge"].max()
+        for w in windows:
+            v = agg.get(w, np.nan)
+            print(f"  w={w:>2}({w*5:>3}min): both_edge_max={v:+.4f}"
+                  + ("  ← 转正" if (v == v and v > 0) else ""))
     else:
         r = run_one(args.thr, args.k)
         print_summary(r, f"评估={args.tf} 方向来源={dir_tf} thr={args.thr} k={args.k} N={args.horizon}")

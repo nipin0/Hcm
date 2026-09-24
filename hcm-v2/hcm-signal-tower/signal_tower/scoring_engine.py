@@ -1818,8 +1818,18 @@ class ScoringEngine:
             self._overheat_suppress_in_trend = await self._config.get_bool(
                 "scoring.overheat_suppress_in_trend", True)
             # ── Phase 1/2/3 灰度总开关（默认 False → 关闭，行为与旧完全一致）──
-            self._v2_enabled = await self._config.get_bool(
-                "co.v2_enabled", False) if self._config is not None else False
+            # 【2026-09-17 A5 熔断】co_source 已整体下线（`co_source.py` 无实现、
+            # `_detect_active_model` 只返 hexp/manual、`apply_v2` 调用已移除）⇒
+            # `co.v2_enabled=true` 只会**关闭** scoring_engine 的三道护栏
+            # （RSI 过热豁免 / 滞后折扣 / 动量同向硬阻断）且**无任何替代裁决**
+            # ⇒ 属"危险僵尸开关"。此处强制归 False 并 CRITICAL 告警，杜绝误开。
+            _v2_raw = (await self._config.get_bool("co.v2_enabled", False)
+                       if self._config is not None else False)
+            if _v2_raw:
+                logger.critical(
+                    "scoring_engine: co.v2_enabled=true 已被忽略（co_source 已下线，"
+                    "开启会关闭三道护栏且无替代裁决；A5 熔断生效）")
+            self._v2_enabled = False
             self._pretrend_threshold_offset = await self._config.get_float(
                 "scoring.pretrend_threshold_offset", -0.08
             )
