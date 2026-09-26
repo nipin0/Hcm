@@ -76,3 +76,7 @@ hcm-v2/tools/models/*.npz
 hcm-v2/tools/models/*_bak.json
 hcm-v2/tools/models/*_meta.json
 hcm-v2/tools/models/snapshots/
+
+# ===== 训练集导出（体积大，不进版本库；2026-09-26 用户确认）=====
+# state_M5.csv ≈ 45MB（FSM 分状态模型训练集，位于 hcm-v2/ 根，此前漏配忽略规则）。
+hcm-v2/state_M5.csv
