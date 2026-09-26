@@ -169,6 +169,23 @@ export const tsClock = (s?: string | null): string =>
   s ? String(s).slice(11, 16) : '—';
 
 // ── 类型（对齐 web/api/state.py 的响应结构）────────────────────────────────
+/** 【2026-09-25】趋势方向诊断量（塔 `hcm:live:state.dir`；单一真源 = trend_direction 模块）。
+ *  null/字段缺失 = 未发布（旧版塔，或本 bar 方向段异常）⇒ 面板如实标"无数据源"，
+ *  **不得**用 0 冒充（0 的语义是"斜率=0=无趋势"）。 */
+export interface TrendDir {
+  src_tf?: string;          // 实际使用的方向来源周期（如 H1）
+  valid?: boolean;          // false = "判不了"（数据不足/指标异常），≠ NONE
+  name?: string;            // 防抖**后**的确认方向 up/down/none
+  raw_name?: string;        // 防抖**前**的逐根原始方向（诊断用）
+  slope_atr?: number | null;      // ATR 归一斜率（窗内总位移 / ATR）
+  slope_thr_atr?: number | null;  // 阈值（state.dir.slope_thr_atr）
+  plus_di?: number | null;
+  minus_di?: number | null;
+  di_spread?: number | null;      // +DI − −DI
+  run_len?: number | null;        // 连续同向根数 = 方向防抖进度
+  debounce_bars?: number | null;  // 防抖所需根数（state.dir.debounce_bars）
+}
+
 export interface Derived {
   state: string | null;
   state_cn: string | null;
@@ -179,6 +196,8 @@ export interface Derived {
   freeze_rule_misaligned: boolean;
   trend_detail_published: boolean;
   trend_detail_reason: string;
+  /** 【2026-09-25】趋势方向诊断；null = 塔未发布 */
+  trend_dir?: TrendDir | null;
 }
 
 export interface CfgItem { key: string; value: number; default: number }
@@ -195,11 +214,21 @@ export interface LiveResp {
 }
 
 export interface KlineBar {
-  /* 【2026-09-17 D4】逐 bar 箱体（塔落 `market_state_log`；NULL=该 bar 不可算） */
+  /* 【2026-09-17 D4】逐 bar 箱体（塔落 `market_state_log`；NULL=该 bar 不可算）
+     —— 这是 **Magic 61（FSM S1 箱）**，含 `box_frozen`（= 本轮已开仓、箱体锁定）。 */
   box_upper?: number | string | null;
   box_lower?: number | string | null;
   box_mid?: number | string | null;
   box_frozen?: boolean | string | null;
+  /* 【2026-09-25】Magic 55（RANGE 均值回归）**fast 箱** 逐 bar 真值
+     —— 塔落 `hcm_signal.range_box_log`（迁移 0054）；NULL / `rng_fast_valid=false`
+        表示该 bar 箱体不可算（或塔尚未落库的早期 bar）⇒ 前端断线不补。
+     无 `frozen` 字段：55 的箱体**每 bar 重算**，不存在冻结/轮次概念。 */
+  rng_fast_upper?: number | string | null;
+  rng_fast_lower?: number | string | null;
+  rng_fast_mid?: number | string | null;
+  rng_fast_width_atr?: number | string | null;
+  rng_fast_valid?: boolean | string | null;
   open_time: string;
   open: number; high: number; low: number; close: number;
   tick_volume?: number;

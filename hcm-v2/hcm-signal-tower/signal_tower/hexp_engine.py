@@ -626,6 +626,12 @@ class HexpEngine:
         self._pending_pullback_mult: float = 1.0
         self._cfg_loaded_at: float = 0.0
         self._cfg_lock = asyncio.Lock()  # 并发去重：symbol_loop 与 live 发布器共用引擎
+        # 【2026-09-24 方案7】produce 全程串行锁：symbol_loop(bar-close) 与 live 发布器
+        # (每 3s) 两条路径并发调用 produce，共享 _sm/_ema_state/_dir_hyst_state 等可变
+        # 状态，异步交错推进会互相污染（迟滞/EMA 被 live 未收盘数据反复推进）。
+        # 持锁后各路径状态推进原子化；live 路径的快照/恢复（scheduler 侧）也因此
+        # 不会覆盖并发插入的 bar-close 推进。
+        self._produce_lock = asyncio.Lock()
         # ── 2026-08-26 抗抖动：EMA 平滑 + grade 迟滞状态（每 symbol 独立）──
         # _ema_state: 最近一次平滑后的 hp_100 / total，做指数移动平均消抖。
         self._ema_state: dict[str, dict] = {}
@@ -1188,7 +1194,61 @@ class HexpEngine:
         return False
 
     # ─────────────────────── 主流程 ───────────────────────
+    # 【2026-09-24 方案7】produce() 会推进的全部可变状态（迟滞机/EMA/翻转计数等）。
+    # 供 state_snapshot()/state_restore() 成对使用；新增可变状态字段时必须同步此处。
+    _STATE_ATTRS = (
+        "_sm", "_prev_period_state", "_reversal_until", "_reversal_src",
+        "_ema_state", "_grade_hyst", "_dir_hyst_state", "_dir_hyst_hold_cnt",
+        "_ai_flip_cnt", "_frontrun_until", "_frontrun_dir",
+        "_pending_pullback_mult",
+    )
+
+    def state_snapshot(self) -> dict:
+        """深拷贝 produce 推进的全部可变状态（live 纯算路径用，见 scheduler）。"""
+        import copy as _copy
+        return {a: _copy.deepcopy(getattr(self, a, None)) for a in self._STATE_ATTRS}
+
+    def state_restore(self, snap: dict) -> None:
+        """恢复 state_snapshot() 的副本（深拷贝回写，避免恢复后引擎侧改动反向污染快照）。"""
+        import copy as _copy
+        for _a, _v in snap.items():
+            setattr(self, _a, _copy.deepcopy(_v))
+
     async def produce(
+        self,
+        symbol: str,
+        m5_indicators: Any,
+        regime_result: Any,
+        *,
+        live: bool = False,
+        zone_level: float = 0.0,
+        zone_type: str = "",
+        zone_strength: int = 0,
+        ai_direction: Optional[str] = None,
+        ai_dir_prob: Optional[float] = None,
+    ) -> ScoreResult:
+        """produce 串行化包装：全程持 _produce_lock 再委托 _produce_impl。
+
+        live=True 探针路径在锁内做 快照→produce→恢复：3s 轮询用未收盘数据推进
+        迟滞/EMA/翻转状态机会污染 bar-close 决策，故对状态零副作用；且快照/恢复
+        与 bar-close produce 同处锁内 ⇒ 不会抹掉并发的 bar-close 推进。
+        """
+        async with self._produce_lock:
+            if live:
+                _snap = self.state_snapshot()
+                try:
+                    return await self._produce_impl(
+                        symbol, m5_indicators, regime_result, live=live,
+                        zone_level=zone_level, zone_type=zone_type, zone_strength=zone_strength,
+                        ai_direction=ai_direction, ai_dir_prob=ai_dir_prob)
+                finally:
+                    self.state_restore(_snap)
+            return await self._produce_impl(
+                symbol, m5_indicators, regime_result, live=live,
+                zone_level=zone_level, zone_type=zone_type, zone_strength=zone_strength,
+                ai_direction=ai_direction, ai_dir_prob=ai_dir_prob)
+
+    async def _produce_impl(
         self,
         symbol: str,
         m5_indicators: Any,

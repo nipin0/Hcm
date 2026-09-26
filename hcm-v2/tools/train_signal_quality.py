@@ -28,6 +28,8 @@ import pandas as pd
 # 杜绝 v3 式"训练混入 state_* 哑变量、漏 DeepSeek/extreme 列"的列错位回归。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _model_feature_cols import MODEL_FEATURE_COLS  # noqa: E402
+# 【校准修复 2026-09-25】退化判定与生产同口径（_calib_common 单一真源）+ Platt 兜底拟合
+from _calib_common import calib_is_degenerate, fit_platt  # noqa: E402
 
 try:
     import lightgbm as lgb
@@ -441,6 +443,19 @@ def main():
             _dir_lv.append(f"{_c}:{len(set(np.round(np.asarray(_ir.y_thresholds_), 4)))}")
         print(f"[dir-calib] 拟合 n={len(_fit_y)} 档位={','.join(_dir_lv)}"
               f"（阈值 {CALIB_MIN_LEVELS}）", file=sys.stderr)
+        # 【校准修复 2026-09-25】丢弃部署口径退化的类校准器：sidecar 对缺类
+        # 安全回退 raw（quality_scorer.py 缺类分支），杜绝常数校准器污染 argmax。
+        _kept_calibs = {}
+        _dropped = []
+        for _c, _cal in _dir_calibs.items():
+            if calib_is_degenerate(_cal, CALIB_MIN_LEVELS):
+                _dropped.append(_c)
+            else:
+                _kept_calibs[_c] = _cal
+        if _dropped:
+            print(f"[dir-calib] 丢弃退化类校准 {[int(c) for c in _dropped]}"
+                  f"（线上对缺类回退 raw）", file=sys.stderr)
+        _dir_calibs = _kept_calibs
         # 【阶段 2·版本跟随】与质量头同版本号、同目录（sidecar 按同目录版本发现加载）。
         dir_model.booster_.save_model(os.path.join(_heads_dir, f"lgbm_direction_v{_ver}.txt"))
         with open(os.path.join(_heads_dir, f"calib_dir_np_v{_ver}.pkl"), "wb") as f:
@@ -495,6 +510,21 @@ def main():
         _e_ir = IsotonicRegression(out_of_bounds="clip")
         _e_ir.fit(_e_fit_p, _e_fit_y)
         entry_calib = NumpyCalibrator(_e_ir.X_thresholds_, _e_ir.y_thresholds_)
+        # 【校准修复 2026-09-25】isotonic 退化（部署口径）→ Platt 兜底：参数化 sigmoid
+        # 输出连续、无档位限制，小样本下比粗阶梯 isotonic 更稳（与评审链默认一致）。
+        if calib_is_degenerate(entry_calib, CALIB_MIN_LEVELS):
+            try:
+                _e_platt = fit_platt(np.asarray(_e_fit_p, float),
+                                     np.asarray(_e_fit_y, int))
+                if not calib_is_degenerate(_e_platt, CALIB_MIN_LEVELS):
+                    entry_calib = _e_platt
+                    print("[entry-calib] isotonic 退化 → Platt 兜底 OK", file=sys.stderr)
+                else:
+                    print("[entry-calib] Platt 亦退化，保留 isotonic（维持退化标记）",
+                          file=sys.stderr)
+            except Exception as _epe:  # noqa: BLE001
+                print(f"[entry-calib] Platt 兜底失败（保留 isotonic）: {_epe}",
+                      file=sys.stderr)
         print(f"[entry-calib] 拟合 n={len(_e_fit_y)} 档位="
               f"{len(set(np.round(np.asarray(_e_ir.y_thresholds_), 4)))}"
               f"（阈值 {CALIB_MIN_LEVELS}）", file=sys.stderr)
@@ -614,6 +644,7 @@ def main():
         _fold = 0
         # 【2026-09-10 治本】跨折汇总 out-of-fold 预测，供最后一次性拟合校准器
         _oof_p, _oof_y = [], []
+        _all_p, _all_y = None, None  # 【校准修复 2026-09-25】OOF 汇总数据（Platt 兜底拟合基）
         for _tr, _te in _tss.split(X_state):
             _fold += 1
             _pos_ratio = float((y[_tr] == 0).sum()) / max(1, float((y[_tr] == 1).sum()))
@@ -667,6 +698,31 @@ def main():
         if _aucs_v:
             print(f"[tss-summary] AUC mean={np.mean(_aucs_v):.3f} ±{np.std(_aucs_v):.3f} "
                   f"| top40%胜率 mean={np.mean(_wrs_v):.3f} ±{np.std(_wrs_v):.3f}")
+        # ── 【F3(c) 2026-09-24 稳健判决口径】跨折 pooled OOF AUC ───────────────
+        # 根因：判决值原取 `[final-model]` = **最近 2 折 AUC 均值**，而单折测试窗仅
+        #   n_te≈335，且 early_stopping 直接在该窗上选 best_iteration ⇒ 单点噪声决定
+        #   模型命运（本版本实测：5 折均值 0.531 而末 2 折 0.461，差 0.070；上一轮
+        #   align 开启时 0.4699）。fail_streak 因此反复累积到熔断，重训闭环被
+        #   **噪声性拒收**堵死。
+        # 修法：把各折 **out-of-fold 预测拼接**后算一个 pooled AUC（n_oof ≈ 5/6·N，
+        #   约 5 倍样本）⇒ 方差显著下降，且仍严格样本外（每折预测均未见过该折数据）。
+        # 口径权衡（必须知情）：pooled 混合了 5 个不同折的模型，与最终落盘的"最后一折
+        #   模型"不完全同一物 ⇒ 比 `final-model` 略宽松。该取舍是**有意**的：宁可少一次
+        #   噪声误杀，也不要把有区分力的模型因单折波动拒之门外。
+        # 消费方：auto_retrain.parse_auc 优先采用本行（auc_src=tss_oof_pooled）。
+        try:
+            if _oof_p and _oof_y:
+                _pool_p = np.concatenate(_oof_p)
+                _pool_y = np.concatenate(_oof_y)
+                if len(_pool_p) >= 100 and len(set(_pool_y.tolist())) > 1:
+                    _pool_auc = float(roc_auc_score(_pool_y, _pool_p))
+                    _fold_mean = float(np.mean(_aucs_v)) if _aucs_v else float("nan")
+                    _fold_std = float(np.std(_aucs_v)) if _aucs_v else float("nan")
+                    print(f"[tss-oof] AUC={_pool_auc:.4f} n_oof={len(_pool_p)} "
+                          f"folds={len(_oof_p)} fold_mean={_fold_mean:.4f} "
+                          f"fold_std={_fold_std:.4f}")
+        except Exception as _oe:  # noqa: BLE001
+            print(f"[tss-oof] 计算失败: {_oe}", file=sys.stderr)
     except Exception as _e:
         print(f"[tss] CV 评估跳过: {_e}", file=sys.stderr)
 
@@ -679,6 +735,27 @@ def main():
     else:
         _save_model = model.booster_
         _save_calib = iso
+    # 【校准修复 2026-09-25】质量头校准器退化（部署口径）→ Platt 兜底。
+    # 背景：v109 的 OOF isotonic 8 阈值，按 probe 口径仅 7 档 → quality_calib_degenerate
+    # 误判拒收整轮；阶梯 isotonic 分辨率受样本量硬约束（档位随样本缩水）。Platt
+    # （2 参数 sigmoid）输出连续、无档位限制、小样本更稳，与评审链默认
+    # （train_review_model REVIEW_CALIB_METHOD=platt）一致。
+    if _save_calib is not None and calib_is_degenerate(_save_calib, CALIB_MIN_LEVELS):
+        if _all_p is not None and len(set(np.asarray(_all_y).tolist())) > 1:
+            try:
+                _q_platt = fit_platt(np.asarray(_all_p, float), np.asarray(_all_y, int))
+                if not calib_is_degenerate(_q_platt, CALIB_MIN_LEVELS):
+                    _save_calib = _q_platt
+                    print("[calib-fix] 质量头 isotonic 退化(部署口径) → Platt 兜底 OK",
+                          file=sys.stderr)
+                else:
+                    print("[calib-fix] 质量头 Platt 亦退化，保留 isotonic（维持退化标记）",
+                          file=sys.stderr)
+            except Exception as _qpe:  # noqa: BLE001
+                print(f"[calib-fix] 质量头 Platt 兜底失败（保留 isotonic）: {_qpe}",
+                      file=sys.stderr)
+        else:
+            print("[calib-fix] 质量头退化但无 OOF 拟合基，保留 isotonic", file=sys.stderr)
 
     # ── 【D3 2026-09-17 治本·判决指标必须与落盘产物一致】─────────────────────
     # 缺陷：auto_retrain.parse_auc 原**优先取 `[tss-summary] AUC mean`（5 折均值）**，
@@ -743,16 +820,19 @@ def main():
                 np.asarray(_save_calib.predict(_probe)).ravel(), 6)))
         except Exception:
             _lv = None
+    # 【校准修复 2026-09-25】退化判定改用与生产**同口径**的 calib_is_degenerate
+    # （_calib_common 单一真源）；probe 档位数仅作展示。auto_retrain 的
+    # parse_calib_degenerate 读 DEGENERATE/OK 标记 —— 训练/部署口径不再漂移。
     if _save_calib is None:
         print("[calib-final] DEGENERATE: 落盘校准器为 None（上线将用原始概率）",
               file=sys.stderr)
-    elif _lv is not None and _lv < CALIB_MIN_LEVELS:
-        print(f"[calib-final] DEGENERATE: 落盘校准器仅 {_lv} 档 < {CALIB_MIN_LEVELS}"
-              f"（阶跃失真：会把正常概率压到 0.05 地板，致 ai_score 恒为下限）",
+    elif calib_is_degenerate(_save_calib, CALIB_MIN_LEVELS):
+        print(f"[calib-final] DEGENERATE: 落盘校准器={type(_save_calib).__name__} "
+              f"按部署口径判定退化（probe 档位数={_lv}，阈值 {CALIB_MIN_LEVELS}）",
               file=sys.stderr)
     else:
-        print(f"[calib-final] OK: 落盘校准器={type(_save_calib).__name__} 档位={_lv}",
-              file=sys.stderr)
+        print(f"[calib-final] OK: 落盘校准器={type(_save_calib).__name__} "
+              f"probe档位数={_lv}", file=sys.stderr)
     # 【路径修复 2026-09-01】args.model/args.calib 可能自带目录（auto_retrain 传
     # models/lgbm_quality_vN.txt + _artifacts/calib_vN.pkl），原 join(outdir, model)
     # 会重复拼成 _artifacts/models/... 导致质量头保存失败、质量头长期停留在旧版本。

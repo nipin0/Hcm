@@ -10,6 +10,10 @@ interface Props {
   live: LiveResp | null;
   orders: any[];
   positions: any[];
+  /** 【2026-09-25 需求】箱体来源 —— 两张图**共用本组件**（不复制实现）：
+   *   'm61'（默认）= FSM S1 箱 → `market_state_log.box_*`（有冻结/轮次概念）
+   *   'm55'         = RANGE 均值回归 **fast 箱** → `range_box_log.rng_fast_*`（每 bar 重算、无冻结） */
+  boxKind?: 'm61' | 'm55';
 }
 
 /** 按时间就近匹配 bar 下标（后端无 signal_id 关联，只能近似 —— 已在 UI 标注） */
@@ -26,8 +30,18 @@ const nearestIdx = (bars: KlineBar[], iso?: string | null): number => {
   return best;
 };
 
-export default function KlineChart({ bars, cursor, live, orders, positions }: Props) {
+export default function KlineChart({ bars, cursor, live, orders, positions,
+                                     boxKind = 'm61' }: Props) {
   const view = useMemo(() => bars.slice(0, cursor + 1), [bars, cursor]);
+  /* 【2026-09-25】字段适配：两套箱体口径**只在字段名上不同**，展示逻辑完全共用。
+   *   m61 → box_upper / box_mid / box_lower（+ box_frozen = "本轮已开仓、箱体锁定"）
+   *   m55 → rng_fast_upper / rng_fast_mid / rng_fast_lower（**无冻结概念** ⇒ 全部按滚动箱画）
+   * ⚠ 严禁在此重算箱体：口径真源在塔（`state_strategy.compute_entry_box` /
+   *   `range_box.compute_box`），前端只负责画。 */
+  const BF = boxKind === 'm55'
+    ? { up: 'rng_fast_upper', mid: 'rng_fast_mid', lo: 'rng_fast_lower' }
+    : { up: 'box_upper', mid: 'box_mid', lo: 'box_lower' };
+  const HAS_FROZEN = boxKind !== 'm55';
 
   /* ── 轮次（rounds）【2026-09-17 D6】────────────────────────────────────────
    * 定义：**连续 `box_frozen=true` 的 bar 段 = 一轮**（进场后箱体被锁定，直到本轮结束）。
@@ -42,7 +56,7 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
     const out: { from: number; to: number; color: string; label: string }[] = [];
     for (let i = 0; i < view.length; i++) {
       const b: any = view[i];
-      const froz = b.box_frozen === true || b.box_frozen === 'true';
+      const froz = HAS_FROZEN && (b.box_frozen === true || b.box_frozen === 'true');
       if (!froz) continue;
       const last = out[out.length - 1];
       if (!last || last.to !== i - 1) {
@@ -53,7 +67,7 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
     }
     out.forEach((r, k) => { r.label = `R${k + 1}`; });
     return out;
-  }, [view]);
+  }, [view, HAS_FROZEN]);
 
   const option = useMemo(() => {
     const times = view.map((b) => tsShort(b.open_time).slice(6));
@@ -100,13 +114,14 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
       const v = Number(b ? b[k] : NaN);
       return Number.isFinite(v) && v > 0;
     };
-    const isFroz = (b: any) => b?.box_frozen === true || b?.box_frozen === 'true';
-    const nBox = view.reduce((n, b: any) => n + (okOf('box_upper', b) ? 1 : 0), 0);
+    const isFroz = (b: any) =>
+      HAS_FROZEN && (b?.box_frozen === true || b?.box_frozen === 'true');
+    const nBox = view.reduce((n, b: any) => n + (okOf(BF.up, b) ? 1 : 0), 0);
 
     const BOX_LEVELS = [
-      { tag: '箱顶', short: '顶', key: 'box_upper' },
-      { tag: '中轨', short: '中', key: 'box_mid' },
-      { tag: '箱底', short: '底', key: 'box_lower' },
+      { tag: '箱顶', short: '顶', key: BF.up },
+      { tag: '中轨', short: '中', key: BF.mid },
+      { tag: '箱底', short: '底', key: BF.lo },
     ] as const;
     const boxBands: any[] = [];
     const boxSeries: any[] = [];
@@ -115,8 +130,8 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
      *  填充从图底拉起并把 y 轴拉爆（D5 已按此口径验证）。 */
     const pushBand = (mask: boolean[], key: string, color: string, opacity: number) => {
       const seg = view.map((b: any, i: number) =>
-        (mask[i] && okOf('box_lower', b) && okOf('box_upper', b))
-          ? [Number(b.box_lower), Number(b.box_upper) - Number(b.box_lower)]
+        (mask[i] && okOf(BF.lo, b) && okOf(BF.up, b))
+          ? [Number(b[BF.lo]), Number(b[BF.up]) - Number(b[BF.lo])]
           : null);
       const sid = `boxband_${key}`;
       boxBands.push({
@@ -166,12 +181,88 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
           label: { show: false },
           lineStyle: {
             color: lineColor,
-            type: frozenSeg ? 'dashed' : (lv.key === 'box_mid' ? 'dotted' : 'solid'),
-            width: lv.key === 'box_mid' ? 1.0 : (frozenSeg ? 1.4 : 1.3),
+            type: frozenSeg ? 'dashed' : (lv.key === BF.mid ? 'dotted' : 'solid'),
+            width: lv.key === BF.mid ? 1.0 : (frozenSeg ? 1.4 : 1.3),
           },
         });
       });
     });
+    // ── 【2026-09-25 可读性①】"是否出箱体"必须一眼可见 ────────────────────────
+    // 对**每个有箱体值的 bar**，若其收盘价越出该 bar 自己的箱体上/下沿 ⇒ 在 K 线上打三角标记。
+    // 上破 = 红▲（朝上）、下破 = 红▼（朝下）；都是**事实**（该 bar 收盘 vs 该 bar 箱体），非预测。
+    const oobUp: any[] = [];
+    const oobDown: any[] = [];
+    view.forEach((b: any, i: number) => {
+      const up = Number(b?.[BF.up]); const lo = Number(b?.[BF.lo]); const c = Number(b?.close);
+      if (!Number.isFinite(up) || !Number.isFinite(lo) || !(up > lo) || !Number.isFinite(c)) return;
+      if (c > up) oobUp.push([i, c]);
+      else if (c < lo) oobDown.push([i, c]);
+    });
+    const outOfBoxSeries: any[] = [];
+    if (oobUp.length) {
+      outOfBoxSeries.push({
+        type: 'scatter', name: `出箱·上破(${oobUp.length})`, data: oobUp, z: 3,
+        symbol: 'triangle', symbolSize: 8, itemStyle: { color: C.block },
+      });
+    }
+    if (oobDown.length) {
+      outOfBoxSeries.push({
+        type: 'scatter', name: `出箱·下破(${oobDown.length})`, data: oobDown, z: 3,
+        symbol: 'triangle', symbolRotate: 180, symbolSize: 8, itemStyle: { color: C.block },
+      });
+    }
+
+    // ── 【2026-09-25 可读性②】稀疏数据兜底（55 表刚上线、逐 bar 累积中）──────
+    // 症状：只有几个孤立点 + `showSymbol:false` ⇒ **图上完全看不到三线**（实测 3 根）。
+    // 处理：把**最后一个有值 bar** 的箱体画成「虚线水平线 + 淡填充带」覆盖最右若干根，
+    //   并在右端标出 `顶/中/底 数值`，让"箱体在哪 / 是否已出箱"立即可见。
+    // ⚠ 诚实性：线型=虚线、文案明确"仅最近一根落库 / 延展为参考"，**绝不冒充实测历史**。
+    let lastBoxIdx = -1;
+    for (let i = view.length - 1; i >= 0; i--) {
+      if (okOf(BF.up, view[i]) && okOf(BF.lo, view[i])) { lastBoxIdx = i; break; }
+    }
+    const sparse = nBox > 0 && nBox < 20 && lastBoxIdx >= 0;
+    const curBoxMarkLines: any[] = [];
+    if (sparse) {
+      const lb: any = view[lastBoxIdx];
+      const xFrom = Math.max(0, view.length - 12);
+      const xTo = view.length - 1;
+      const _lo = Number(lb?.[BF.lo]); const _up = Number(lb?.[BF.up]);
+      const _mid = Number(lb?.[BF.mid]);
+      // 淡填充带：覆盖最右 12 根（仅视觉参考，边界由下方虚线给出真值）
+      if (_up > _lo && xFrom <= xTo) {
+        const mask = view.map((_: any, i: number) => i >= xFrom);
+        const bandLo = view.map((_: any, i: number) => (i >= xFrom ? _lo : null));
+        const bandHi = view.map((_: any, i: number) => (i >= xFrom ? _up - _lo : null));
+        void mask;
+        boxBands.push({
+          type: 'line', name: '箱带·当前(延展参考)', stack: 'curbox',
+          silent: true, showSymbol: false, connectNulls: true, z: 0,
+          data: bandLo, lineStyle: { opacity: 0 }, areaStyle: { opacity: 0 },
+        });
+        boxBands.push({
+          type: 'line', name: '箱带·当前·填充', stack: 'curbox',
+          silent: true, showSymbol: false, connectNulls: true, z: 0,
+          data: bandHi, lineStyle: { opacity: 0 },
+          areaStyle: { color: BOX_COLOR, opacity: 0.10 },
+        });
+      }
+      ([['顶', _up], ['中', _mid], ['底', _lo]] as const).forEach(([tag, v]) => {
+        if (!Number.isFinite(v) || v <= 0) return;
+        curBoxMarkLines.push([
+          {
+            coord: [xFrom, v],
+            label: {
+              show: true, position: 'end' as const,
+              formatter: `${tag} ${v.toFixed(1)}`,
+              color: BOX_COLOR, fontSize: 9, fontWeight: 'bold' as const,
+            },
+          },
+          { coord: [xTo, v] },
+        ]);
+      });
+    }
+
     // 轮次分隔线：在本轮**开仓/锁定那一刻**画竖虚线 + `R1/R2…` 标签
     const roundMarkLines = rounds.map((r) => ({
       xAxis: r.from,
@@ -184,12 +275,17 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
 
     // ④ 现价箱内位置：DOM 位置条用（在组件体内计算，见下方 `stripInfo`）
     const boxNote = nBox === 0
-      ? '箱体：该区间无逐 bar 箱体数据（塔自 2026-09-17 起逐 bar 落库）'
-      : `箱体（逐 bar 真实值 · ${nBox}/${view.length} 根）`
-        + `｜填充=箱体区间${rounds.length
-          ? `（冻结段=本轮已开仓，按轮换底色 · 本视窗 ${rounds.length} 轮）`
-          : '（本视窗无冻结轮）'}`
-        + '｜实线=滚动箱｜灰虚线=冻结箱｜点线=中轨';
+      ? (HAS_FROZEN
+        ? '箱体：该区间无逐 bar 箱体数据（塔自 2026-09-17 起逐 bar 落库）'
+        : '箱体：该区间无逐 bar 箱体数据（塔自 2026-09-25 起逐 bar 落库 range_box_log）')
+      : (HAS_FROZEN
+        ? `箱体(Magic 61·FSM S1)（逐 bar 真实值 · ${nBox}/${view.length} 根）`
+          + `｜填充=箱体区间${rounds.length
+            ? `（冻结段=本轮已开仓，按轮换底色 · 本视窗 ${rounds.length} 轮）`
+            : '（本视窗无冻结轮）'}`
+          + '｜实线=滚动箱｜灰虚线=冻结箱｜点线=中轨'
+        : `箱体(Magic 55·RANGE 快箱)（逐 bar 真实值 · ${nBox}/${view.length} 根）`
+          + '｜填充=箱体区间｜实线=箱体线（每 bar 重算，无冻结/轮次）｜点线=中轨');
 
     /* 开平仓标记：按时间就近吸附到 bar（后端无 signal_id，属近似） */
     const marks: any[] = [];
@@ -232,7 +328,8 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
       backgroundColor: 'transparent',
       // 【2026-09-17 修复 D2】把箱体口径直接写在图上，消除"当前值被读成历史箱体"的误判
       title: {
-        text: boxNote, left: 60, top: 0,
+        text: boxNote + (sparse ? '｜虚线=当前箱体(参考)' : ''),
+        left: 60, top: 0,
         textStyle: { color: C.weak, fontSize: 10, fontWeight: 'normal' },
       },
       // 【2026-09-17 D6】右侧留白 1cm（@96dpi：1cm ≈ 37.8px ⇒ 62 → 100）。
@@ -280,15 +377,17 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
             + row('transitioned', String(b.transitioned ?? '—'))
             + row('note', b.note || '—')
             // 【2026-09-17 D4】显示**本 bar 自己的**箱体（逐 bar 真值），不再贴"当前值"。
-            + row('箱体 上/中/下（本 bar）', Number.isFinite(Number((b as any).box_upper))
-                ? `${fmt((b as any).box_upper)} / ${fmt((b as any).box_mid)} / ${fmt((b as any).box_lower)}`
-                  + `${(b as any).box_frozen === true ? '　〔冻结箱·本轮锁定〕' : '　〔滚动箱〕'}`
+            + row('箱体 上/中/下（本 bar）', Number.isFinite(Number((b as any)[BF.up]))
+                ? `${fmt((b as any)[BF.up])} / ${fmt((b as any)[BF.mid])} / ${fmt((b as any)[BF.lo])}`
+                  + (HAS_FROZEN
+                    ? `${(b as any).box_frozen === true ? '　〔冻结箱·本轮锁定〕' : '　〔滚动箱〕'}`
+                    : '　〔每 bar 重算·无冻结〕')
                 : `<i style="color:${C.block}">本 bar 无箱体数据</i>`)
             // 【2026-09-17 D5】本 bar 收盘价在**本 bar 自己的箱体**里的位置（直观回答"在箱底还是箱顶"）
             + row('箱内位置（本 bar 收盘）', (() => {
-                const up = Number((b as any).box_upper);
-                const lo = Number((b as any).box_lower);
-                const mi = Number((b as any).box_mid);
+                const up = Number((b as any)[BF.up]);
+                const lo = Number((b as any)[BF.lo]);
+                const mi = Number((b as any)[BF.mid]);
                 const c = Number(b.close);
                 if (!(up > lo) || !Number.isFinite(c)) {
                   return `<i style="color:${C.weak}">本 bar 无箱体数据</i>`;
@@ -300,6 +399,7 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
               })())
             // 【2026-09-17 D6】轮次：本 bar 是否落在某轮冻结段（= 本轮已开仓、箱体锁定）
             + row('轮次', (() => {
+                if (!HAS_FROZEN) return `<i style="color:${C.weak}">—（55 无轮次概念：每 bar 重算）</i>`;
                 const k = rounds.findIndex((r) => view.indexOf(b) >= r.from && view.indexOf(b) <= r.to);
                 if (k < 0) return `<i style="color:${C.weak}">未开仓（滚动箱，每 bar 重算）</i>`;
                 const r = rounds[k];
@@ -333,11 +433,15 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
           markArea: { silent: true, data: areas },
           markPoint: { data: marks, silent: true },
           // 【2026-09-17 D6】轮次分隔：在本轮"开仓/锁箱"那一刻画竖虚线 + R1/R2… 标签
-          markLine: { silent: true, symbol: 'none', data: roundMarkLines },
+          // 【2026-09-25】追加"当前箱体"水平虚线（仅稀疏数据时；见 curBoxMarkLines）
+          markLine: { silent: true, symbol: 'none',
+                      data: [...roundMarkLines, ...curBoxMarkLines] },
         },
         // 【2026-09-17 D5】箱体画法：填充带（z=0，最底层，不遮蜡烛）→ 三条线（z=1）
         ...boxBands,
         ...boxSeries,
+        // 【2026-09-25】出箱标记（红▲上破 / 红▼下破）——"是否出箱体"一眼可见
+        ...outOfBoxSeries,
       ],
     };
   }, [view, live, orders, positions]);
@@ -349,13 +453,13 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
     let info: { t: string; froz: boolean; up: number; mid: number; lo: number } | null = null;
     for (let i = view.length - 1; i >= 0; i--) {
       const b: any = view[i];
-      const up = Number(b ? b.box_upper : NaN);
-      const lo = Number(b ? b.box_lower : NaN);
+      const up = Number(b ? (b as any)[BF.up] : NaN);
+      const lo = Number(b ? (b as any)[BF.lo] : NaN);
       if (Number.isFinite(up) && up > 0 && Number.isFinite(lo) && lo > 0) {
         info = {
           t: b.open_time,
-          froz: b.box_frozen === true || b.box_frozen === 'true',
-          up, mid: Number(b.box_mid), lo,
+          froz: HAS_FROZEN && (b.box_frozen === true || b.box_frozen === 'true'),
+          up, mid: Number((b as any)[BF.mid]), lo,
         };
         break;
       }
@@ -363,19 +467,25 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
     const close = Number(view[view.length - 1] ? view[view.length - 1].close : NaN);
     let text = '无箱体数据';
     let color: string = C.weak;
+    // 【2026-09-25】"是否出箱体"的**结论词**（需求原话要求一眼可见）：
+    //   已出箱 = 现价越出上/下沿；贴边 = 落在箱内最外 15%；箱内 = 其余。
+    let stateLabel = '无数据';
     if (info && Number.isFinite(close) && info.up > info.lo) {
       if (close > info.up) {
         text = `已破箱顶 +${(close - info.up).toFixed(2)} 点`; color = C.block;
+        stateLabel = '已出箱 ↑';
       } else if (close < info.lo) {
         text = `已破箱底 ${(close - info.lo).toFixed(2)} 点`; color = C.block;
+        stateLabel = '已出箱 ↓';
       } else {
         const pct = ((close - info.lo) / (info.up - info.lo)) * 100;
         const d = close - info.mid;
         text = `箱内 ${pct.toFixed(0)}%（中轨${d >= 0 ? '上方 +' : '下方 '}${d.toFixed(2)} 点）`;
         color = (pct >= 85 || pct <= 15) ? C.warn : C.ok;
+        stateLabel = (pct >= 85 || pct <= 15) ? '贴边（箱内）' : '箱内';
       }
     }
-    return { info, close, text, color };
+    return { info, close, text, color, stateLabel };
   }, [view]);
 
   const stripItem = (k: string, v: React.ReactNode, color?: string, bold?: boolean) => (
@@ -390,8 +500,12 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
         display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center',
         fontSize: 11, padding: '2px 2px 5px', fontVariantNumeric: 'tabular-nums',
       }}>
-        {stripItem('箱体', strip.info
-          ? `${strip.info.froz ? '冻结箱·本轮锁定' : '滚动箱'} · ${tsShort(strip.info.t).slice(6)} bar`
+        {/* 【2026-09-25】"是否出箱体"提到最前、加粗带色 */}
+        {stripItem('', <b style={{ color: strip.color, fontSize: 12 }}>{strip.stateLabel}</b>)}
+        {stripItem(HAS_FROZEN ? '箱体 61' : '箱体 55', strip.info
+          ? `${HAS_FROZEN
+            ? (strip.info.froz ? '冻结箱·本轮锁定' : '滚动箱')
+            : '快箱·每 bar 重算'} · ${tsShort(strip.info.t).slice(6)} bar`
           : '无数据', C.sub)}
         {stripItem('顶', strip.info ? fmt(strip.info.up) : '—', BOX_COLOR, true)}
         {stripItem('中', strip.info ? fmt(strip.info.mid) : '—', BOX_COLOR)}
@@ -399,7 +513,8 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
         {stripItem(`现价 ${Number.isFinite(strip.close) ? fmt(strip.close) : '—'} ·`,
           strip.text, strip.color, true)}
         {/* 【2026-09-17 D6】当前轮：末根附近若处冻结段 ⇒ 就是"正在进行的这一轮" */}
-        {rounds.length > 0 ? (() => {
+        {!HAS_FROZEN ? stripItem('轮次', '—（55 每 bar 重算，无轮次概念）', C.weak)
+          : rounds.length > 0 ? (() => {
           const k = (() => {
             for (let i = rounds.length - 1; i >= 0; i--) {
               if (rounds[i].to >= view.length - 3) return i;
@@ -412,10 +527,13 @@ export default function KlineChart({ bars, cursor, live, orders, positions }: Pr
             + `（本视窗共 ${rounds.length} 轮，按轮换底色）`, r.color, true);
         })() : stripItem('轮次', '本视窗无冻结轮（尚未开仓）', C.weak)}
         <span style={{ color: C.weak }}>
-          填充=箱体区间（冻结段按轮换色）｜实线=滚动箱｜灰虚线=冻结箱｜点线=中轨
+          {HAS_FROZEN
+            ? '填充=箱体区间（冻结段按轮换色）｜实线=滚动箱｜灰虚线=冻结箱｜点线=中轨'
+            : '填充=箱体区间｜实线=箱体线（每 bar 重算）｜点线=中轨｜无冻结/轮次'}
         </span>
       </div>
-      <ReactEChartsCore echarts={echarts} option={option} style={{ height: 320 }}
+      {/* 【2026-09-25】并排后每图变窄 ⇒ 高度 320→360，避免图表过扁、"难看" */}
+      <ReactEChartsCore echarts={echarts} option={option} style={{ height: 360 }}
                         notMerge lazyUpdate />
     </div>
   );

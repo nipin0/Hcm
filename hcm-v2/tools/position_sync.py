@@ -88,12 +88,10 @@ async def sync_positions(mt5, pool, redis_conn, account_id_mode: Optional[int] =
                 current_price = tick.bid
                 # float_profit: (bid - open_price) * lot * 100
                 float_profit = round((tick.bid - pos.price_open) * pos.volume * 100, 2)
-                direction = "BUY"
             elif pos.type == 1:  # SELL
                 current_price = tick.ask
                 # float_profit: (open_price - ask) * lot * 100
                 float_profit = round((pos.price_open - tick.ask) * pos.volume * 100, 2)
-                direction = "SELL"
             else:
                 log.warning(f"Pos sync #{ticket}: unknown pos.type={pos.type}")
                 continue
@@ -165,7 +163,7 @@ async def sync_positions(mt5, pool, redis_conn, account_id_mode: Optional[int] =
             # Redis 写入（独立 try/except）
             try:
                 _redis_update_position(
-                    redis_conn, pos, current_price, float_profit, trail_tier, trail_state
+                    redis_conn, pos, current_price, float_profit, trail_tier
                 )
             except Exception as e:
                 log.error(f"Redis sync failed for #{ticket}: {e}")
@@ -1303,7 +1301,7 @@ async def _close_stale_positions(pool, account_id: int, live_tickets: set[int], 
 # ═══════════════════════════════════════════════════════════════
 
 
-def _redis_update_position(redis_conn, pos, current_price, float_profit, trail_tier, trail_state) -> None:
+def _redis_update_position(redis_conn, pos, current_price, float_profit, trail_tier) -> None:
     """写入持仓状态到 Redis Hash，TTL=3600s。
 
     Key:   hcm:position:{mt5_ticket}
@@ -1318,15 +1316,9 @@ def _redis_update_position(redis_conn, pos, current_price, float_profit, trail_t
         current_price: 当前价格。
         float_profit: 浮动盈亏。
         trail_tier: 分级追踪字符串 ("none"|"tier1"|"tier2"|"tier3")。
-        trail_state: trail_state dict（用于提取 last_sl_move_time）。
     """
     key = f"hcm:position:{pos.ticket}"
     direction = "BUY" if pos.type == 0 else "SELL"
-
-    # 提取 last_sl_move_time
-    last_move_time = ""
-    if trail_state:
-        last_move_time = trail_state.get("last_sl_move_time", "")
 
     mapping = {
         "symbol": pos.symbol,

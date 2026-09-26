@@ -48,7 +48,7 @@ import MetaTrader5 as _mt5_global  # top-level import for reliable order_send
 # Re-imported in T04 when actually called from main()
 from position_sync import sync_positions, _record_after_close_cooldown  # noqa: F401
 # MT5 pos.time 是经纪商服务器时间（实测比 UTC 快 3h），经统一入口校正后再用。
-from _mt5_timeutil import mt5_time_to_utc, detect_mt5_tz_offset  # noqa: F401
+from _mt5_timeutil import mt5_time_to_utc
 
 # Live bar Redis key — inline to avoid cross-module import (bridge runs on Windows host)
 LIVE_BAR_KEY_TEMPLATE = "market:bar:{symbol}:{timeframe}:live"
@@ -561,6 +561,11 @@ def _align_bar_open_epoch(epoch: int, bar_sec: int):
 
 # 错位超过该秒数才告警（过滤亚分钟级 epoch 取整噪声；真实错位为整小时级）
 ALIGN_WARN_SECONDS = 60
+
+# 错位告警节流：同一 (symbol, timeframe) 至少间隔该秒数才再次打印，避免每个 bar 重复刷屏
+_MISALIGN_LOG_INTERVAL = 3600
+# 错位告警最近打印时间戳表，key=(symbol, timeframe_str)，value=time.time()，用于上面节流判定
+_misalign_last_log = {}
 
 
 def _rate_get(r, name, default=0):
@@ -1691,7 +1696,7 @@ async def _compute_atr14(pool, symbol: str, n: int = 31) -> Optional[float]:
         rows = list(reversed(rows))  # 时间升序
         trs = []
         for i in range(1, len(rows)):
-            h, l, c = float(rows[i]["high"]), float(rows[i]["low"]), float(rows[i]["close"])
+            h, l = float(rows[i]["high"]), float(rows[i]["low"])
             pc = float(rows[i - 1]["close"])
             tr = max(h - l, abs(h - pc), abs(l - pc))  # True Range
             trs.append(tr)
@@ -3261,7 +3266,18 @@ async def main(dry_run=False):
         return
     live_login, live_server, disc_mt5 = disc
 
-    # 每桥独立日志文件（按 login 命名），避免多桥共用 bridge.log 在 Windows 下并发写冲突
+    # 每桥独立日志文件（按 login 命名），避免多桥共用 bridge.log 在 Windows 下并发写冲突。
+    # 【2026-09-24 防重入累积】main() 会被 run_bridge_forever 的 while 自愈循环反复重入
+    # （任一异常即重跑 main），若每次无条件 addHandler，则每次重入都多挂一个 FileHandler
+    # → 同一日志按 handler 数成倍刷屏 + 文件句柄泄漏（实证：NameError 自愈循环期间单条日志重复 10~14 次）。
+    # 故挂新 handler 前先摘除并关闭本模块此前添加的 FileHandler（幂等）。
+    for _old_fh in list(log.handlers):
+        if isinstance(_old_fh, logging.FileHandler):
+            log.removeHandler(_old_fh)
+            try:
+                _old_fh.close()
+            except Exception:
+                pass
     try:
         _fh = logging.FileHandler(
             os.path.join(_BRIDGE_LOG_DIR, f"bridge_{live_login}.log"), encoding="utf-8"

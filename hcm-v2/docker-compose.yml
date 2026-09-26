@@ -137,6 +137,9 @@ services:
     volumes:
       # 绑定挂载源码（无网环境无法 rebuild 镜像）：使主号周期重解析等修复跨容器 recreate 持久生效
       - ./hcm-signal-tower/signal_tower/scheduler.py:/app/signal_tower/scheduler.py
+      # [2026-09-25] 让衰竭期(trend_fade)也出箱体单：③-B 收敛范围扩至四类（含 trend_fade）；
+      # 绑定挂载使该修复跨容器 recreate 持久生效（与 scheduler.py 等同模式）
+      - ./hcm-signal-tower/signal_tower/state_machine.py:/app/signal_tower/state_machine.py
       # [2026-08-04 治本③] 连亏制动时间衰减：consecutive_loss 老旧自动清零，破除永久死锁；绑定挂载跨 recreate 持久
       - ./hcm-signal-tower/signal_tower/risk_state_sync.py:/app/signal_tower/risk_state_sync.py
       # [2026-07-30] Bar 质量分纯函数：信号塔处理高质量 K 线数据，默认不影响信号（计算层）

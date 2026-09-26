@@ -12,6 +12,9 @@
   3. PG hcm_market.klines_xauusd      K 线（周期列名是 time_frame；与状态按 open_time=bar_open_time JOIN，已实测可匹配）
   4. PG hcm_trading.positions         当前持仓（列名是 lot，不是 volume）
   5. PG hcm_trading.orders            当日亏损（口径同 hcm-risk-engine/risk_engine/rule_chain.py:_get_daily_loss）
+  6. PG hcm_signal.range_box_log      RANGE(Magic 55) **fast 箱**逐 bar 真值（迁移 0054；
+                                      塔 `scheduler._persist_range_box` 每 bar 写入，
+                                      仅 bar 收盘主路径）。是"两张箱体图"中 55 那张的唯一数据源
 
 已实测的坑（勿按直觉假设）：
   · 状态是 **7 态字符串枚举** S0_IDLE / S1_OSC / S2_TREND_INIT / S3_TREND_MID /
@@ -201,6 +204,12 @@ def create_state_router(db_pool=None, config_provider=None, auth_handler=None, r
         #    此处**如实同时返回**，由前端分别呈现，不用 UI 规则覆盖字段真值。
         misaligned = (box_frozen is not None) and (bool(box_frozen) != (not is_osc))
 
+        # 【2026-09-25 修复】趋势方向**诊断量**（塔在 hcm:live:state.dir 发布）：
+        #   斜率 slope_atr（ATR 归一）/ +DI / −DI / di_spread / 防抖进度 run_len /
+        #   源周期 src_tf / 阈值 slope_thr_atr / 防抖前原始方向 raw_name。
+        # 取不到 ⇒ None（前端如实显示"无数据源"，不伪造 0）。
+        _dir_diag = (live or {}).get("dir") if isinstance(live, dict) else None
+
         return _envelope({
             "symbol": sym,
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -217,9 +226,18 @@ def create_state_router(db_pool=None, config_provider=None, auth_handler=None, r
                 "box_frozen_at": (ctx or {}).get("box_frozen_at"),
                 # UI 规则与字段是否打架（true = 打架，面板应如实展示而非掩盖）
                 "freeze_rule_misaligned": misaligned,
-                # 趋势细节未发布（实测），显式标注而非伪造 0
-                "trend_detail_published": False,
-                "trend_detail_reason": "scheduler.py:2231 从 latest_direction() 只取 name，slope_atr/di_spread 被丢弃",
+                # 【2026-09-25 修复】趋势方向诊断 —— 原实现**硬编码 False** 并注明
+                # "scheduler 只取 name、slope_atr/di_spread 被丢弃"（那是当时的真实缺陷）。
+                # 现塔已在 `hcm:live:state.dir` 发布全部诊断量 ⇒ 按**实际是否取到**如实标注，
+                # 不再无条件谎报"无数据源"。
+                "trend_detail_published": bool(
+                    isinstance(_dir_diag, dict)
+                    and _dir_diag.get("slope_atr") is not None),
+                "trend_detail_reason": (
+                    "" if (isinstance(_dir_diag, dict)
+                           and _dir_diag.get("slope_atr") is not None)
+                    else "塔未发布方向诊断（hcm:live:state.dir 缺失：旧版塔，或本 bar 方向段异常）"),
+                "trend_dir": _dir_diag,
             },
             "config": await _cfg_bundle(config_provider),
         })
@@ -283,13 +301,29 @@ def create_state_router(db_pool=None, config_provider=None, auth_handler=None, r
             "       s.trigger_on, s.trigger_reason, s.note, "
             # 【2026-09-17 D4】逐 bar 箱体（前端按真实序列分段绘制箱体三线）；
             #   NULL = 该 bar 无可算箱体（K 线/ATR 不足或策略层未就绪），前端应断线不补。
-            "       s.box_upper, s.box_lower, s.box_mid, s.box_frozen "
+            "       s.box_upper, s.box_lower, s.box_mid, s.box_frozen, "
+            # 【2026-09-25】Magic 55（RANGE 均值回归）**fast 箱** 逐 bar 真值。
+            # 表 `hcm_signal.range_box_log` 由塔 `_persist_range_box` 每 bar 写入
+            # （与发布 Redis 的 fast 箱同一次计算）；NULL / fast_valid=false = 该 bar
+            # 箱体不可算（或塔尚未落库的早期 bar）⇒ 前端断线不补、不画 0。
+            "       rb.fast_upper AS rng_fast_upper, "
+            "       rb.fast_lower AS rng_fast_lower, "
+            "       rb.fast_mid AS rng_fast_mid, "
+            "       rb.fast_width_atr AS rng_fast_width_atr, "
+            "       rb.fast_valid AS rng_fast_valid "
             "FROM (SELECT * FROM hcm_market.klines_xauusd "
             "      WHERE symbol = $1 AND time_frame = $2 "
             "      ORDER BY open_time DESC LIMIT $3) k "
             "LEFT JOIN hcm_signal.market_state_log s "
             "  ON s.symbol = k.symbol AND s.time_frame = k.time_frame "
             " AND s.bar_open_time = k.open_time "
+            # 【2026-09-25】55 箱体：**独立表**，按同一 (symbol, tf, bar_open_time) 对齐。
+            # 为什么独立表而不是 market_state_log 加列：那张表由 FSM 写、其
+            # ON CONFLICT DO UPDATE 只回填 intent_*/box_* ⇒ 若 55 侧先插行会把
+            # state/prob_* 永久留 NULL（破坏 61 图表）。详见迁移 0054 头注释。
+            "LEFT JOIN hcm_signal.range_box_log rb "
+            "  ON rb.symbol = k.symbol AND rb.time_frame = k.time_frame "
+            " AND rb.bar_open_time = k.open_time "
             "ORDER BY k.open_time ASC",
             symbol.upper(), tf, limit,
         )

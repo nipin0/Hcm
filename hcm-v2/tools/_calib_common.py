@@ -73,3 +73,60 @@ def fit_platt(raw: np.ndarray, y: np.ndarray) -> PlattCalibrator:
     lr = LogisticRegression(C=1e6, solver="lbfgs", max_iter=2000)
     lr.fit(z, np.asarray(y).astype(int))
     return PlattCalibrator(float(lr.coef_[0][0]), float(lr.intercept_[0]))
+
+
+def calib_is_degenerate(calib, min_levels: int = 8, min_span: float = 0.10,
+                        min_iqr: float = 0.15, grid_n: int = 17) -> bool:
+    """校准器退化判定 —— **训练/验收侧与生产 quality_scorer._calib_is_degenerate
+    完全同口径**（y_fit 档位计数 + 17 点决策网格唯一值 + 输出跨度 + IQR 四判据）。
+
+    为什么放这里（2026-09-25 根因修复）：train_signal_quality.py 的 `[calib-final]`
+    判据与生产侧**口径不一致**（probe×101/round-6 vs y_fit/round-4 + 网格四判据），
+    同一校准器训练侧判退化、生产侧放行/ vice versa ⇒ auto_retrain 的
+    `quality_calib_degenerate` 误判（v109 实测：OOF isotonic 8 阈值，probe 口径仅
+    7 档 → 判 DEGENERATE 拒收整轮）。统一以本函数为准，训练侧验收不再漂移。
+
+    生产实现对 PlattCalibrator **无分支**（y_thresholds_/y_fit 皆无 ⇒ 恒 False，
+    属既有漏洞）；本函数补 Platt 专属分支（level_count + 网格跨度），训练侧验收
+    **不依赖**该漏洞。判定失败一律返回 False（与生产一致：宁可漏判不让校准器
+    被误杀后静默回退 raw）。
+    """
+    try:
+        _min = int(min_levels)
+        # 分支 1：sklearn IsotonicRegression
+        yt = getattr(calib, "y_thresholds_", None)
+        if yt is not None:
+            return len({round(float(v), 4) for v in yt}) < _min
+        # 分支 2：calib_np.NumpyCalibrator —— y_fit 档位 + 决策网格三判据
+        yf = getattr(calib, "y_fit", None)
+        if yf is not None:
+            levels = {round(float(v), 4) for v in yf}
+            if len(levels) < _min:
+                return True
+            grid = np.linspace(0.1, 0.9, int(grid_n))
+            outs = np.round(np.asarray(calib.predict(grid), dtype=float), 4)
+            if len(set(outs.tolist())) < _min:
+                return True
+            if float(outs.max() - outs.min()) < float(min_span):
+                return True
+            _q1, _q3 = np.percentile(outs, [25, 75])
+            if float(_q3) - float(_q1) < float(min_iqr):
+                return True
+            return False
+        # 分支 3（补生产漏洞）：calib_np.PlattCalibrator —— 连续输出无阶梯
+        _lc = getattr(calib, "level_count", None)
+        if callable(_lc):
+            try:
+                _n = int(_lc(100))
+            except TypeError:
+                _n = int(_lc())
+            if _n < 2:          # a≈0 ⇒ 输出近常数 ⇒ 退化
+                return True
+            grid = np.linspace(0.1, 0.9, int(grid_n))
+            outs = np.asarray(calib.predict(grid), dtype=float)
+            if float(outs.max() - outs.min()) < float(min_span):
+                return True
+            return False
+        return False
+    except Exception:
+        return False

@@ -97,9 +97,10 @@ DEFAULTS: dict = {
     #   ⇒ 模型对这三类的 argmax 实为**噪声**；用它驱动 S1/S2/S3 的区分 = **按噪声迁移**
     #     （生产实测 43 次迁移 / 251 bar，其中 S0_IDLE ↔ S4_TREND_FADE 反复横跳 ≥6 轮）。
     # 语义：取值 ∈ {"", S0_IDLE, S1_OSC, S2_TREND_INIT}；**"" = 关闭（默认，零行为变化）**。
-    #   非空时：模型判 `oscillation / trend_init / trend_mid` → **一律落该目标态**
-    #   （仍走同一套防抖与第 8.5 步两道门，不绕过任何约束）；模型判 `trend_fade`
-    #   → 仍落 S4 不变（那是它**唯一可判**的类：recall 0.79 / AUC 0.76~0.80）。
+    #   非空时：模型判 `oscillation / trend_init / trend_mid / trend_fade` → **一律落该目标态**
+    #   （仍走同一套防抖与第 8.5 步两道门，不绕过任何约束）。
+    #   注：2026-09-25 起 `trend_fade` 亦纳入收敛（用户要求"衰竭期也出箱体单"）；
+    #   此前它刻意排除、保持 S4_TREND_FADE（只持有、不新开）的语义已不再适用。
     # 建议值：`S2_TREND_INIT` —— 12 天整链回放中它占 **95%+ 成交**且是唯一稳定正边际
     #   （均值 R **+0.076** / 累计 +12.4）；`S0_IDLE` 可作"非 fade 不下单"的对照臂。
     "state.fsm.non_fade_target": "",
@@ -446,13 +447,14 @@ def decide(
         target = CLASS_TO_STATE.get(str(getattr(infer, "state", "") or ""))
         if target is None:
             return _keep("unknown_class")
-        # ── 【③-B 2026-09-19】非 fade 三类**收敛到一个目标态**（开关，默认关闭）──────
+        # ── 【③-B 2026-09-19】非 fade 类**收敛到一个目标态**（开关，默认关闭）──────
         # 为什么：`oscillation / trend_init / trend_mid` 两两 AUC 0.51~0.55、条件分布
         #   总变差 ≤8.5%，两套独立实验（补 l1 特征 / 重定标签口径）均**无法分开**
         #   ⇒ 模型对三者的 argmax 是**噪声**，用它驱动 S1/S2/S3 的区分 = 按噪声迁移。
         # 做法：**只改目标态**；不动防抖根数、不动第 8.5 步两道门（不绕过任何约束）。
-        #   保留 `trend_fade` 不受影响 —— 它是模型**唯一可判**的类（recall 0.79 / AUC 0.76~0.80）。
-        if non_fade_target and target != MarketState.S4_TREND_FADE:
+        #   2026-09-25 起 `trend_fade` 一并纳入收敛（用户要求"衰竭期也出箱体单"）：
+        #   去掉 `target != S4_TREND_FADE` 排除条件，四类统一落 `non_fade_target`。
+        if non_fade_target:
             try:
                 target = MarketState(non_fade_target)
             except ValueError:

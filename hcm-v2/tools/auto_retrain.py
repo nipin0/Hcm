@@ -287,18 +287,28 @@ def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
 
 # ── 回测指标解析 ──────────────────────────────────────────────────────────
 def parse_auc(stdout: str) -> float | None:
-    """抓**被部署模型自己**的测试段 AUC：[final-model] 优先。
+    """判决用 AUC：**优先** `[tss-oof]`（跨折 pooled OOF，稳健）；回退 `[final-model]`。
 
-    【D3 2026-09-17 治本】原实现"**优先取 tss-summary 均值**（时序交叉验证更可靠）"，
-    但 `train_signal_quality.py` 落盘的是 **TSS 最后一折**的模型（其 :675-678
-    `_save_model = _tss_model.booster_`），二者根本不是同一个东西：
-      · `[tss-summary]` = 5 折 AUC **均值**（含最早期的 fold1，也含已被行情淘汰的旧 fold）
-      · `[final-model]` = **实际写进 staging 那个模型**在自己测试窗上的 AUC
-    实测 v109（09-17 06:34）：tss_mean=0.516、final(fold5)=**0.477** ⇒ 旧口径比产物更
-    宽松；反之（均值低而产物好）会**误杀**。判决必须对齐"要部署的那个东西"。
-    tss 均值降级为诊断字段（parse_auc_tss_mean），仍落库可看趋势，但**不参与判决**。
+    【F3(c) 2026-09-24 稳健判决口径】原实现（D3 2026-09-17 引入）取 `[final-model]`
+    = **最近 2 折 AUC 均值**。实测 v109（09-24，n=1831）各折：
+        0.610 / 0.563 / 0.561 / **0.386** / 0.536   （fold std = 0.077）
+        末 2 折均值（旧判决值） = **0.461**  ← 恰好抽到最差的一折
+        pooled OOF（新判决值）  = **0.519**  （n_oof=1525）
+        5 折均值                 = 0.531
+    ⇒ 旧口径的判决值等于"**哪两折恰好排在时序最后**"的抽签：灾难折落进尾部（0.386）
+      就把整体判成 0.461，换折数/换窗口即跳回 0.536 ⇒ **判决不可复现**，且会制造
+      噪声性拒收（fail_streak 反复累积到熔断）。
+    改为 pooled OOF：把各折 out-of-fold 预测**拼接**后算一个 AUC（样本 ~5 倍、方差大降），
+    且仍严格样本外（每折预测均未见过该折数据）。
+    **口径权衡（须知）**：pooled 混合 5 个不同折的模型，与最终落盘的"最后一折模型"不
+    完全同一物 ⇒ 比 `final-model` 略宽松。该取舍是**有意**的：宁少一次噪声误杀，也不要
+    把有区分力的模型因单折波动拒之门外。
+    `[final-model]` 降级为诊断字段（parse_auc_final_model），仍落库可回看。
     """
     import re
+    m = re.search(r"\[tss-oof\]\s*AUC=(\d+\.\d+)", stdout)
+    if m:
+        return float(m.group(1))
     m = re.search(r"\[final-model\]\s*AUC=(\d+\.\d+)", stdout)
     if m:
         return float(m.group(1))
@@ -326,9 +336,26 @@ def parse_auc_tss_mean(stdout: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
+def parse_auc_final_model(stdout: str) -> float | None:
+    """`[final-model]` = 落盘模型**最近 2 折** AUC 均值 —— 仅诊断（F3(c) 起不参与判决）。"""
+    import re
+    m = re.search(r"\[final-model\]\s*AUC=(\d+\.\d+)", stdout)
+    return float(m.group(1)) if m else None
+
+
+def parse_auc_oof_n(stdout: str) -> int | None:
+    """pooled OOF 的参与样本量 —— 诊断用（判断 pooled 值是否可信）。"""
+    import re
+    m = re.search(r"\[tss-oof\]\s*AUC=\d+\.\d+\s+n_oof=(\d+)", stdout)
+    return int(m.group(1)) if m else None
+
+
 def parse_auc_src(stdout: str) -> str:
     """本次 auc 的取数来源（便于回看"判决依据是什么"）。"""
     import re
+    # F3(c)：pooled OOF 优先 —— 取值顺序必须与 parse_auc 严格一致，否则溯源与判决错配
+    if re.search(r"\[tss-oof\]", stdout):
+        return "tss_oof_pooled"
     if re.search(r"\[final-model\]", stdout):
         return "final_model"
     if re.search(r"tss-summary\] AUC mean=", stdout):
@@ -466,6 +493,50 @@ def _auto_promote_enabled() -> bool:
     except Exception as e:  # noqa: BLE001
         log(f"[promote-gate] config read failed({e}) → fail-open auto promote")
         return True
+
+
+def _quality_adopt_block_enabled() -> bool:
+    """【C 2026-09-25】质量头采纳降级开关。
+
+    根因：质量头无可用区分力（n=1831 样本 + 标签赢率 0.499 + 单特征 AUC 最大仅 0.0587
+    ⇒ pooled OOF AUC≈0.52<0.55，且校准器退化）。继续让它作为整轮 adopt 的硬条件，会
+    把达标的方向头/买点头一并拒收（fail_streak 反复累积到熔断），重训闭环空转。
+
+    true（开启降级）时：
+      · 质量头 **不再**阻塞整轮采纳，仅记录 quality_ok（落 payload/日志）
+      · 整轮 adopt 改由方向头+买点头本地判定驱动（dir_ok && entry_ok）
+      · 切换时若质量头本轮不达标，只切方向头+买点头四键，质量头保持线上版本不切（停更）
+    false（默认）：维持旧护栏（质量头达标才整轮 adopt）。
+
+    口径（铁律 5.2）：Redis 热缓存 > PG 真源 > 默认 False。
+    fail-open：读取失败一律 False（维持旧护栏，绝不因配置故障意外停更质量头）。
+    """
+    _val = None
+    try:
+        import redis as _r
+        _rc = _r.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=3, decode_responses=True)
+        _val = _rc.hget("hcm:config:v2", "ai.lm.quality_adopt_block")
+    except Exception as e:  # noqa: BLE001
+        log(f"[cfg] quality_adopt_block redis read failed({e})")
+    if _val is None:
+        try:
+            import psycopg2
+            conn = psycopg2.connect(DB_URL_DEFAULT, connect_timeout=5)
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT current_value FROM hcm_config.metadata "
+                        "WHERE config_key='ai.lm.quality_adopt_block'")
+                    _row = cur.fetchone()
+                    if _row and _row[0]:
+                        _val = _row[0]
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001
+            log(f"[cfg] quality_adopt_block pg read failed({e})")
+    if _val in (None, ""):
+        return False
+    return str(_val).strip().lower() in ("true", "1")
 
 
 def _save_pending_promote(v: int, model_out: str, calib_out: str, shadow) -> None:
@@ -814,9 +885,11 @@ def _promote_candidate(v: int) -> bool:
     return ok
 
 
-def switch_model(model_path: str, calib_path: str) -> bool:
+def switch_model(model_path: str, calib_path: str, skip_quality: bool = False) -> bool:
     """把新模型路径写 ai.lm.model_path / ai.lm.calib_path（PG+Redis 双写+PUB）。
 
+    【C 2026-09-25】skip_quality=True 时质量头两键不写，仅切同版本方向头+买点头
+    （质量头降级模式：质量头停更、只演进方向头/买点头）。
     优先用 config_provider.set（若存在），否则直接双写 PG+Redis。
     返回是否成功。DRY_RUN=True 时只记录不切换（验证/灰度用）。
     """
@@ -839,8 +912,13 @@ def switch_model(model_path: str, calib_path: str) -> bool:
         try:
             # 【2026-09-11 三头同步】质量头 + 同版本号的方向头/买点头一并写，
             # 消除三头版本漂移（见 _sibling_head_pairs）；文件不齐时只写质量头两键。
-            pairs = [("ai.lm.model_path", model_path), ("ai.lm.calib_path", calib_path)]
-            pairs += _sibling_head_pairs(model_path)
+            # 【C 2026-09-25】skip_quality=True（质量头降级且本轮不达标）时，质量头两键
+            # 不写，仅切方向头+买点头（质量头保持线上版本不切，停更）。
+            _q_pairs = ([("ai.lm.model_path", model_path), ("ai.lm.calib_path", calib_path)]
+                        if not skip_quality else [])
+            pairs = _q_pairs + _sibling_head_pairs(model_path)
+            if skip_quality:
+                log("[switch] skip_quality=true → 质量头保持线上版本不切，仅切方向头+买点头")
             with conn.cursor() as cur:
                 for key, val in pairs:
                     # default_value 是 NOT NULL 列：INSERT 时与 current_value 同值；
@@ -996,6 +1074,49 @@ REAL_EVAL_HOLDOUT_RATIO = float(os.environ.get("REAL_EVAL_HOLDOUT_RATIO", "0.20"
 # 抢占 CPU，且结果必然 adopted=false。达到阈值后降级为"仅告警不重训"，
 # 待 fail_streak 被成功采纳重置（或人工清零）后自动恢复。
 RETRAIN_FAIL_STREAK_HALT = 3
+
+# 【2026-09-24 自愈闭环死锁修复】熔断自动重试窗口（小时）。
+#   原实现：fail_streak >= HALT 即**永久**跳过重训 —— 但重训是唯一能产出新模型、
+#   从而把 fail_streak 清零（switched=True）的路径 ⇒ **逻辑死锁**：越熔断越不可能恢复，
+#   只能人工 `--force` 或清零 Redis 键（实证：2026-09-15~18 连续 4 轮全 rollback →
+#   fail_streak=4 → 闭环自 09-18 起停摆，体检表判 block，日志每轮只打"不重训"）。
+#   现改为「时间受限熔断」：仍跳过绝大部分轮次（防 churn），但每 RETRAIN_HALT_RETRY_H
+#   小时放行一次自动重试；若市场/特征回稳使候选达标 → switched=True → fail_streak 清零
+#   → 闭环自动复活，全程无人工。0 = 关闭自动重试（恢复旧的永久熔断行为）。
+RETRAIN_HALT_RETRY_H = float(os.environ.get("RETRAIN_HALT_RETRY_H", "24"))
+# 下次允许自动重试的时间戳（unix 秒）；缺失/过期 ⇒ 本轮放行并刷新窗口。
+HALT_UNTIL_KEY = "hcm:ai:retrain:halt_until"
+
+
+def _halt_allow_retrain(r) -> tuple[bool, int]:
+    """fail_streak 熔断门（时间受限）。返回 (是否放行, 当前 streak)。
+
+    规则：
+      streak < HALT                   → 放行
+      streak >= HALT 且窗口未到期     → 不放行
+      streak >= HALT 且窗口到期/缺失  → 放行，并把下次窗口推后 RETRAIN_HALT_RETRY_H 小时
+    Redis 不可用/异常 → 放行（fail-open：绝不因熔断机制本身故障而阻塞重训）。
+    """
+    if r is None:
+        return True, 0
+    try:
+        n = int(float(r.get(FAIL_STREAK_KEY) or 0))
+    except Exception:
+        return True, 0
+    if n < RETRAIN_FAIL_STREAK_HALT:
+        return True, n
+    if RETRAIN_HALT_RETRY_H <= 0:
+        return False, n
+    try:
+        _until = r.get(HALT_UNTIL_KEY)
+        _now = time.time()
+        if _until is None or _now >= float(_until):
+            r.set(HALT_UNTIL_KEY, str(_now + RETRAIN_HALT_RETRY_H * 3600),
+                  ex=int(RETRAIN_HALT_RETRY_H * 3600) + 60)
+            return True, n
+        return False, n
+    except Exception:
+        return True, n
 
 
 def build_live_baseline(window_days: float = 1.0) -> dict | None:
@@ -1241,22 +1362,10 @@ def monitor_and_trigger(use_deepseek: bool = True) -> bool:
         log(f"[WARN] 退化/常量特征 {len(_degen)} 个（线上无信息，PSI=0 不代表健康）: "
             f"{_degen}")
     if triggered:
-        # 【2026-09-08 审计修复 P1】fail_streak 熔断（见 RETRAIN_FAIL_STREAK_HALT 注释）：
-        # 漂移可以是真的（实测基线重建后 psi_max 仍 1.40、22 维漂移），但若连续多轮
-        # 重训都被影子验收拒收，再触发重训只是空转。达到阈值 → 本轮仅告警不重训。
-        _streak = 0
-        try:
-            import redis as _rlib
-            _rc = _rlib.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=3,
-                              decode_responses=True)
-            _streak = int(float(_rc.get("hcm:ai:retrain:fail_streak") or 0))
-        except Exception as _se:
-            log(f"[trigger] fail_streak 读取失败({_se})，按 0 处理")
-        if _streak >= RETRAIN_FAIL_STREAK_HALT:
-            log(f"[trigger] 漂移确认，但 fail_streak={_streak} >= "
-                f"{RETRAIN_FAIL_STREAK_HALT} → 本轮**不重训**（避免空转 churn），"
-                f"仅告警。待新模型通过影子验收或人工重置 fail_streak 后自动恢复。")
-            return triggered
+        # 【2026-09-24 去冗余·死锁修复】fail_streak 熔断**只在 retrain_once 里判**
+        # （单一门，见 _halt_allow_retrain）。此处原有的重复判定已删除 —— 它会让
+        # PSI 触发路径在熔断期**永不调用** retrain_once，从而绕过"时间受限熔断"的
+        # 自动重试窗口，与 retrain_once 的旧判定共同构成闭环永久停摆。
         if RETRAIN_TRIGGER_COOLDOWN_H > 0:
             _cd_key = "hcm:ai:retrain:trigger_cooldown"
             _now = time.time()
@@ -1463,23 +1572,30 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
     （main:1239）以及 daemon 定时分支（main:1265）都直接调用本函数 → 完全绕过
     熔断。实测：fail_streak=12（远超 RETRAIN_FAIL_STREAK_HALT=3）时仍在
     2026-09-08T21:44 训练出 v96，版本继续堆积、CPU 空转。
-    现统一在此判定：fail_streak >= RETRAIN_FAIL_STREAK_HALT 且非 force → 跳过
-    训练（仅告警，避免 churn）；人工确实要强制重训时用 --force 覆盖。
+    现统一在此判定（**单一门**，monitor 路径不再重复判）：fail_streak >=
+    RETRAIN_FAIL_STREAK_HALT 且非 force → 跳过训练（避免 churn）。
+    【2026-09-24】"跳过"改为**时间受限**：每 RETRAIN_HALT_RETRY_H 小时放行一次
+    自动重试（详见 RETRAIN_HALT_RETRY_H 注释），根治"越熔断越无法恢复"的死锁；
+    人工可随时用 --force 立即强制重训。
     """
     if not force:
+        _rc = None
         try:
             import redis as _rlib
             _rc = _rlib.Redis(host=REDIS_HOST, port=REDIS_PORT, socket_timeout=3,
                               decode_responses=True)
-            _streak = int(float(_rc.get(FAIL_STREAK_KEY) or 0))
         except Exception as _se:
-            log(f"[halt] fail_streak 读取失败({_se})，按 0 处理")
-            _streak = 0
-        if _streak >= RETRAIN_FAIL_STREAK_HALT:
-            log(f"[halt] fail_streak={_streak} >= {RETRAIN_FAIL_STREAK_HALT} "
-                f"→ 跳过本轮重训（空转防护）；人工强制请加 --force")
+            log(f"[halt] redis 连接失败({_se})，按放行处理（fail-open）")
+        _allow, _streak = _halt_allow_retrain(_rc)
+        if not _allow:
+            log(f"[halt] fail_streak={_streak} >= {RETRAIN_FAIL_STREAK_HALT} 且熔断"
+                f"自动重试窗口未到（每 {RETRAIN_HALT_RETRY_H}h 放行一次）→ 跳过本轮重训"
+                f"（空转防护）；人工强制请加 --force")
             _record_abort("fail_streak_halt", f"fail_streak={_streak}")
             return {"ok": False, "stage": "fail_streak_halt", "fail_streak": _streak}
+        if _streak >= RETRAIN_FAIL_STREAK_HALT:
+            log(f"[halt] fail_streak={_streak} >= {RETRAIN_FAIL_STREAK_HALT} 但自动重试"
+                f"窗口到期 → 放行本轮（自愈重试，每 {RETRAIN_HALT_RETRY_H}h 一次）")
     v = next_model_version()
     # 【P4-a 2026-09-11】候选先落 staging（**不占版本号**）；验收通过后由
     # _promote_candidate(v) 移入 MODELS_DIR 才真正占用 v。方向头/买点头由
@@ -1562,10 +1678,15 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
     auc = parse_auc(_all_out)
     samples = count_samples(_all_out)
     ds_ratio = ds_nonzero_ratio(_all_out)
-    # 【D3 2026-09-17】判决口径 = 落盘模型自身指标；5 折均值仅作诊断（见 parse_auc 注释）
+    # 【F3(c) 2026-09-24】判决口径 = **跨折 pooled OOF**（稳健，见 parse_auc 注释）；
+    # 下列三项均降级为诊断：final_model = 落盘模型末 2 折均值、tss_mean = 5 折均值、
+    # oof_n = pooled 参与样本量。三者口径混用是过去反复噪声性拒收的结构性原因。
+    auc_final_model = parse_auc_final_model(_all_out)
+    auc_oof_n = parse_auc_oof_n(_all_out)
     auc_tss_mean = parse_auc_tss_mean(_all_out)
     auc_src = parse_auc_src(_all_out)
-    log(f"[train] done: auc={auc} (src={auc_src}, tss_mean={auc_tss_mean}) "
+    log(f"[train] done: auc={auc} (src={auc_src}, final_model={auc_final_model}, "
+        f"tss_mean={auc_tss_mean}, oof_n={auc_oof_n}) "
         f"samples={samples} ds_nonzero_ratio={ds_ratio}")
 
     # 【阶段 2·健康判定 2026-08-29】方向头 / 买点头**独立**健康判定（用户决策 1/2/4）：
@@ -1595,20 +1716,34 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
             "不阻塞质量头采纳）")
 
     quality_calib_degenerate = parse_calib_degenerate(_all_out)
+    # 【C 2026-09-25】质量头采纳降级判定（仅记录，不阻塞；详见 _quality_adopt_block_enabled）
+    _quality_block = _quality_adopt_block_enabled()
+    quality_ok = (auc is not None and auc >= LOCAL_AUC_ADOPT_MIN
+                  and samples >= MIN_SAMPLES_FOR_SWITCH
+                  and (ds_ratio is None or ds_ratio >= DS_MIN_NONZERO_RATIO)
+                  and not quality_calib_degenerate)
+    log(f"[head-health] quality_ok={quality_ok} (auc={auc}, calib_degen="
+        f"{quality_calib_degenerate}, block={_quality_block})")
     payload = {
         "model_version": f"v{v}",
         "auc": auc,
         "samples": samples,
         "ds_nonzero_ratio": ds_ratio,
         "baseline_win_rate": None,  # train 输出含，按需扩展解析
-        # 【D3 2026-09-17】判决口径溯源：auc 取自"落盘模型自身"（final_model）；
-        # tss_mean 是 5 折均值，仅诊断（趋势）—— 二者过去混用是本次误判的结构性原因。
+        # 【F3(c) 2026-09-24】判决口径溯源：auc 取自 **跨折 pooled OOF**（稳健）；
+        # final_model(末2折均值) / tss_mean(5折均值) / oof_n 仅诊断 —— 三者口径混用是
+        # 过去反复噪声性拒收的结构性原因（同一份 v109 数据实测：0.461 / 0.519 / 0.531）。
         "auc_src": auc_src,
+        "auc_final_model": auc_final_model,
+        "auc_oof_n": auc_oof_n,
         "auc_tss_mean": auc_tss_mean,
         # 质量头【自身】校准器状态 → 这才是裁判该用的"校准器退化"判据
         "quality_calib_degenerate": quality_calib_degenerate,
         # 阶段 2：三头健康指标（本地判定 + 落库追溯；【不交裁判】，见 _judge_payload）
         "head_health": head_health,
+        # 【C 2026-09-25】质量头采纳降级诊断（仅记录，便于回看本轮是否处于降级模式）
+        "quality_ok": quality_ok,
+        "quality_adopt_block": _quality_block,
     }
     # 【2026-09-10 修复·落实决策 4】裁判专用 payload：剔除 head_health。
     # :1168-1190 明确记载「决策 4：走本地阈值，不交 DeepSeek 裁判」，但原实现把含
@@ -1618,8 +1753,10 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
     # 【D3 2026-09-17】除 head_health 外，**再把两个诊断字段剔出裁判 payload**：
     #   `auc_tss_mean` / `auc_src` 是给人看的口径溯源，若一并喂给 LLM，可能被它
     #   当成"第二个 AUC"去比对 0.55 门槛（历史已发生过 head_health 被误读为
-    #   校准退化）。判决只应看 `auc`（=落盘模型自身指标）。
-    _JUDGE_EXCLUDE = {"head_health", "auc_tss_mean", "auc_src"}
+    #   校准退化）。判决只应看 `auc`（F3(c) 2026-09-24 起 = 跨折 pooled OOF）。
+    # 【F3(c) 2026-09-24】`auc_final_model` / `auc_oof_n` 同属诊断字段，一并剔除。
+    _JUDGE_EXCLUDE = {"head_health", "auc_tss_mean", "auc_src",
+                      "auc_final_model", "auc_oof_n"}
     _judge_payload = {k: v for k, v in payload.items() if k not in _JUDGE_EXCLUDE}
     log(f"[judge-payload] 已剔除 {sorted(_JUDGE_EXCLUDE)}；"
         f"quality_calib_degenerate={quality_calib_degenerate}")
@@ -1651,6 +1788,15 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
     log(f"[judge] decision={judge.get('decision')} reason={judge.get('reason')} "
         f"-> adopt={decided_adopt}")
 
+    # 【C 2026-09-25】质量头采纳降级：开关开启时，质量头**不再**阻塞整轮采纳。
+    # 无论裁判/本地护栏结论如何，整轮 adopt 改由方向头+买点头本地判定驱动；质量头
+    # 仅做记录（quality_ok 已落 payload）。这是"接受质量头停更、只演进方向头/买点头"
+    # 的工程落地——样本量/标签语义恢复后把开关改回 false 即恢复旧护栏。
+    if _quality_block:
+        decided_adopt = bool(dir_ok and entry_ok)
+        log(f"[head-health] 质量头降级模式：decided_adopt 改由 dir_ok&&entry_ok="
+            f"{decided_adopt}（质量头仅记录，不阻塞）；quality_ok={quality_ok}")
+
     # 5) 样本不足 → 只产模型不切（避免噪声覆盖）
     if samples < MIN_SAMPLES_FOR_SWITCH:
         log(f"[skip-switch] samples={samples} < {MIN_SAMPLES_FOR_SWITCH}，模型已产出但未切换")
@@ -1666,37 +1812,42 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
     # 6) 切换（P3-C 灰度闸门：候选需不劣于现役 champion 才切）
     switched = False
     if decided_adopt:
-        champ_path = _current_model_path()
-        if champ_path and os.path.exists(champ_path) and \
-                os.path.abspath(champ_path) != os.path.abspath(model_out):
-            _ai_l, _f_l, _p_l = fetch_recent(24.0)
-            # 【治本 2026-09-09】优先用"真实成交结果"标签验收（破除 passed 代理 +
-            # verdict 特征的循环自证）；真实集不可用时回退 passed 代理并标注来源。
-            _real = fetch_real_eval_set()
-            if _real is not None:
-                _ev_f, _ev_y = _real
-                se = shadow_eval(champ_path, model_out, _ev_f, _ev_y,
-                                 label_src="real_outcome")
-            elif _f_l:
-                se = shadow_eval(champ_path, model_out, _f_l, _p_l,
-                                 label_src="passed_proxy")
-            else:
-                se = None
-            if se is not None:
-                log(f"[shadow] {se}")
-                # 【P1-O5 2026-08-22】影子对比持久化：候选 vs 现役 AUC 差异 + 决定落库，
-                # 形成在线表现时间线，供按版本归因/回看（不再仅打日志）。
-                record_shadow_eval({
-                    "at": datetime.now(timezone.utc).isoformat(),
-                    "champion": os.path.basename(champ_path),
-                    "candidate": os.path.basename(model_out),
-                    "shadow": se,
-                    "blocked": bool(se.get("available") and not se.get("adopt")),
-                })
-                payload["shadow"] = se
-                if se.get("available") and not se.get("adopt"):
-                    log("[shadow] challenger 未优于 champion -> 不切换")
-                    decided_adopt = False
+        if _quality_block:
+            # 【C 2026-09-25】质量头降级：不做质量头 champion/candidate 影子对比
+            # （质量头本就停更，比较它无意义），直接演进方向头+买点头（质量头跳过）。
+            log("[head-health] 质量头降级：跳过质量头 shadow gate，仅演进方向头/买点头")
+        else:
+            champ_path = _current_model_path()
+            if champ_path and os.path.exists(champ_path) and \
+                    os.path.abspath(champ_path) != os.path.abspath(model_out):
+                _ai_l, _f_l, _p_l = fetch_recent(24.0)
+                # 【治本 2026-09-09】优先用"真实成交结果"标签验收（破除 passed 代理 +
+                # verdict 特征的循环自证）；真实集不可用时回退 passed 代理并标注来源。
+                _real = fetch_real_eval_set()
+                if _real is not None:
+                    _ev_f, _ev_y = _real
+                    se = shadow_eval(champ_path, model_out, _ev_f, _ev_y,
+                                     label_src="real_outcome")
+                elif _f_l:
+                    se = shadow_eval(champ_path, model_out, _f_l, _p_l,
+                                     label_src="passed_proxy")
+                else:
+                    se = None
+                if se is not None:
+                    log(f"[shadow] {se}")
+                    # 【P1-O5 2026-08-22】影子对比持久化：候选 vs 现役 AUC 差异 + 决定落库，
+                    # 形成在线表现时间线，供按版本归因/回看（不再仅打日志）。
+                    record_shadow_eval({
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "champion": os.path.basename(champ_path),
+                        "candidate": os.path.basename(model_out),
+                        "shadow": se,
+                        "blocked": bool(se.get("available") and not se.get("adopt")),
+                    })
+                    payload["shadow"] = se
+                    if se.get("available") and not se.get("adopt"):
+                        log("[shadow] challenger 未优于 champion -> 不切换")
+                        decided_adopt = False
         if decided_adopt and not _auto_promote_enabled():
             # 【P4-b 2026-09-11】人工确认门：候选**不占号、不切换**，只落待批准记录。
             _save_pending_promote(v, model_out, calib_out, payload.get("shadow"))
@@ -1705,13 +1856,15 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
             decided_adopt = False
             payload["pending_promote"] = True
         if decided_adopt:
-            # 【P4-a 2026-09-11】先 promote（staging → MODELS_DIR，此刻才占号），
-            # 再切换配置指向**正式目录**路径；否则配置会指向 staging → 清理/回切失效。
             if _promote_candidate(v):
+                # 【C 2026-09-25】质量头降级且本轮质量头不达标 → 只切方向头+买点头，
+                # 质量头保持线上版本不切（停更）；质量头达标时仍随三头同步切。
                 switched = switch_model(
                     os.path.join(MODELS_DIR, f"lgbm_quality_v{v}.txt"),
-                    os.path.join(MODELS_DIR, f"calib_v{v}.pkl"))
-                log(f"[switch] {'OK' if switched else 'FAILED'} -> v{v}")
+                    os.path.join(MODELS_DIR, f"calib_v{v}.pkl"),
+                    skip_quality=(_quality_block and not quality_ok))
+                log(f"[switch] {'OK' if switched else 'FAILED'} -> v{v}"
+                    f"{(' (quality skipped: quality_ok=%s)' % quality_ok) if _quality_block else ''}")
             else:
                 switched = False
                 log("[switch] skipped (promote incomplete → 配置未改，避免指向悬空文件)")
@@ -1743,7 +1896,8 @@ def retrain_once(use_deepseek: bool = True, force: bool = False) -> dict:
     _streak = _bump_fail_streak(_rc, ok=bool(switched))
     payload["fail_streak"] = _streak
     if _streak >= FAIL_STREAK_ALERT:
-        log(f"[ALERT][需人工介入] 连续 {_streak} 轮复活失败（阈值 {FAIL_STREAK_ALERT}）："
+        log(f"[ALERT][需关注] 连续 {_streak} 轮复活失败（阈值 {FAIL_STREAK_ALERT}；"
+            f"已进入时间受限熔断，每 {RETRAIN_HALT_RETRY_H}h 自动重试一次，**无需人工解冻**）："
             f"stage={payload.get('stage', '-')} "
             f"judge={judge.get('decision')} reason={str(judge.get('reason'))[:160]}")
     if switched:

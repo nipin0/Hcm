@@ -16,7 +16,7 @@ import subprocess
 import ctypes
 import msvcrt
 import asyncio
-from ctypes import wintypes, Structure, c_void_p
+from ctypes import wintypes
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 PY = r"C:\Python313\python.exe"

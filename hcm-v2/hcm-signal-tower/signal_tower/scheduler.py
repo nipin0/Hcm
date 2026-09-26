@@ -271,6 +271,22 @@ def _format_suppress_reason(chain: list[tuple[int, str]]) -> str:
     return " > ".join(text for _, text in ordered)
 
 
+def _num_or_none(v, digits: int = 4):
+    """安全转数值：NaN / ±Inf / 不可解析 → None。
+
+    【2026-09-25 上屏修复】用于方向诊断字段。为什么用 None 而不是 0：
+      面板必须能区分"值真的算出来了"与"没算出来"；拿 0 冒充会把"判不了"
+      显示成"斜率=0（无趋势）"，属静默失真（铁律：无数据源须如实标注）。
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return round(f, digits)
+
+
 def _threshold_reason(score_result) -> str:
     """P2c: build a truthful filter reason when threshold_passed is False.
 
@@ -1660,6 +1676,9 @@ class Scheduler:
                     except Exception:  # noqa: BLE001
                         _hexp_on = True
                 if _live_model == "hexp" and _hexp_on:
+                    # 【2026-09-24 方案7】live=True 探针在 hexp_engine.produce 包装器内
+                    # 已做 锁内快照→produce→恢复，对迟滞/EMA/翻转状态机零副作用，
+                    # 避免 3s 轮询污染 bar-close 决策（详见 hexp_engine.produce）。
                     score_result = await self._hexp_engine.produce(
                         state.symbol, indicators, regime_result, live=True,
                     )
@@ -2123,6 +2142,60 @@ class Scheduler:
             logger.debug("range position count failed (%s): %s", symbol, exc)
             return -1
 
+    async def _persist_range_box(self, state: "SymbolState", box) -> None:
+        """【2026-09-25】把 RANGE(Magic 55) 的 **fast 箱** 逐 bar 落库（UPSERT）。
+
+        表：`hcm_signal.range_box_log`（迁移 0054）。
+        为什么必须落库：`hcm:live:range_box` 是 TTL 600s 的**单点快照** ⇒ 面板只能
+          显示"当前箱体"，画不出随时间移动的箱体（历史上曾把当前值读成历史）。
+        为什么独立建表：`market_state_log` 由 FSM 每 bar 写入且
+          `ON CONFLICT DO UPDATE` 只回填 `intent_* / box_*`；若本函数先 UPSERT 出一行、
+          FSM 后写入，该行的 `state / prob_*` 会**永久为 NULL** ⇒ 破坏既有 61 图表。
+        口径：与发布到 Redis 的 `fast` 箱是**同一次计算**（调用方传入，不重算）
+          ⇒ 不新增第二份箱体实现。
+        bar 身份：用 `state.last_bar_open_time`（= FSM 给 `market_state_log` 打标签的同一个
+          T）。箱体为 exclusive 切片（窗口不含评估 bar，= "T-2 往前 window 根"），
+          与 FSM 在 T 落库的 `box_*` **同窗口**（实测同刻 55.fast.lower == 61.ctx.box_lower）
+          ⇒ 必须同标签，否则两张图会横向错开一根 bar。
+        失败只告警：观测落库绝不影响交易链路。
+        """
+        if self._db is None or not getattr(self._db, "is_initialized", False):
+            return
+        bt = state.last_bar_open_time
+        if bt is None:
+            return
+        if getattr(bt, "tzinfo", None) is None:
+            bt = bt.replace(tzinfo=timezone.utc)
+        try:
+            _valid = bool(getattr(box, "valid", False))
+            await self._db.execute(
+                """
+                INSERT INTO hcm_signal.range_box_log
+                    (symbol, time_frame, bar_open_time,
+                     fast_upper, fast_lower, fast_mid, fast_width_atr,
+                     fast_valid, fast_reason)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                ON CONFLICT (symbol, time_frame, bar_open_time) DO UPDATE SET
+                    fast_upper     = EXCLUDED.fast_upper,
+                    fast_lower     = EXCLUDED.fast_lower,
+                    fast_mid       = EXCLUDED.fast_mid,
+                    fast_width_atr = EXCLUDED.fast_width_atr,
+                    fast_valid     = EXCLUDED.fast_valid,
+                    fast_reason    = EXCLUDED.fast_reason
+                """,
+                state.symbol, state.timeframe, bt,
+                # invalid 箱体一律落 NULL（前端断线不补），与 market_state_log.box_* 同口径
+                (round(float(box.upper), 4) if _valid else None),
+                (round(float(box.lower), 4) if _valid else None),
+                (round(float(box.mid), 4) if _valid else None),
+                (round(float(box.width_atr), 4) if _valid else None),
+                _valid, str(getattr(box, "reason", "") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            # WARNING 而非 DEBUG：观测表写入失败必须可见（否则"以为在记录、其实 0 行"）
+            logger.warning("[range_box] %s/%s 55 箱体落库失败：%s",
+                           state.symbol, state.timeframe, exc)
+
     async def _publish_fsm_intent(self, state: "SymbolState", dec, intent,
                                   price: float, bar_key: str = "") -> None:
         """把策略层意图发布为**可执行信号**（方案 §43.2）。
@@ -2171,6 +2244,10 @@ class Scheduler:
                             "（防同一 bar 双发造成超仓；BUG-4 修复）",
                             state.symbol, bar_key)
                         return
+                    # 【2026-09-24 方案3】认领成功才持有键：发布失败时 except 块据此
+                    # 回滚删除（原实现 _claim_key 恒 None ⇒ 回滚死代码，键残留 1h
+                    # 永久挡掉该 bar 重试）。
+                    _claim_key = f"hcm:state:fsm_sent:{state.symbol}:{bar_key}"
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("[fsm] %s bar 去重键异常（继续发布，避免漏单）：%s",
                                    state.symbol, exc)
@@ -2413,6 +2490,9 @@ class Scheduler:
         # 实测依据（方案 §30）：触发器 漏检 0.4% / 误报 16.6% / 中位提前 −1.0 根；
         # 对照 4 类 argmax 推导为 20% / 67.8% / **滞后 +3.5**。方向用于 NONE 否决。
         _dir_name, _trg = "", {"on": False, "reason": "disabled"}
+        # 【2026-09-25 上屏修复】方向诊断量（斜率 / +DI / −DI / di_spread / 防抖进度）。
+        # 初值 {} ⇒ 上屏落成 None（面板如实显示"无数据源"），**不得**用 0 冒充。
+        _dir_diag: dict = {}
         # 【路线 B】波动扩张概率（P(未来窗口振幅/ATR ≥ 阈值)）。
         # None = 未算出（模型缺失/量价数组缺失）⇒ 下游按"**不裁决**"处理。
         # 语义方向很重要：`-1`（未知）与 `0.0`（明确判波动收敛）**必须分开** ——
@@ -2468,8 +2548,20 @@ class Scheduler:
                 if _pos >= 0:
                     _dser = _TD.compute_direction_series(_dh, _dl, _dc, cfg=_cfg)
                     if bool(_dser["valid"][_pos]):
+                        # 【2026-09-25 上屏修复】此前**只取 `name`** ⇒ 斜率/+DI/−DI/di_spread/
+                        # 防抖进度全部被丢弃 ⇒ 面板「趋势方向」长期显示"部分缺/无数据源"
+                        # （而数据其实已算出）。现随裁决一并带上：同一份 `_dser`，
+                        # 零额外计算、零行为变化（不参与任何判定）。
                         _dr = {"valid": True,
-                               "name": _TD.dir_name(int(_dser["confirmed"][_pos]))}
+                               "name": _TD.dir_name(int(_dser["confirmed"][_pos])),
+                               "slope_atr": float(_dser["slope_atr"][_pos]),
+                               "di_spread": float(_dser["di_spread"][_pos]),
+                               "plus_di": float(_dser["plus_di"][_pos]),
+                               "minus_di": float(_dser["minus_di"][_pos]),
+                               "run_len": int(_dser["run_len"][_pos]),
+                               "raw_name": _TD.dir_name(int(_dser["raw"][_pos])),
+                               "debounce_bars": int(_dser["debounce_bars"]),
+                               "slope_thr_atr": float(_dser["slope_thr_atr"])}
                     else:
                         # valid=False 是"**判不了**"（数据不足/指标异常），
                         # **不是**"判过、无方向"（模块 docstring 明确定义）。
@@ -2505,6 +2597,26 @@ class Scheduler:
                     "[shadow_state] 方向模块 valid=False（数据不足/指标异常）→ 本根 "
                     "direction=\"\"（**不否决**趋势入口）；%s/%s",
                     state.symbol, tf)
+            # 【2026-09-25 上屏修复】整理为**上屏用**的方向诊断（唯一真源 = `_dr`）：
+            #   · 两个方向源路径（跨周期 / 同周期回落）都在 `_dr` 里，此处统一归一；
+            #   · 数值经 `_num_or_none`（NaN/Inf → None），面板可区分"算出来"与"判不了"；
+            #   · `run_len≥debounce_bars` 即"防抖已确认"（面板直接显示进度，不用自己推）。
+            _dir_diag = {
+                "src_tf": str(_dir_src or ""),
+                "valid": bool(_dr.get("valid")),
+                "name": str(_dr.get("name") or ""),
+                "raw_name": str(_dr.get("raw_name") or ""),
+                "slope_atr": _num_or_none(_dr.get("slope_atr")),
+                "slope_thr_atr": _num_or_none(_dr.get("slope_thr_atr")),
+                "plus_di": _num_or_none(_dr.get("plus_di")),
+                "minus_di": _num_or_none(_dr.get("minus_di")),
+                "di_spread": _num_or_none(_dr.get("di_spread")),
+                "run_len": (int(_dr["run_len"])
+                            if isinstance(_dr.get("run_len"), (int, float)) else None),
+                "debounce_bars": (int(_dr["debounce_bars"])
+                                  if isinstance(_dr.get("debounce_bars"), (int, float))
+                                  else None),
+            }
             _tail = self._state_infer.infer_onset_tail(tf, high, low, close, tail=8)
             _trg = _trigger_latest(high, low, close, _tail, cfg=_cfg)
             # 【路线 B】波动扩张概率。量价/点差数组取自同一份 `kl`
@@ -2693,6 +2805,10 @@ class Scheduler:
                         "age_bars": dec.age_bars,
                         # 方向（up/down/none）与起点触发器状态（三件套的另两项，方案 §30）
                         "direction": dec.direction,
+                        # 【2026-09-25 上屏修复】方向**诊断量**（斜率 / +DI / −DI / di_spread /
+                        # 防抖进度 / 源周期 / 阈值）。单一真源 = trend_direction 模块的返回；
+                        # 缺失时 None（面板如实显示"无数据源"，不伪造 0）。
+                        "dir": (_dir_diag or None),
                         "trigger_on": bool(_trg.get("on")),
                         "trigger_reason": str(_trg.get("reason") or ""),
                         "infer_ok": dec.infer_ok, "infer_reason": dec.infer_reason,
@@ -3093,7 +3209,12 @@ class Scheduler:
 
         # ── Step 1: Fetch K-line data ───────────
         t0 = time.time()
-        klines = await self._fetch_klines(state.symbol, state.timeframe)
+        # 【2026-09-24 方案6】bar-close 主决策对齐已收盘 bar；bar 内触发
+        # (live_override/value_drive) 保留实时 bar 作为决策依据。
+        klines = await self._fetch_klines(
+            state.symbol, state.timeframe,
+            keep_forming=bool(live_override or value_drive),
+        )
         # ── Bar 质量分日志（验证用, DEBUG 级, 不影响信号）──
         if klines:
             _lb = klines[-1]
@@ -3580,14 +3701,26 @@ class Scheduler:
                     except Exception as _bp_e:  # noqa: BLE001
                         logger.debug("range_box publish failed %s: %s", state.symbol, _bp_e)
 
+                    # ── 【2026-09-25】Magic 55 逐 bar 落库（面板双图之一的数据源）──
+                    # 只在 **bar 收盘主路径**（`not live_override`）落库：
+                    #   bar 内重入（live_override 每 ~30s）时 `_fetch_klines(keep_forming=True)`
+                    #   的序列**含未收盘 bar** ⇒ 同一 bar 会算出**不同窗口**的箱体；
+                    #   若允许覆盖，图上箱体会在一根 bar 内跳变。只写主路径 ⇒ 一根 bar 一个几何。
+                    # 失败只告警（观测链路不得影响交易），见 `_persist_range_box`。
+                    if not live_override:
+                        await self._persist_range_box(state, _box_fast)
+
                     # ── 突破熔断（2026-09-10 事故新增）──
                     # 均值回归的致命场景："声称 RANGE、实为突破"。本次事故中
                     # period_states 五周期全 RANGE，但 M5 实际从 4408 单边拉到 4427(+2.5ATR)，
                     # 继续反向开空 = 逆势送单 → 4 笔 SELL 全部止损。
                     # 判定：收盘越过【近 N 根且不含当前 bar】的高低点 → 冷却 N 根 M5。
                     # （不含当前 bar 是关键：否则极值信号本身常创新高，会自我误封。）
-                    _bg_on = str(_rng_cfg.get("range.break_guard_enabled")
-                                 or "true").strip().lower() in ("1", "true", "yes", "on")
+                    # 显式判 None 再转字符串：布尔 False 经 `or "true"` 会被吞成
+                    # "true"（关不掉的开关），与 :3513 single_position 同型陷阱。
+                    _bg_raw = _rng_cfg.get("range.break_guard_enabled")
+                    _bg_on = str("true" if _bg_raw is None else _bg_raw).strip().lower() \
+                        in ("1", "true", "yes", "on")
                     if _bg_on and _b_src == "box" and _box_break is not None and _box_break.valid:
                         # 箱体口径（range.box.break_source=box）——【A+B 2026-09-18 修复】
                         #   A 边界用**极值**箱体 `_box_break`（非宽度门的 quantile）：
@@ -3768,8 +3901,14 @@ class Scheduler:
                                 _bl = float(_rl_w[-1]) if _rl_w else 0.0
                             except Exception:
                                 _bh = _bl = 0.0
-                            if (_arm["dir"] == "BUY" and _bl > 0 and _bl <= _arm["target"]) or \
-                               (_arm["dir"] == "SELL" and _bh > 0 and _bh >= _arm["target"]):
+                            # 【2026-09-24 方案4】arm 回填须同新注入口径的 direction 守卫：
+                            # 若 value_drive/micro_state 已在本轮注入方向，不得用后写
+                            # 者胜覆盖（原实现无守卫 ⇒ range arm 可推翻 value_drive）。
+                            if str(getattr(score_result, "direction", "") or "") in ("", "NO_TRADE") and (
+                                    (_arm["dir"] == "BUY" and _bl > 0
+                                     and _bl <= _arm["target"]) or
+                                    (_arm["dir"] == "SELL" and _bh > 0
+                                     and _bh >= _arm["target"])):
                                 _inject_dir = _arm["dir"]
                                 state.range_arm = None
                                 logger.info(
@@ -4537,7 +4676,8 @@ class Scheduler:
                 "(regime=%s rsi_conf=%s fb=%s) → suppress (keep HEXP passed, external env bad)",
                 state.symbol, state.timeframe, final_direction,
                 _market_composite, regime_result.regime.value,
-                getattr(score_result, "neutral_rsi_confirmed", False), _is_fb,
+                getattr(score_result, "neutral_rsi_confirmed", False),
+                bool(getattr(score_result, "co_exec_fb", 0)),
             )
             final_direction = "NO_TRADE"
 
@@ -5048,7 +5188,12 @@ class Scheduler:
             _tight_sl = min(ai_sl_mult * _chase, 1.8)  # 防御性封顶，避免超过桥 max_sl_atr_mult
             _atr_c = float(getattr(indicators, "atr_14", 0.0) or 0.0)
             _entry_c = live_entry_price if live_entry_price else indicators.close
-            if _atr_c > 0 and _entry_c > 0:
+            # 【P0 修复·2026-09-25】ai_sl_mult==0 的语义 =「SL 交桥会话系数」（RANGE 均值回归
+            # 专用，见上方 AI SL 块 :5216）。此时 _tight_sl=min(0×chase,1.8)=0 ⇒ 会写出
+            # sl_price=入场价，而桥对非零 sl_price 直接采用 ⇒ 仅靠会话 SL 下限兜底
+            # (mt5_bridge.py:1492) 才偶然正确，兜底一旦被跳过（redis 缺失 / sl_locked）即
+            # 退化为「开仓即止损」。与 AI SL 块(:5222 `if _sl_a>0`)同口径：仅在 _tight_sl>0 时写。
+            if _atr_c > 0 and _entry_c > 0 and _tight_sl > 0:
                 if final_direction == "BUY":
                     _chase_sl_price = round(_entry_c - _tight_sl * _atr_c, 5)
                     _chase_tp1 = round(_entry_c + ai_tp_mult * _atr_c, 5)
@@ -6118,7 +6263,8 @@ class Scheduler:
         return hh, ll, cc, ee
 
     async def _fetch_klines(
-        self, symbol: str, timeframe: str, limit: int = 100
+        self, symbol: str, timeframe: str, limit: int = 100,
+        *, keep_forming: bool = True,
     ) -> list[dict]:
         """Fetch recent klines from PostgreSQL, merged with Redis live bar.
 
@@ -6129,6 +6275,9 @@ class Scheduler:
             symbol: Trading symbol.
             timeframe: Timeframe string.
             limit: Max bars to fetch.
+            keep_forming: True=保留 Redis 合并进来的"正在形成"实时 bar（live_override/
+                value_drive 等 bar 内触发路径的决策依据）；False=丢弃该 bar，使指标
+                只用已收盘 bar（bar-close 主决策路径，消除 repaint/训练口径错位）。
 
         Returns:
             List of kline dicts sorted by open_time ascending.
@@ -6213,6 +6362,14 @@ class Scheduler:
                             )
             except Exception as exc:
                 logger.debug("live bar merge skipped (%s/%s): %s", symbol, timeframe, exc)
+            # ── 【2026-09-24 方案6】决策路径对齐已收盘 bar ──
+            # bar-close 主决策若带上"正在形成"的新 bar（is_live_forming），指标用
+            # 未收盘 OHLC（repaint 风险，且与训练/回测口径错位）。keep_forming=False
+            # 时丢弃尾部 live-forming bar（至多 1 根，由上方 merge 打标记；同 bar 覆盖
+            # 分支是已收盘 bar 的最终 OHLC，不受影响）。
+            if not keep_forming:
+                while klines and klines[-1].get("is_live_forming"):
+                    klines.pop()
             # ── Bar 质量分（计算层, 纯函数, 默认不影响信号）──
             # 为每根 bar 附加 quality/vol_q/spread_q/body_ratio/pin/outlier 字段；
             # 当前信号闸门不消费这些字段，仅作数据增强与后续质量过滤的前提。

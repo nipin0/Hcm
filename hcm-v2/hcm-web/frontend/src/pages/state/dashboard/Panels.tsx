@@ -114,24 +114,71 @@ export const FsmCard = ({ live }: { live: LiveResp | null }) => {
   );
 };
 
-/* ── 卡片 2：趋势方向 ───────────────────────────────────────────────────── */
-/* 数据源：仅 direction 有（fsm 快照）；斜率/+DI/-DI/方向防抖计数 均无线上发布 */
+/* ── 卡片 2：趋势方向（含诊断量）────────────────────────────────────────── */
+/* 【2026-09-25 修复】原实现 4 个字段恒为"无数据源"：真因是塔只取了 `name`，把
+ * `slope_atr/di_spread` 丢弃、且 `run_len`（防抖进度）未暴露。现塔已在
+ * `hcm:live:state.dir` 发布全部诊断量（单一真源 = `trend_direction` 模块）⇒ 此处如实展示。
+ * 判定口径与模块一致：UP = 斜率>阈值 ∧ di_spread>0；DOWN = 斜率<−阈值 ∧ di_spread<0。 */
 export const TrendCard = ({ live }: { live: LiveResp | null }) => {
   const fsm = live?.fsm || {};
   const dv = live?.derived;
-  const d = (fsm.direction || 'none').toLowerCase();
+  const td = dv?.trend_dir;
+  /* 【2026-09-25 口径修复】大字必须取**模块本 bar 裁决**（`dir.name`）。
+   * 为什么不能用 `fsm.direction` 当主显示：那是 FSM 的**锁存**字段 —— 仅在
+   * "触发器命中 / 趋势态入口"时更新（`state_machine.py:371/403/548`），
+   * 在 S0/S1/S4 等状态**不更新** ⇒ 会长期显示**过期方向**。
+   * 实测证据（2026-09-25 04:00 同一 bar）：`fsm.direction=up` 而模块裁决 `=down`，
+   * 且模块诊断自洽（slope_atr=−6.22<−1.0、di_spread=−24.80<0 ⇒ DOWN）。
+   * 两者都展示，且各自标注来源，避免"面板显示的方向"被误当作当前裁决。 */
+  const modDir = (td?.name || '').toLowerCase();
+  const fsmDir = (fsm.direction || '').toLowerCase();
+  const d = modDir || fsmDir || 'none';
   const col = d === 'up' ? UD.up : d === 'down' ? UD.down : C.weak;
+  const ok = !!td && td.slope_atr != null && td.slope_atr !== undefined;
+  const sl = td?.slope_atr ?? null;
+  const thr = td?.slope_thr_atr ?? null;
+  const ds = td?.di_spread ?? null;
+  const passUp = sl != null && thr != null && sl > thr && (ds ?? 0) > 0;
+  const passDown = sl != null && thr != null && sl < -thr && (ds ?? 0) < 0;
+  const needK = td?.debounce_bars ?? null;
+  const runLen = td?.run_len ?? null;
   return (
-    <Card title="趋势方向" badge={<SrcPill ok="partial" />}>
+    <Card title="趋势方向" badge={<SrcPill ok={ok ? 'full' : 'partial'} />}
+          right={td?.src_tf ? `方向源 ${td.src_tf}` : undefined}>
       <Box sx={{ color: col, fontWeight: 700, fontSize: 19, mb: 1, letterSpacing: 0.5 }}>
         {d.toUpperCase()}
       </Box>
-      <KV k="direction（fsm 快照）" v={fsm.direction || '—'} />
-      <KV k="斜率 slope_atr" v={<NoSrc reason={dv?.trend_detail_reason} />} />
-      <KV k="+DI" v={<NoSrc reason={dv?.trend_detail_reason} />} />
-      <KV k="−DI" v={<NoSrc reason={dv?.trend_detail_reason} />} />
-      <KV k="di_spread" v={<NoSrc reason={dv?.trend_detail_reason} />} />
-      <KV k="方向防抖计数" v={<NoSrc reason="trend_direction.py 为纯窗口函数 debounce_bars，无计数器变量" />} />
+      <KV k="趋势方向（模块本 bar 裁决）" v={modDir ? modDir.toUpperCase() : '—'} />
+      <KV k="FSM 采用（锁存·仅趋势入口更新）" v={fsmDir ? fsmDir.toUpperCase() : '—'} />
+      {ok ? (
+        <>
+          <KV k="斜率 slope_atr（ATR 归一）"
+              v={<Box component="span" sx={{ color: (sl ?? 0) > 0 ? UD.up : (sl ?? 0) < 0 ? UD.down : C.text }}>
+                {fmt(sl, 2)}</Box>} />
+          <KV k="阈值 slope_thr_atr" v={fmt(thr, 2)} />
+          <KV k="+DI / −DI" v={`${fmt(td?.plus_di, 1)} / ${fmt(td?.minus_di, 1)}`} />
+          <KV k="di_spread（+DI − −DI）"
+              v={<Box component="span" sx={{ color: (ds ?? 0) > 0 ? UD.up : (ds ?? 0) < 0 ? UD.down : C.text }}>
+                {fmtSigned(ds, 2)}</Box>} />
+          <KV k={`方向防抖进度 run_len / 需 ${needK ?? '—'}`}
+              v={<Box component="span" sx={{
+                color: (runLen != null && needK != null && runLen >= needK) ? C.ok : C.warn }}>
+                {runLen ?? '—'}{runLen != null && needK != null && runLen >= needK ? ' ✓已确认' : ' 确认中'}
+              </Box>} />
+          <KV k="防抖前原始方向" v={td?.raw_name || '—'} />
+          <KV k="达标（斜率 ∧ DI 同向）"
+              v={<Box component="span" sx={{ color: (passUp || passDown) ? C.ok : C.weak }}>
+                {passUp ? 'UP 达标' : passDown ? 'DOWN 达标' : '未达标（方向应为 none）'}
+              </Box>} />
+          {td?.valid === false ? (
+            <Box sx={{ color: C.block, fontSize: 10, mt: 0.5 }}>
+              ⚠ 本 bar valid=false（判不了：数据不足/指标异常）→ 方向按""不否决
+            </Box>
+          ) : null}
+        </>
+      ) : (
+        <KV k="诊断量" v={<NoSrc reason={dv?.trend_detail_reason || '塔未发布 hcm:live:state.dir'} />} />
+      )}
     </Card>
   );
 };
@@ -339,23 +386,7 @@ export const DetailPanels = ({ live, probeBar }: { live: LiveResp | null; probeB
         </Box>
       </Card>
 
-      {/* 趋势方向面板 */}
-      <Card title="趋势方向面板" badge={<SrcPill ok="none" />} right="仅 direction 有源">
-        <Box sx={{ fontWeight: 700, fontSize: 19, mb: 1, letterSpacing: 0.5,
-                   color: (fsm.direction || 'none') === 'up' ? UD.up
-                        : (fsm.direction || 'none') === 'down' ? UD.down : C.weak }}>
-          {String(fsm.direction || 'none').toUpperCase()}
-        </Box>
-        <KV k="direction" v={fsm.direction || '—'} />
-        <KV k="斜率 slope_atr" v={<NoSrc reason={dv?.trend_detail_reason} />} />
-        <KV k="+DI" v={<NoSrc reason={dv?.trend_detail_reason} />} />
-        <KV k="−DI" v={<NoSrc reason={dv?.trend_detail_reason} />} />
-        <KV k="di_spread" v={<NoSrc reason={dv?.trend_detail_reason} />} />
-        <KV k="方向防抖计数" v={<NoSrc reason="trend_direction.py:226-238 为纯窗口函数" />} />
-        <Box sx={{ color: C.weak, fontSize: 10.5, mt: 1, lineHeight: 1.5 }}>
-          +DI/−DI 目前仅作模型特征（state_features.py:53-54），落在 infer.feats，未进流/表/Redis。
-        </Box>
-      </Card>
+
     </Box>
   );
 };

@@ -49,13 +49,28 @@ CFG_FALLBACK = {
     #   atr_fallback(旧·向后兼容): 全部用 atr×label_sl_atr_fallback，忽略真实 SL
     #   real(旧·向后兼容): 仅保留 sl_price>0 的信号（剔除其余）
     "ai.lm.label_sl_source": "prefer_real",
+    # 【标签口径重构 2026-09-25】质量头标签阈值单位由 R 改为 ATR（见 label_one 注释）。
+    #   r_touch        = 旧口径：阈值 = label_r_win/label_r_loss × R（R≈2ATR），保留可回滚
+    #   atr_dir_touch  = 新口径（默认）：阈值 = ±k·ATR，窗 = label_touch_horizon_bars
+    # 实测（n=1831，TSS×5 pooled OOF AUC，3 seed）：
+    #   r_touch 1R/12根        AUC = 0.4779 ±0.0032
+    #   atr_dir_touch k=1.5/h=24 AUC = 0.5576 ±0.0059（跨过 0.55 判决门）
+    # 冗余：与买点头 corr 0.877 → 0.751；与方向头 corr −0.189（真独立）。
+    "ai.lm.label_mode": "atr_dir_touch",
+    "ai.lm.label_touch_atr_mult": 1.5,
+    "ai.lm.label_touch_horizon_bars": 24,
     # 【阶段 0·方向头/买点头标签】独立于 hexp 方向，由未来 K 线方向驱动。
     "ai.lm.dir_atr_mult": 0.8,        # 方向幅度阈值(ATR 倍数)：未来 N 根 close 相对 entry 涨/跌 ≥ ±0.8·ATR → 有方向
     "ai.lm.dir_horizon_bars": 24,     # 方向展望期(根 M5)，长于质量头 12 以稳方向
-    # 【2026-09-02 趋势对齐】方向头标签只学"顺 H1 主趋势"的运动方向：
-    #   逆 H1 趋势的未来 ±dir_atr_mult 运动压为 FLAT(0) —— 趋势市不教摸顶/抄底
-    #   （根治"buy 趋势行情判 SELL、被 flip 成逆势空单"系统性背离）。
-    "ai.lm.dir_trend_align": "true",  # 开关：false 则完全退回旧双向(纯未来收益)语义
+    # 【2026-09-24 关闭·回滚】方向头标签趋势对齐（2026-09-02 引入）经 Phase 0 复跑判定有害：
+    #   全 M5 网格 71111 根 / 11.6 个月 / 60732 评估样本（生产 enrich_klines 特征 + 因果 H1 方向），
+    #   **高置信子集 edge 在 5/5 个 horizon 上 ON 全为负、OFF 全为正**
+    #   （h=1: OFF +0.0088 vs ON -0.0044；h=24: OFF +0.1973 vs ON -0.0254）；
+    #   全样本 edge 亦 OFF ≥ ON 于 5/5。结论：align 把方向头唯一可用的方向性销毁掉。
+    #   现役 lgbm_direction_v108.txt (2026-09-15) 正是在 align=ON 下训练，属被污染模型。
+    #   PG 真源 current_value/default_value 均已置 false（2026-09-24 14:17 UTC）。
+    #   此处兜底同步为 false：仅在 PG 缺该键时生效，防止"键被删→静默恢复 align"。
+    "ai.lm.dir_trend_align": "false",  # 开关：false = 纯未来收益双向语义（当前线上口径）
     "ai.lm.dir_trend_tf": "H1",       # 趋势基准周期（当前实现仅 H1；扩展需另加载对应 tf）
     # 【P1' 2026-09-11·买点头差异化标签】此前 entry_label 与质量头 label 逐值相同
     # （两侧 R 都回退 atr×2.0、horizon/r_loss 共用同一配置键）→ 买点头是质量头复制品，
@@ -201,9 +216,30 @@ def label_one(sig_row, kl: pd.DataFrame, cfg: dict, events=None):
         return None, "zero_R", 0.0, None
     atr = sig_row.get("atr_14")     # 下方跳空剔除仍需 atr
 
-    r_win = cfg["ai.lm.label_r_win"] * R
-    r_loss = cfg["ai.lm.label_r_loss"] * R
-    horizon = int(cfg["ai.lm.label_horizon_bars"])
+    # ── 【标签口径重构 2026-09-25】默认阈值为 **ATR 尺度**（r_touch 保留可回滚）────
+    # 根因：旧口径阈值 = label_r_win × R，而 R 取自真实 SL（实测 mean R=10.38 ≈ 2×ATR）。
+    #   **R 尺度(≈2ATR) 与观察窗(12根=1h) 严重不匹配** ⇒ 30% 样本根本不触（no_touch
+    #   被剔），剩余标签实为"是否发生罕见大幅移动" ⇒ 近随机（AUC 0.478，低于 0.5）。
+    # 新口径：阈值 ±k·ATR（k 默认 1.5）、窗 24 根 —— 尺度与窗匹配，且阈值放大后
+    #   避开"小幅噪声区"，学的是真实趋势性突破。
+    # 实测（n=1831，TimeSeriesSplit×5 pooled OOF AUC，3 seed）：
+    #   r_touch 旧(1R/12根)             0.4779 ±0.0032   ← 基线
+    #   atr_dir_touch k=1.5 h=24        **0.5576 ±0.0059**  ← 跨过 0.55 判决门
+    #   （k=1.5 族 h=18/24/36 均 0.554~0.558，稳定；k=0.8 次优 0.554）
+    # 冗余同步改善：与买点头 corr 0.877 → 0.751；与方向头 corr −0.189。
+    _mode = str(cfg.get("ai.lm.label_mode", "atr_dir_touch") or "atr_dir_touch").strip().lower()
+    if _mode == "atr_dir_touch":
+        _atr_f = float(atr) if (atr and float(atr) > 0) else None
+        if _atr_f is None:
+            return None, "no_atr_for_atr_mode", R, None
+        _k = float(cfg.get("ai.lm.label_touch_atr_mult", 1.5))
+        r_win = _k * _atr_f
+        r_loss = r_win                      # 对称 ±k·ATR
+        horizon = int(cfg.get("ai.lm.label_touch_horizon_bars", 24))
+    else:                                   # r_touch：完整保留旧行为（配置一键回滚）
+        r_win = cfg["ai.lm.label_r_win"] * R
+        r_loss = cfg["ai.lm.label_r_loss"] * R
+        horizon = int(cfg["ai.lm.label_horizon_bars"])
 
     created = sig_row["created_at"]
     if pd.isna(created) or kl is None or kl.empty:

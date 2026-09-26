@@ -225,6 +225,10 @@ def compute_direction_series(
 
     # ── 防抖：最近 k 根原始方向全等才确认（纯窗口函数，无状态）──
     confirmed = np.zeros(n, dtype=int)
+    # 【2026-09-25 上屏修复】`run_len` 提到外层：它 = **连续同值段长度**，即"方向防抖进度"
+    #   （`confirmed` 要求 run_len ≥ k）。此前是块内局部变量 ⇒ 调用方拿不到 ⇒ 面板把它
+    #   标成"无计数器变量/无数据源"（不准确）。暴露它**不改变任何判定**，仅供观测。
+    run_len = np.zeros(n, dtype=int)
     if n > 0 and k >= 1:
         idx = np.arange(n)
         # 连续同值段的起点：raw 变化处或无效处开新段
@@ -245,6 +249,15 @@ def compute_direction_series(
         "di_spread": di_spread,
         "debounce_bars": int(k),
         "slope_thr_atr": float(thr),
+        # 【2026-09-25 上屏修复】以下三个是**纯新增诊断键**（不参与任何判定）：
+        #   plus_di / minus_di = `di_spread` 的两个分量（同一份 `ind`，单一实现口径）
+        #   run_len            = 防抖进度（见上）
+        # 为什么必须由本模块给出：面板要显示"+DI/−DI/防抖计数"，若另找来源
+        # （如 `hcm:live:adx` 的 IndicatorCalculator 口径）就是**同一指标两份实现**，
+        # 会出现"面板 DI 与方向裁决用的 DI 不一致"，属本仓库明令禁止的双真源。
+        "plus_di": plus_di,
+        "minus_di": minus_di,
+        "run_len": run_len,
     }
 
 
@@ -259,7 +272,8 @@ def latest_direction(
     """线上单点入口：返回最后一根的裁决 + 诊断。
 
     Returns:
-        dict(code, name, valid, slope_atr, di_spread)
+        dict(code, name, valid, slope_atr, di_spread, plus_di, minus_di, run_len,
+             raw_name, debounce_bars, slope_thr_atr)
         valid=False ⇒ 数据不足/指标异常（**不得**当作 NONE 用：NONE 是"判过、无方向"，
         valid=False 是"判不了"，按方案 §5 由调用方走 S9 暂停态）。
     """
@@ -267,7 +281,9 @@ def latest_direction(
     i = len(close) - 1
     if i < 0:
         return {"code": DIR_NONE, "name": "none", "valid": False,
-                "slope_atr": float("nan"), "di_spread": float("nan")}
+                "slope_atr": float("nan"), "di_spread": float("nan"),
+                "plus_di": float("nan"), "minus_di": float("nan"),
+                "run_len": 0, "raw_name": "none"}
     code = int(s["confirmed"][i])
     return {
         "code": code,
@@ -275,4 +291,11 @@ def latest_direction(
         "valid": bool(s["valid"][i]),
         "slope_atr": float(s["slope_atr"][i]),
         "di_spread": float(s["di_spread"][i]),
+        # 【2026-09-25 上屏修复】随裁决一起返回诊断量（单一真源；调用方直接透传上屏）
+        "plus_di": float(s["plus_di"][i]),
+        "minus_di": float(s["minus_di"][i]),
+        "run_len": int(s["run_len"][i]),
+        "raw_name": dir_name(int(s["raw"][i])),   # 防抖**前**的原始方向（诊断）
+        "debounce_bars": int(s["debounce_bars"]),
+        "slope_thr_atr": float(s["slope_thr_atr"]),
     }

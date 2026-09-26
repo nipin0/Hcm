@@ -362,19 +362,35 @@ export default function FsmDashboard() {
       {/* ── 4 张状态卡片 ── */}
       <StateCards live={live} risk={risk} />
 
-      {/* ── 双图表 ── */}
-      <Paper elevation={0} sx={{ backgroundColor: C.card, border: `1px solid ${C.border}`,
-                                 borderRadius: 2, p: 2, mb: 1.5 }}>
-        {cardHead('K 线主图 · 状态背景 / 箱体三线 / 开平仓标记',
-                  'hcm_market.klines_xauusd ⋈ hcm_signal.market_state_log（按 open_time = bar_open_time）· '
-                  + '开平仓取自 hcm_trading.orders(order_status=2)',
-                  <Typography sx={{ color: C.block, fontSize: 10.5 }}>
-                    ⚠ 箱体无历史（仅当前值）· 标记点无 position_id 关联，按时间就近吸附（近似）
-                  </Typography>)}
-        <KlineChart bars={bars} cursor={cursor} live={live}
-                    orders={risk?.recent_orders || []}
-                    positions={risk?.positions || []} />
-      </Paper>
+      {/* ── 箱体双图（左右并排）【2026-09-25 需求：把 K 线主图拆成 55/61 两张箱体图】── */}
+      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr', lg: '1fr 1fr' },
+                 gap: 1.5, mb: 1.5 }}>
+        <Paper elevation={0} sx={{ backgroundColor: C.card, border: `1px solid ${C.border}`,
+                                   borderRadius: 2, p: 2 }}>
+          {cardHead('箱体图 ① · Magic 61（FSM S1 箱）',
+                    'hcm_market.klines_xauusd ⋈ hcm_signal.market_state_log（open_time = bar_open_time）· '
+                    + '三线 = 塔逐 bar 落库的 intent.box_*（冻结感知）· 开平仓取自 orders',
+                    <Typography sx={{ color: C.weak, fontSize: 10.5 }}>
+                      ⚠ 标记点无 position_id 关联，按时间就近吸附（近似）
+                    </Typography>)}
+          <KlineChart bars={bars} cursor={cursor} live={live} boxKind="m61"
+                      orders={risk?.recent_orders || []}
+                      positions={risk?.positions || []} />
+        </Paper>
+
+        <Paper elevation={0} sx={{ backgroundColor: C.card, border: `1px solid ${C.border}`,
+                                   borderRadius: 2, p: 2 }}>
+          {cardHead('箱体图 ② · Magic 55（RANGE 均值回归 · 快箱）',
+                    'hcm_market.klines_xauusd ⋈ hcm_signal.range_box_log（open_time = bar_open_time）· '
+                    + '三线 = 塔逐 bar 落库的 range_box **fast 箱**（与 Redis 快照同一次计算）',
+                    <Typography sx={{ color: C.weak, fontSize: 10.5 }}>
+                      ⚠ 该表自 2026-09-25 起逐 bar 落库（历史不可回填）· 55 每 bar 重算、无冻结/轮次
+                    </Typography>)}
+          <KlineChart bars={bars} cursor={cursor} live={live} boxKind="m55"
+                      orders={risk?.recent_orders || []}
+                      positions={risk?.positions || []} />
+        </Paper>
+      </Box>
 
       <Paper elevation={0} sx={{ backgroundColor: C.card, border: `1px solid ${C.border}`,
                                  borderRadius: 2, p: 2, mb: 1.5 }}>
